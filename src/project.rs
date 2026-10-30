@@ -1,17 +1,24 @@
 use crate::model::{Exchange, Workspace};
 use anyhow::{Context, Result, ensure};
 use redb::{Database, ReadableTable, TableDefinition};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const FLOWS: TableDefinition<u64, &[u8]> = TableDefinition::new("exchanges");
+mod annotations;
+mod audit;
 mod scanner;
 mod websockets;
 use crate::websocket::{CapturedMessage, MessageSummary, Session};
 
 pub struct Project {
-    db: Option<Database>,
-    memory: BTreeMap<u64, Exchange>,
+    db: Option<Arc<Database>>,
+    path: Option<PathBuf>,
+    memory: BTreeMap<u64, Arc<Exchange>>,
     pub workspace: Workspace,
     secret: Option<Vec<u8>>,
     next_id: u64,
@@ -20,11 +27,78 @@ pub struct Project {
     ws_memory: BTreeMap<(u64, u64), CapturedMessage>,
     scan_jobs: BTreeMap<u64, crate::scanner::ScanJob>,
     findings: BTreeMap<u64, crate::scanner::Finding>,
+    audit: Vec<crate::mcp::AuditEntry>,
+    annotations: BTreeMap<u64, crate::history::Annotation>,
 }
+
+/// Read access to stored exchanges that does not hold the project lock, so
+/// long scans never delay proxy recording. Disk projects read a consistent
+/// redb snapshot; temporary projects read a snapshot of shared exchanges.
+pub struct HistoryReader {
+    db: Option<Arc<Database>>,
+    memory: Vec<Arc<Exchange>>,
+}
+impl HistoryReader {
+    pub fn get(&self, id: u64) -> Result<Option<Exchange>> {
+        if let Some(db) = &self.db {
+            let tx = db.begin_read()?;
+            Ok(tx
+                .open_table(FLOWS)?
+                .get(id)?
+                .map(|v| serde_json::from_slice(v.value()))
+                .transpose()?)
+        } else {
+            Ok(self
+                .memory
+                .binary_search_by_key(&id, |flow| flow.id)
+                .ok()
+                .map(|index| (*self.memory[index]).clone()))
+        }
+    }
+    pub fn len(&self) -> Result<u64> {
+        if let Some(db) = &self.db {
+            use redb::ReadableTableMetadata;
+            Ok(db.begin_read()?.open_table(FLOWS)?.len()?)
+        } else {
+            Ok(self.memory.len() as u64)
+        }
+    }
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+    /// Visit exchanges newest first with IDs below `before`, until `visit`
+    /// returns false.
+    pub fn scan_desc(
+        &self,
+        before: Option<u64>,
+        mut visit: impl FnMut(Exchange) -> Result<bool>,
+    ) -> Result<()> {
+        let end = before.unwrap_or(u64::MAX);
+        if let Some(db) = &self.db {
+            let tx = db.begin_read()?;
+            let table = tx.open_table(FLOWS)?;
+            for item in table.range(..end)?.rev() {
+                let (_, value) = item?;
+                if !visit(serde_json::from_slice(value.value())?)? {
+                    break;
+                }
+            }
+        } else {
+            for flow in self.memory.iter().rev().filter(|flow| flow.id < end) {
+                if !visit((**flow).clone())? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Project {
     pub fn temporary() -> Self {
         Self {
             db: None,
+            path: None,
             memory: BTreeMap::new(),
             workspace: Workspace::default(),
             secret: None,
@@ -34,6 +108,29 @@ impl Project {
             ws_memory: BTreeMap::new(),
             scan_jobs: BTreeMap::new(),
             findings: BTreeMap::new(),
+            audit: vec![],
+            annotations: BTreeMap::new(),
+        }
+        .normalised()
+    }
+    /// Assign stable identifiers to Repeater tabs saved by older versions.
+    fn normalised(mut self) -> Self {
+        self.workspace.assign_repeater_ids();
+        self
+    }
+    /// The project file, or None for a temporary in-memory project.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+    /// A lock-free reader over the exchanges stored so far.
+    pub fn history_reader(&self) -> HistoryReader {
+        HistoryReader {
+            db: self.db.clone(),
+            memory: if self.db.is_some() {
+                vec![]
+            } else {
+                self.memory.values().cloned().collect()
+            },
         }
     }
     /// Open an existing project, or create one for the command-line interface.
@@ -103,7 +200,8 @@ impl Project {
             (workspace, secret, next_id)
         };
         let mut project = Self {
-            db: Some(db),
+            db: Some(Arc::new(db)),
+            path: Some(path.to_owned()),
             memory: BTreeMap::new(),
             workspace,
             secret,
@@ -113,9 +211,14 @@ impl Project {
             ws_memory: BTreeMap::new(),
             scan_jobs: BTreeMap::new(),
             findings: BTreeMap::new(),
-        };
+            audit: vec![],
+            annotations: BTreeMap::new(),
+        }
+        .normalised();
         project.load_websockets()?;
         project.load_scanner()?;
+        project.load_audit()?;
+        project.load_annotations()?;
         project.save_workspace()?;
         Ok(project)
     }
@@ -159,7 +262,7 @@ impl Project {
             }
             tx.commit()?;
         } else {
-            self.memory.insert(flow.id, flow);
+            self.memory.insert(flow.id, Arc::new(flow));
         }
         self.next_id = self.next_id.max(next_id);
         Ok(())
@@ -186,6 +289,7 @@ impl Project {
                 }
                 tx.open_table(META)?.insert("workspace", bytes.as_slice())?;
                 websockets::delete_tables(&tx, ids)?;
+                annotations::delete_tables(&tx, ids)?;
             }
             tx.commit()?;
         } else {
@@ -197,6 +301,7 @@ impl Project {
         self.ws_sessions.retain(|id, _| !ids.contains(id));
         self.ws_summaries.retain(|(id, _), _| !ids.contains(id));
         self.ws_memory.retain(|(id, _), _| !ids.contains(id));
+        self.annotations.retain(|id, _| !ids.contains(id));
         Ok(())
     }
     pub fn get(&self, id: u64) -> Result<Option<Exchange>> {
@@ -208,7 +313,7 @@ impl Project {
                 .map(|v| serde_json::from_slice(v.value()))
                 .transpose()?)
         } else {
-            Ok(self.memory.get(&id).cloned())
+            Ok(self.memory.get(&id).map(|flow| (**flow).clone()))
         }
     }
     pub fn list(&self) -> Result<Vec<Exchange>> {
@@ -222,7 +327,7 @@ impl Project {
                 })
                 .collect()
         } else {
-            Ok(self.memory.values().cloned().collect())
+            Ok(self.memory.values().map(|flow| (**flow).clone()).collect())
         }
     }
     /// Move the current in-memory project to a new disk file without replacing
@@ -252,6 +357,8 @@ impl Project {
             }
             self.copy_websockets(&mut disk)?;
             self.copy_scanner(&mut disk)?;
+            self.copy_audit(&mut disk)?;
+            self.copy_annotations(&mut disk)?;
         }
         // The native save dialog confirms replacement; only replace after the
         // complete project has been written successfully.
@@ -301,6 +408,8 @@ impl Project {
             }
             self.copy_websockets(&mut dest)?;
             self.copy_scanner(&mut dest)?;
+            self.copy_audit(&mut dest)?;
+            self.copy_annotations(&mut dest)?;
             Ok(())
         })();
         if result.is_err() {

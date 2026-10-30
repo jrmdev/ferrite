@@ -36,7 +36,7 @@ fn args() -> Result<Args> {
             "--export-ca" => a.ca = Some(it.next().context("--export-ca requires a path")?.into()),
             "--help" | "-h" => {
                 println!(
-                    "Ferrite Workbench 0.1\n\nUsage: ferrite [--project FILE] [--listen IP:PORT] [--headless]\n               [--transparent] [--fallback URL] [--export-ca FILE]\n\nWithout --project, uses a temporary in-memory project.\nHeadless proxy starts with interception disabled. Ctrl-C stops it.\n--export-ca writes only the public CA certificate (PEM).\nBuild without the GUI: cargo build --no-default-features"
+                    "Ferrite Workbench 0.1\n\nUsage: ferrite [--project FILE] [--listen IP:PORT] [--headless]\n               [--transparent] [--fallback URL] [--export-ca FILE]\n       ferrite mcp [--headless ...]   (MCP server; see ferrite mcp --help)\n\nWithout --project, uses a temporary in-memory project.\nHeadless proxy starts with interception disabled. Ctrl-C stops it.\n--export-ca writes only the public CA certificate (PEM).\nBuild without the GUI: cargo build --no-default-features"
                 );
                 std::process::exit(0);
             }
@@ -64,7 +64,113 @@ fn export_ca(engine: &Engine, path: &Path) -> Result<()> {
     f.write_all(engine.authority.pem().as_bytes())?;
     Ok(())
 }
+const MCP_HELP: &str = "Ferrite Workbench MCP server (Model Context Protocol over stdio)
+
+Usage: ferrite mcp [--endpoint-file FILE]
+       ferrite mcp --headless [--project FILE] [--listen IP:PORT] [--start-proxy]
+                   [--allow-requests] [--allow-active-scans] [--include-credentials]
+
+Without --headless, relays an MCP client (for example Claude Code) to the
+running Ferrite window. Enable MCP in Ferrite's MCP page first.
+
+--headless runs Ferrite without a window and owns the project exclusively.
+Requests and active scans are denied unless pre-authorised with
+--allow-requests / --allow-active-scans; they stay limited to the project's
+target scope. --start-proxy also starts the proxy listener.
+
+Standard output carries only MCP messages; diagnostics go to standard error.";
+
+fn mcp_main(mut it: impl Iterator<Item = String>) -> Result<()> {
+    use ferrite::mcp::{
+        McpSettings, Permission,
+        host::{Host, HostMode},
+        ipc, server,
+    };
+    let mut headless = false;
+    let mut project = None;
+    let mut listen = None;
+    let mut start_proxy = false;
+    let mut endpoint = None;
+    let mut settings = McpSettings {
+        enabled: true,
+        send_requests: Permission::Deny,
+        active_scans: Permission::Deny,
+        ..Default::default()
+    };
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--headless" => headless = true,
+            "--project" => {
+                project = Some(PathBuf::from(
+                    it.next().context("--project requires a path")?,
+                ))
+            }
+            "--listen" => listen = Some(it.next().context("--listen requires IP:port")?),
+            "--start-proxy" => start_proxy = true,
+            "--allow-requests" => settings.send_requests = Permission::Allow,
+            "--allow-active-scans" => settings.active_scans = Permission::Allow,
+            "--include-credentials" => settings.include_credentials = true,
+            "--endpoint-file" => {
+                endpoint = Some(PathBuf::from(
+                    it.next().context("--endpoint-file requires a path")?,
+                ))
+            }
+            "--help" | "-h" => {
+                eprintln!("{MCP_HELP}");
+                return Ok(());
+            }
+            _ => anyhow::bail!("Unknown argument {flag}; use ferrite mcp --help"),
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    if !headless {
+        anyhow::ensure!(
+            project.is_none() && listen.is_none() && !start_proxy,
+            "--project, --listen and --start-proxy require --headless"
+        );
+        let endpoint = match endpoint {
+            Some(path) => path,
+            None => ipc::default_endpoint_path()?,
+        };
+        return runtime.block_on(server::run_relay(endpoint));
+    }
+    // redb locks the file, so a project open in the GUI cannot be opened here.
+    let project = match &project {
+        Some(path) => Project::open(path)
+            .with_context(|| format!("Open {} (close it in Ferrite first)", path.display()))?,
+        None => Project::temporary(),
+    };
+    let preferences = Preferences::load(&project)?;
+    let engine = Engine::new_with_key(project, preferences.ca_key())?;
+    if let Some(listen) = listen {
+        let mut proxy = engine.settings();
+        proxy.listen = listen;
+        engine.configure(proxy)?;
+    }
+    let host = Host::new(engine.clone(), settings, HostMode::Headless);
+    runtime.block_on(async {
+        let listener = if start_proxy {
+            let listener = engine.start().await?;
+            eprintln!("Ferrite proxy listening on {}", listener.address);
+            Some(listener)
+        } else {
+            None
+        };
+        let result = server::run_headless(host).await;
+        let _ = ferrite::scanner::runner::shutdown(engine.clone());
+        if let Some(listener) = listener {
+            listener.stop().await;
+        }
+        result
+    })
+}
+
 fn main() -> Result<()> {
+    let mut raw = std::env::args().skip(1).peekable();
+    if raw.peek().map(String::as_str) == Some("mcp") {
+        raw.next();
+        return mcp_main(raw);
+    }
     let args = args()?;
     let project = if let Some(path) = &args.project {
         Project::open(path)?

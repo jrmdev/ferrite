@@ -1,5 +1,8 @@
 #[cfg(feature = "gui")]
 pub mod app;
+pub mod browser;
+pub mod comparer;
+pub mod decoder;
 pub mod display_timezone;
 pub mod engine;
 pub mod history;
@@ -7,6 +10,7 @@ pub mod history_export;
 pub mod http;
 pub mod http2;
 pub mod intruder;
+pub mod mcp;
 pub mod model;
 pub mod preferences;
 pub mod project;

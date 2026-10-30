@@ -1,11 +1,12 @@
 use super::history_viewport::HistoryViewport;
 use super::{EntryAction, entry_menu, history_selection::HistorySelection, timestamp};
 use crate::display_timezone::DisplayTimezone;
-use crate::history::short_content_type;
+use crate::history::{Annotation, short_content_type};
 use crate::model::Exchange;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SortColumn {
@@ -18,10 +19,11 @@ enum SortColumn {
     Duration,
     Tool,
     Method,
+    Comment,
     Url,
 }
 
-const COLUMNS: [(SortColumn, &str, f32); 9] = [
+const COLUMNS: [(SortColumn, &str, f32); 10] = [
     (SortColumn::Id, "#", 50.0),
     (SortColumn::Timestamp, "Timestamp", 200.0),
     (SortColumn::Status, "Status", 70.0),
@@ -30,6 +32,7 @@ const COLUMNS: [(SortColumn, &str, f32); 9] = [
     (SortColumn::Duration, "Duration (ms)", 100.0),
     (SortColumn::Tool, "Tool", 80.0),
     (SortColumn::Method, "Method", 70.0),
+    (SortColumn::Comment, "Comment", 140.0),
     (SortColumn::Url, "URL", 240.0),
 ];
 
@@ -58,7 +61,22 @@ impl HistorySort {
         }
     }
 
+    #[cfg(test)]
     fn compare(&self, a: &Exchange, b: &Exchange) -> Ordering {
+        self.compare_with(a, b, &BTreeMap::new())
+    }
+
+    fn compare_with(
+        &self,
+        a: &Exchange,
+        b: &Exchange,
+        annotations: &BTreeMap<u64, Annotation>,
+    ) -> Ordering {
+        let comment = |id| {
+            annotations
+                .get(&id)
+                .map_or("", |a: &Annotation| a.comment.as_str())
+        };
         let order = match self.column {
             SortColumn::Id => a.id.cmp(&b.id),
             SortColumn::Timestamp => a.timestamp_ms.cmp(&b.timestamp_ms),
@@ -70,6 +88,7 @@ impl HistorySort {
             SortColumn::Duration => a.duration_ms.cmp(&b.duration_ms),
             SortColumn::Tool => a.tool.cmp(&b.tool),
             SortColumn::Method => a.method.cmp(&b.method),
+            SortColumn::Comment => comment(a.id).cmp(comment(b.id)),
             SortColumn::Url => a.url.cmp(&b.url),
         }
         .then_with(|| a.id.cmp(&b.id));
@@ -81,18 +100,29 @@ impl HistorySort {
     }
 }
 
+/// How the table is presented: which history it shows and with what notes.
+pub(super) struct TableView<'a> {
+    pub intruder: bool,
+    pub timezone: DisplayTimezone,
+    pub annotations: &'a BTreeMap<u64, Annotation>,
+}
+
 pub(super) fn show(
     ui: &mut egui::Ui,
     rows: &mut [&Exchange],
     selection: &mut HistorySelection,
     sort: &mut HistorySort,
     viewport: &mut HistoryViewport,
-    intruder: bool,
-    timezone: DisplayTimezone,
+    view: TableView<'_>,
 ) -> Option<(Vec<u64>, EntryAction)> {
+    let TableView {
+        intruder,
+        timezone,
+        annotations,
+    } = view;
     let mut action = None;
     let original_sort = *sort;
-    rows.sort_unstable_by(|a, b| sort.compare(a, b));
+    rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
     let initial_ids: Vec<_> = rows.iter().map(|flow| flow.id).collect();
     let offset = viewport.offset_for(&initial_ids, *sort);
     let invert_stripes = viewport.invert_stripes_for(&initial_ids, *sort);
@@ -158,7 +188,7 @@ pub(super) fn show(
                 }
             }).body(|mut body| {
                 // Sort after rendering headers so a click updates rows in the same frame.
-                rows.sort_unstable_by(|a, b| sort.compare(a, b));
+                rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
                 let visible: Vec<_> = rows.iter().map(|flow| flow.id).collect();
                 selection.retain_visible(&visible);
                 // Insert the stripes behind the cells so selection/hover fills still take precedence.
@@ -166,6 +196,7 @@ pub(super) fn show(
                 let background = painter.add(egui::Shape::Noop);
                 let stripe_color = body.ui_mut().visuals().faint_bg_color;
                 let hover_color = body.ui_mut().visuals().widgets.hovered.bg_fill;
+                let dark = body.ui_mut().visuals().dark_mode;
                 let spacing = body.ui_mut().spacing().item_spacing;
                 let row_width = body.widths().iter().sum::<f32>()
                     + spacing.x * (body.widths().len() - 1) as f32;
@@ -182,7 +213,9 @@ pub(super) fn show(
                         if flow.error.is_some() { format!("{} (error)", flow.status) } else { flow.status.to_string() },
                         short_content_type(&flow.response),
                         flow.response.len().to_string(), flow.duration_ms.to_string(),
-                        flow.tool.clone(), flow.method.clone(), flow.url.clone()];
+                        flow.tool.clone(), flow.method.clone(),
+                        annotations.get(&flow.id).map(|a| a.comment.lines().next().unwrap_or("").to_string()).unwrap_or_default(),
+                        flow.url.clone()];
                     let mut rect = egui::Rect::NOTHING;
                     let mut response = None;
                     for (column, value) in values.into_iter().enumerate() {
@@ -211,7 +244,12 @@ pub(super) fn show(
                         });
                     }
                     let response = response.unwrap();
+                    let highlight = annotations.get(&flow.id).and_then(|a| a.highlight).map(|h| {
+                        let [r, g, b] = h.rgb();
+                        egui::Color32::from_rgba_unmultiplied(r, g, b, if dark { 70 } else { 90 })
+                    });
                     let fill = if response.hovered() && !selected { Some(hover_color) }
+                        else if highlight.is_some() { highlight }
                         else if striped { Some(stripe_color) } else { None };
                     if let Some(fill) = fill {
                         stripes.push(egui::Shape::rect_filled(rect.expand2(spacing * 0.5),
@@ -225,11 +263,18 @@ pub(super) fn show(
                     }
                     if let Some(value) = entry_menu(&response, true) {
                         let ids = if matches!(value, EntryAction::Intruder | EntryAction::CopyUrl
-                            | EntryAction::CopyCurl | EntryAction::CopyPython) { vec![flow.id] }
+                            | EntryAction::CopyCurl | EntryAction::CopyPython | EntryAction::CopyMessage(_)
+                            | EntryAction::Comparer(..) | EntryAction::Decoder(_)) { vec![flow.id] }
                             else { visible.iter().filter(|id| selection.ids.contains(id)).copied().collect() };
                         action = Some((ids, value));
                     }
-                    if let Some(error) = &flow.error { response.on_hover_text(error); }
+                    let comment = annotations.get(&flow.id).map(|a| a.comment.as_str()).filter(|c| !c.is_empty());
+                    match (&flow.error, comment) {
+                        (Some(error), Some(comment)) => { response.on_hover_text(format!("{comment}\n{error}")); }
+                        (Some(error), None) => { response.on_hover_text(error); }
+                        (None, Some(comment)) => { response.on_hover_text(comment); }
+                        (None, None) => {}
+                    }
                 });
                 painter.set(background, egui::Shape::Vec(stripes));
             });
@@ -331,8 +376,11 @@ mod tests {
                             &mut selection,
                             &mut sort,
                             &mut viewport,
-                            false,
-                            DisplayTimezone::Utc,
+                            TableView {
+                                intruder: false,
+                                timezone: DisplayTimezone::Utc,
+                                annotations: &BTreeMap::new(),
+                            },
                         );
                     });
                 },
@@ -403,8 +451,11 @@ mod tests {
                                 &mut selection,
                                 &mut sort,
                                 viewport,
-                                false,
-                                DisplayTimezone::Utc,
+                                TableView {
+                                    intruder: false,
+                                    timezone: DisplayTimezone::Utc,
+                                    annotations: &BTreeMap::new(),
+                                },
                             );
                         });
                     },

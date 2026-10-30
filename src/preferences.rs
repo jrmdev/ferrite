@@ -1,6 +1,7 @@
 //! Application-wide appearance and CA identity, independent of project files.
 use crate::{
-    display_timezone::DisplayTimezone, model::ColorScheme, project::Project, tls::Authority,
+    browser::BrowserSettings, display_timezone::DisplayTimezone, mcp::McpSettings,
+    model::ColorScheme, project::Project, tls::Authority,
 };
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -16,6 +17,21 @@ struct Stored {
     ca_key: Vec<u8>,
     #[serde(default)]
     timezone: DisplayTimezone,
+    #[serde(default)]
+    browser: BrowserSettings,
+    #[serde(default)]
+    mcp: McpSettings,
+}
+
+/// Ferrite's configuration directory: `FERRITE_CONFIG_DIR`, or
+/// `<platform config dir>/ferrite` (for example `~/.config/ferrite`).
+pub fn config_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("FERRITE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(dirs::config_dir()
+        .context("Cannot locate the application configuration directory")?
+        .join("ferrite"))
 }
 
 pub struct Preferences {
@@ -25,10 +41,7 @@ pub struct Preferences {
 
 impl Preferences {
     pub fn load(project: &Project) -> Result<Self> {
-        let dir = dirs::config_dir()
-            .context("Cannot locate the application configuration directory")?
-            .join("ferrite");
-        Self::load_at(&dir.join("settings.json"), project)
+        Self::load_at(&config_dir()?.join("settings.json"), project)
     }
 
     pub fn load_at(path: &Path, project: &Project) -> Result<Self> {
@@ -39,6 +52,8 @@ impl Preferences {
             let stored = Stored {
                 color_scheme: project.workspace.color_scheme,
                 timezone: DisplayTimezone::default(),
+                browser: BrowserSettings::default(),
+                mcp: McpSettings::default(),
                 ca_key: match project.ca_key() {
                     Some(key) => key,
                     None => Authority::generate_key()?,
@@ -107,6 +122,34 @@ impl Preferences {
         let updated = Self::with_lock(&self.path, || {
             let mut latest = Self::read(&self.path)?;
             latest.stored.timezone = timezone;
+            latest.write(true)?;
+            Ok(latest.stored)
+        })?;
+        self.stored = updated;
+        Ok(())
+    }
+    pub fn browser(&self) -> &BrowserSettings {
+        &self.stored.browser
+    }
+    pub fn set_browser(&mut self, browser: BrowserSettings) -> Result<()> {
+        browser.validate()?;
+        let updated = Self::with_lock(&self.path, || {
+            let mut latest = Self::read(&self.path)?;
+            latest.stored.browser = browser;
+            latest.write(true)?;
+            Ok(latest.stored)
+        })?;
+        self.stored = updated;
+        Ok(())
+    }
+    pub fn mcp(&self) -> &McpSettings {
+        &self.stored.mcp
+    }
+    pub fn set_mcp(&mut self, mcp: McpSettings) -> Result<()> {
+        mcp.validate()?;
+        let updated = Self::with_lock(&self.path, || {
+            let mut latest = Self::read(&self.path)?;
+            latest.stored.mcp = mcp;
             latest.write(true)?;
             Ok(latest.stored)
         })?;
@@ -235,6 +278,26 @@ mod tests {
         let mut first = Preferences::load_at(&path, &project).unwrap();
         let mut second = Preferences::load_at(&path, &project).unwrap();
         assert_eq!(first.timezone(), DisplayTimezone::Utc);
+        assert_eq!(first.browser(), &BrowserSettings::default());
+        // MCP is opt-in and asks before sending requests by default.
+        assert!(!first.mcp().enabled);
+        assert_eq!(first.mcp().send_requests, crate::mcp::Permission::Ask);
+        assert_eq!(first.mcp().active_scans, crate::mcp::Permission::Deny);
+        assert!(!first.mcp().include_credentials);
+        let browser = BrowserSettings {
+            profile: crate::browser::ProfileMode::Persistent,
+            extra_args: vec!["--lang=en-AU".into()],
+            ..Default::default()
+        };
+        second.set_browser(browser.clone()).unwrap();
+        assert!(
+            second
+                .set_browser(BrowserSettings {
+                    extra_args: vec!["--proxy-server=direct://".into()],
+                    ..Default::default()
+                })
+                .is_err()
+        );
         first
             .set_timezone(DisplayTimezone::Named(chrono_tz::Asia::Kolkata))
             .unwrap();
@@ -245,6 +308,7 @@ mod tests {
             DisplayTimezone::Named(chrono_tz::Asia::Kolkata)
         );
         assert_eq!(reloaded.scheme(), ColorScheme::Light);
+        assert_eq!(reloaded.browser(), &browser);
         assert_eq!(
             Authority::from_key(reloaded.ca_key())
                 .unwrap()

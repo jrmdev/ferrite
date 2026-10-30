@@ -3,13 +3,17 @@ use crate::{
     engine::{Decision, Engine, Listener, Stage},
     http::{self, Message},
     intruder::{AttackType, Plan},
-    model::{ColorScheme, Exchange, RepeaterTab, RuleTarget, UpstreamKind},
+    model::{ColorScheme, Exchange, RuleTarget, UpstreamKind},
     preferences::Preferences,
     project::Project,
 };
 use eframe::egui::{self, Color32, RichText};
 mod alerts;
+mod browser_view;
+mod comparer_view;
+mod decoder_view;
 mod editor_context;
+mod highlight;
 mod history_export;
 mod history_filters;
 mod history_selection;
@@ -17,6 +21,8 @@ mod history_table;
 mod history_viewport;
 mod http_editor;
 mod json_preview;
+mod mcp_view;
+mod repeater_view;
 mod request_copy;
 mod response_content;
 mod scanner_view;
@@ -45,7 +51,11 @@ enum Page {
     Repeater,
     Intruder,
     Scanner,
+    Decoder,
+    Comparer,
     Proxy,
+    Browser,
+    Mcp,
     Alerts,
     Plugins,
 }
@@ -56,6 +66,7 @@ enum FileAction {
     SaveProject,
     ExportCertificate,
     LoadPayloadSet(usize),
+    BrowserExecutable,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchAction {
@@ -78,8 +89,10 @@ enum SwitchChoice {
 enum Event {
     FileDialog(FileAction, Option<PathBuf>),
     Started(Result<Listener>),
-    Repeater(usize, Result<Exchange>),
+    Repeater(u64, Result<Exchange>),
     AttackDone(Result<usize>),
+    Browser(browser_view::BrowserEvent),
+    Mcp(Result<crate::mcp::ipc::IpcServer>),
 }
 pub struct Workbench {
     engine: Arc<Engine>,
@@ -117,8 +130,10 @@ pub struct Workbench {
     intercept_edit: String,
     intercept_hex: bool,
     intercept_omission: Option<response_content::BodyOmitted>,
-    repeater_index: usize,
-    repeater_busy: Vec<usize>,
+    /// Selected Repeater tab ID.
+    repeater_tab: u64,
+    /// Tab IDs with a send in flight.
+    repeater_busy: Vec<u64>,
     repeater_flow: Option<u64>,
     repeater_cursor: usize,
     attack_cancel: Option<tokio::sync::watch::Sender<bool>>,
@@ -130,46 +145,28 @@ pub struct Workbench {
     websocket_intercept: bool,
     timezone_search: String,
     scanner_view: scanner_view::State,
+    browser: browser_view::State,
+    mcp: Arc<crate::mcp::host::Host>,
+    mcp_view: mcp_view::State,
+    decoder: decoder_view::State,
+    comparer: comparer_view::State,
+    /// Exchanges whose comment is being edited, with the draft text.
+    comment_edit: Option<(Vec<u64>, String)>,
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes
-        .chunks(24)
-        .map(|row| {
-            row.iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    http::hex_dump(bytes)
 }
 fn unhex(text: &str) -> Result<Vec<u8>> {
-    let s: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    anyhow::ensure!(
-        s.len().is_multiple_of(2) && s.is_ascii(),
-        "Hex needs complete byte pairs"
-    );
-    (0..s.len())
-        .step_by(2)
-        .map(|i| Ok(u8::from_str_radix(&s[i..i + 2], 16)?))
-        .collect()
+    http::parse_hex(text)
 }
 fn editable(bytes: &[u8]) -> (String, bool) {
-    match std::str::from_utf8(bytes) {
-        Ok(s) if http_editor::is_display_text(bytes) => (s.into(), false),
-        Ok(_) => (hex(bytes), true),
-        Err(_) => (hex(bytes), true),
-    }
+    http::editor_text(bytes)
 }
 fn subsection_heading(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).size(15.0).strong());
 }
 fn decode_editor(text: &str, is_hex: bool) -> Result<Message> {
-    if is_hex {
-        Message::parse(&unhex(text)?)
-    } else {
-        http::from_editor(text)
-    }
+    http::from_editor_buffer(text, is_hex)
 }
 // Keep binary messages byte-editable while also exposing their HTTP headers as text.
 fn hex_headers(
@@ -338,6 +335,16 @@ enum EntryAction {
     CopyUrl,
     CopyCurl,
     CopyPython,
+    /// Copy the request (false) or response (true) as text.
+    CopyMessage(bool),
+    /// Send the request (false) or response (true) to a Comparer slot.
+    Comparer(bool, comparer_view::Slot),
+    /// Send the request (false) or response (true) to Decoder.
+    Decoder(bool),
+    /// Set or clear the highlight colour of stored exchanges.
+    Highlight(Option<crate::history::Highlight>),
+    /// Edit the comment of stored exchanges.
+    Comment,
     Repeater,
     Intruder,
     Scanner,
@@ -357,6 +364,8 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
         ui.menu_button("Copy", |ui| {
             for (label, value) in [
                 ("URL", EntryAction::CopyUrl),
+                ("Request", EntryAction::CopyMessage(false)),
+                ("Response", EntryAction::CopyMessage(true)),
                 ("as curl", EntryAction::CopyCurl),
                 ("as Python requests", EntryAction::CopyPython),
             ] {
@@ -377,6 +386,42 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
                     ui.close();
                 }
             }
+            ui.menu_button("Comparer", |ui| {
+                for (label, value) in [
+                    (
+                        "Request as A",
+                        EntryAction::Comparer(false, comparer_view::Slot::A),
+                    ),
+                    (
+                        "Request as B",
+                        EntryAction::Comparer(false, comparer_view::Slot::B),
+                    ),
+                    (
+                        "Response as A",
+                        EntryAction::Comparer(true, comparer_view::Slot::A),
+                    ),
+                    (
+                        "Response as B",
+                        EntryAction::Comparer(true, comparer_view::Slot::B),
+                    ),
+                ] {
+                    if ui.button(label).clicked() {
+                        action = Some(value);
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button("Decoder", |ui| {
+                for (label, value) in [
+                    ("Request", EntryAction::Decoder(false)),
+                    ("Response", EntryAction::Decoder(true)),
+                ] {
+                    if ui.button(label).clicked() {
+                        action = Some(value);
+                        ui.close();
+                    }
+                }
+            });
         });
         ui.separator();
         if let Some(label) = delete
@@ -412,6 +457,29 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
         }
         if export {
             ui.separator();
+            ui.menu_button("Highlight", |ui| {
+                for colour in crate::history::Highlight::ALL {
+                    let [r, g, b] = colour.rgb();
+                    if ui
+                        .button(
+                            RichText::new(format!("■ {}", colour.label()))
+                                .color(Color32::from_rgb(r, g, b)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(EntryAction::Highlight(Some(colour)));
+                        ui.close();
+                    }
+                }
+                if ui.button("None").clicked() {
+                    action = Some(EntryAction::Highlight(None));
+                    ui.close();
+                }
+            });
+            if ui.button("Comment…").clicked() {
+                action = Some(EntryAction::Comment);
+                ui.close();
+            }
             if ui.button("Export selected items").clicked() {
                 action = Some(EntryAction::Export);
                 ui.close();
@@ -445,6 +513,12 @@ impl Workbench {
         );
         let (tx, rx) = mpsc::channel();
         let s = engine.settings();
+        let mcp = crate::mcp::host::Host::new(
+            engine.clone(),
+            preferences.mcp().clone(),
+            crate::mcp::host::HostMode::Gui,
+        );
+        let start_mcp = preferences.mcp().enabled;
         let attack_payloads = engine
             .project
             .lock()
@@ -455,7 +529,7 @@ impl Workbench {
             .iter()
             .map(|s| s.join("\n"))
             .collect();
-        let (initial_repeater_flow, initial_repeater_cursor) = engine
+        let (initial_repeater_tab, initial_repeater_flow, initial_repeater_cursor) = engine
             .project
             .lock()
             .unwrap()
@@ -464,6 +538,7 @@ impl Workbench {
             .first()
             .map(|tab| {
                 (
+                    tab.id,
                     tab.history.last().copied(),
                     tab.history.len().saturating_sub(1),
                 )
@@ -505,7 +580,7 @@ impl Workbench {
             intercept_edit: String::new(),
             intercept_hex: false,
             intercept_omission: None,
-            repeater_index: 0,
+            repeater_tab: initial_repeater_tab,
             repeater_busy: vec![],
             repeater_flow: initial_repeater_flow,
             repeater_cursor: initial_repeater_cursor,
@@ -518,7 +593,20 @@ impl Workbench {
             websocket_intercept: false,
             timezone_search: String::new(),
             scanner_view: scanner_view::State::default(),
+            browser: browser_view::State::default(),
+            mcp,
+            mcp_view: mcp_view::State::default(),
+            decoder: decoder_view::State::default(),
+            comparer: comparer_view::State::default(),
+            comment_edit: None,
         }
+        .started(start_mcp)
+    }
+    fn started(mut self, start_mcp: bool) -> Self {
+        if start_mcp {
+            self.start_mcp();
+        }
+        self
     }
     fn report<T>(&mut self, result: Result<T>) -> Option<T> {
         match result {
@@ -555,26 +643,17 @@ impl Workbench {
                         self.notify("Proxy", format!("Listening on {}", listener.address));
                         self.listener = Some(listener);
                     }
-                }
-                Event::Repeater(index, result) => {
-                    self.repeater_busy.retain(|i| *i != index);
-                    if let Some(flow) = self.report(result) {
-                        self.repeater_flow = Some(flow.id);
-                        if let Some(tab) = self
-                            .engine
-                            .project
-                            .lock()
-                            .unwrap()
-                            .workspace
-                            .repeater
-                            .get_mut(index)
-                        {
-                            tab.history.push(flow.id);
-                            self.repeater_cursor = tab.history.len().saturating_sub(1);
+                    if self.browser.launch_after_start {
+                        if self.listener.is_some() {
+                            self.launch_browser();
+                        } else {
+                            self.browser.launch_after_start = false;
                         }
-                        self.persist();
                     }
                 }
+                Event::Browser(event) => self.browser_event(event),
+                Event::Mcp(result) => self.mcp_started(result),
+                Event::Repeater(tab, result) => self.repeater_sent(tab, result),
                 Event::AttackDone(result) => {
                     self.attack_running = false;
                     self.attack_cancel = None;
@@ -684,6 +763,7 @@ impl Workbench {
         let project = Engine::new_with_key(project, self.preferences.ca_key());
         if let Some(engine) = self.report(project) {
             self.engine = engine;
+            self.mcp.set_engine(self.engine.clone());
             self.alerts.clear();
             self.listener_was_running = false;
             self.project_path = path;
@@ -696,8 +776,7 @@ impl Workbench {
             self.history_viewport = Default::default();
             self.history_export = None;
             self.response_cache = ResponseCache::default();
-            self.repeater_index = 0;
-            (self.repeater_flow, self.repeater_cursor) = self
+            let first = self
                 .engine
                 .project
                 .lock()
@@ -705,13 +784,13 @@ impl Workbench {
                 .workspace
                 .repeater
                 .first()
-                .map(|tab| {
-                    (
-                        tab.history.last().copied(),
-                        tab.history.len().saturating_sub(1),
-                    )
-                })
-                .unwrap_or_default();
+                .cloned();
+            match first {
+                Some(tab) => self.select_repeater_tab(&tab),
+                None => {
+                    (self.repeater_tab, self.repeater_flow, self.repeater_cursor) = (0, None, 0);
+                }
+            }
             self.intercept_id = None;
             let s = self.engine.settings();
             self.settings_json = serde_json::to_string_pretty(&s).unwrap();
@@ -768,6 +847,9 @@ impl Workbench {
                     .set_title(format!("Load payload set {}", index + 1))
                     .add_filter("Payload list", &["txt", "lst", "csv"])
                     .pick_file(),
+                FileAction::BrowserExecutable => rfd::FileDialog::new()
+                    .set_title("Choose a Chromium-family browser executable")
+                    .pick_file(),
             };
             let _ = tx.send(Event::FileDialog(action, path));
             ctx.request_repaint();
@@ -810,6 +892,7 @@ impl Workbench {
                     self.switch_state = None;
                 }
             }
+            FileAction::BrowserExecutable => self.complete_browser_pick(path),
             FileAction::ExportCertificate => {
                 let result =
                     std::fs::write(&path, self.engine.authority.pem()).map_err(anyhow::Error::from);
@@ -1081,7 +1164,7 @@ impl Workbench {
                 }
             }
         });
-        ui.label("Import this public certificate into your test browser's certificate authorities to intercept HTTPS.");
+        ui.label("The built-in browser (Open browser) trusts this CA automatically, only inside its isolated profile. For other browsers or devices, import this public certificate as a certificate authority to intercept HTTPS.");
         ui.label(format!(
             "Current CA SHA-256 fingerprint: {}",
             self.engine.authority.fingerprint()
@@ -1183,6 +1266,7 @@ impl Workbench {
             }
         };
         let scope = self.engine.settings().scope;
+        let annotations = self.engine.project.lock().unwrap().annotations().clone();
         let mut rows: Vec<_> = self
             .rows
             .iter()
@@ -1193,7 +1277,7 @@ impl Workbench {
                     self.websocket_view.reveal_handshake == Some(r.id)
                         || compiled
                             .as_ref()
-                            .is_some_and(|filter| filter.matches(r, &scope))
+                            .is_some_and(|filter| filter.matches(r, &scope, annotations.get(&r.id)))
                 }
             })
             .collect();
@@ -1210,8 +1294,11 @@ impl Workbench {
             &mut self.history_selection[usize::from(intruder_only)],
             &mut self.history_sort[usize::from(intruder_only)],
             &mut self.history_viewport[usize::from(intruder_only)],
-            intruder_only,
-            self.preferences.timezone(),
+            history_table::TableView {
+                intruder: intruder_only,
+                timezone: self.preferences.timezone(),
+                annotations: &annotations,
+            },
         );
         if let Some((ids, action)) = action {
             self.entry_action(ui.ctx(), &ids, action);
@@ -1265,6 +1352,70 @@ impl Workbench {
                     if let Some(text) = self.report(text) {
                         ctx.copy_text(text);
                     }
+                }
+            }
+            EntryAction::CopyMessage(response) => {
+                if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
+                    let bytes = if response {
+                        &flow.response
+                    } else {
+                        &flow.request
+                    };
+                    ctx.copy_text(String::from_utf8_lossy(bytes).into_owned());
+                }
+            }
+            EntryAction::Comparer(response, slot) => {
+                if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
+                    let part = if response { "response" } else { "request" };
+                    let label = if flow.id == 0 {
+                        format!("Repeater {part}")
+                    } else {
+                        format!("#{} {part}", flow.id)
+                    };
+                    let bytes = if response {
+                        &flow.response
+                    } else {
+                        &flow.request
+                    };
+                    self.send_to_comparer(slot, label, &bytes.clone());
+                }
+            }
+            EntryAction::Decoder(response) => {
+                if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
+                    self.decoder.set_input(if response {
+                        &flow.response
+                    } else {
+                        &flow.request
+                    });
+                    self.page = Page::Decoder;
+                }
+            }
+            EntryAction::Highlight(colour) => {
+                let result = {
+                    let mut project = self.engine.project.lock().unwrap();
+                    let changes: Vec<_> = flows
+                        .iter()
+                        .filter(|flow| flow.id != 0)
+                        .map(|flow| {
+                            let mut annotation =
+                                project.annotation(flow.id).cloned().unwrap_or_default();
+                            annotation.highlight = colour;
+                            (flow.id, annotation)
+                        })
+                        .collect();
+                    project.set_annotations(&changes)
+                };
+                self.report(result);
+            }
+            EntryAction::Comment => {
+                let ids: Vec<u64> = flows.iter().map(|f| f.id).filter(|id| *id != 0).collect();
+                let current = ids
+                    .first()
+                    .and_then(|id| self.engine.project.lock().unwrap().annotation(*id).cloned())
+                    .map(|a| a.comment)
+                    .unwrap_or_default();
+                if !ids.is_empty() {
+                    self.comment_edit = Some((ids, current));
                 }
             }
             EntryAction::Repeater => {
@@ -1325,6 +1476,53 @@ impl Workbench {
             }
         }
     }
+    fn comment_dialog(&mut self, ctx: &egui::Context) {
+        let Some((ids, draft)) = &mut self.comment_edit else {
+            return;
+        };
+        let mut save = None;
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("history-comment")).show(ctx, |ui| {
+            ui.heading(if ids.len() == 1 {
+                format!("Comment on #{}", ids[0])
+            } else {
+                format!("Comment on {} exchanges", ids.len())
+            });
+            ui.add(
+                egui::TextEdit::multiline(draft)
+                    .desired_rows(4)
+                    .desired_width(420.0)
+                    .hint_text("Notes are stored in the project and searchable in History"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    save = Some((ids.clone(), draft.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if let Some((ids, comment)) = save {
+            let result = {
+                let mut project = self.engine.project.lock().unwrap();
+                let changes: Vec<_> = ids
+                    .iter()
+                    .map(|id| {
+                        let mut annotation = project.annotation(*id).cloned().unwrap_or_default();
+                        annotation.comment = comment.trim().to_string();
+                        (*id, annotation)
+                    })
+                    .collect();
+                project.set_annotations(&changes)
+            };
+            self.report(result);
+            close = true;
+        }
+        if close {
+            self.comment_edit = None;
+        }
+    }
     fn editor_action(
         &mut self,
         ctx: &egui::Context,
@@ -1365,10 +1563,6 @@ impl Workbench {
         if let Some(e) = &flow.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        ui.separator();
-        let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
-        subsection_heading(&mut request_ui, "Request");
-        subsection_heading(&mut response_ui, "Response");
         let request = message_view(&flow.request, self.response_hex);
         let response = self.response_cache.get(
             flow.id,
@@ -1376,6 +1570,11 @@ impl Workbench {
             self.response_hex,
             self.engine.settings().max_message_bytes,
         );
+        highlight::find_bar(ui, &[("request", &request), ("response", &response)]);
+        ui.separator();
+        let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
+        subsection_heading(&mut request_ui, "Request");
+        subsection_heading(&mut response_ui, "Response");
         let request_output = http_editor(
             &mut request_ui,
             &mut request.as_str(),
@@ -1415,23 +1614,6 @@ impl Workbench {
         if let Some((action, flow)) = self.scanner_view.take_action() {
             self.exchange_action(ui.ctx(), vec![flow], action);
         }
-    }
-    fn send_to_repeater(&mut self, flow: &Exchange) {
-        let (request, request_hex) = editable(&flow.request);
-        let mut p = self.engine.project.lock().unwrap();
-        let index = p.workspace.repeater.len();
-        p.workspace.repeater.push(RepeaterTab {
-            name: (index + 1).to_string(),
-            destination: flow.destination.origin(),
-            request,
-            request_hex,
-            history: vec![],
-        });
-        drop(p);
-        self.repeater_index = index;
-        self.repeater_flow = None;
-        self.page = Page::Repeater;
-        self.persist();
     }
     fn send_to_intruder(&mut self, flow: &Exchange) {
         if let Ok(text) = std::str::from_utf8(&flow.request) {
@@ -1757,174 +1939,6 @@ impl Workbench {
         }
     }
 
-    fn repeater(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Repeater");
-        let mut editor_action = None;
-        let mut tabs = self
-            .engine
-            .project
-            .lock()
-            .unwrap()
-            .workspace
-            .repeater
-            .clone();
-        ui.horizontal_wrapped(|ui| {
-            for (i, t) in tabs.iter().enumerate() {
-                if ui
-                    .selectable_label(self.repeater_index == i, &t.name)
-                    .clicked()
-                {
-                    self.repeater_index = i;
-                    self.repeater_flow = t.history.last().copied();
-                    self.repeater_cursor = t.history.len().saturating_sub(1);
-                }
-            }
-            if ui.button("+").clicked() {
-                tabs.push(RepeaterTab {
-                    name: (tabs.len() + 1).to_string(),
-                    destination: "https://example.com".into(),
-                    request: "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".into(),
-                    ..Default::default()
-                });
-                self.repeater_index = tabs.len() - 1;
-                self.repeater_flow = None;
-            }
-        });
-        self.repeater_index = self.repeater_index.min(tabs.len().saturating_sub(1));
-        if let Some(tab) = tabs.get_mut(self.repeater_index) {
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut tab.name);
-                ui.label("Target");
-                ui.text_edit_singleline(&mut tab.destination);
-                if ui
-                    .add_enabled(
-                        !self.repeater_busy.contains(&self.repeater_index),
-                        egui::Button::new("Send"),
-                    )
-                    .clicked()
-                {
-                    let parsed = decode_editor(&tab.request, tab.request_hex).and_then(|r| {
-                        Ok((r, crate::model::Destination::from_url(&tab.destination)?))
-                    });
-                    if let Some((request, dest)) = self.report(parsed) {
-                        let tx = self.tx.clone();
-                        let engine = self.engine.clone();
-                        let index = self.repeater_index;
-                        self.repeater_busy.push(index);
-                        self.runtime.spawn(async move {
-                            let result = engine.execute(request, dest, "Repeater", false).await;
-                            let _ = tx.send(Event::Repeater(index, result));
-                        });
-                    }
-                }
-                ui.label(if self.repeater_busy.contains(&self.repeater_index) {
-                    "Sending…"
-                } else {
-                    ""
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut tab.request_hex, "Request is hex");
-                ui.checkbox(&mut self.response_hex, "Response as hex");
-                if ui.button("Previous").clicked() && !tab.history.is_empty() {
-                    self.repeater_cursor = self.repeater_cursor.saturating_sub(1);
-                    self.repeater_cursor = self.repeater_cursor.min(tab.history.len() - 1);
-                    self.repeater_flow = Some(tab.history[self.repeater_cursor]);
-                }
-                if ui.button("Next").clicked() && !tab.history.is_empty() {
-                    self.repeater_cursor = (self.repeater_cursor + 1).min(tab.history.len() - 1);
-                    self.repeater_flow = Some(tab.history[self.repeater_cursor]);
-                }
-                ui.label(format!("{} saved sends", tab.history.len()));
-            });
-            let flow = self
-                .repeater_flow
-                .and_then(|id| self.rows.iter().find(|r| r.id == id))
-                .cloned();
-            if let Some(flow) = &flow {
-                ui.label(format!(
-                    "Status {} · {} bytes · {} ms",
-                    flow.status,
-                    flow.response.len(),
-                    flow.duration_ms
-                ));
-                if let Some(e) = &flow.error {
-                    ui.colored_label(ui.visuals().error_fg_color, e);
-                }
-                if ui.button("Restore this request").clicked() {
-                    let (text, h) = editable(&flow.request);
-                    tab.request = text;
-                    tab.request_hex = h;
-                }
-            }
-            ui.separator();
-            let [mut request_ui, mut response_ui] = split_panes(ui, "repeater-editors", false, 0.5);
-            subsection_heading(&mut request_ui, "Request");
-            subsection_heading(&mut response_ui, "Response");
-            let headers = hex_headers(
-                &mut request_ui,
-                &tab.request,
-                tab.request_hex,
-                ("repeater-headers", self.repeater_index),
-            );
-            let request_output = http_editor(
-                &mut request_ui,
-                &mut tab.request,
-                ("repeater-request", self.repeater_index, tab.request_hex),
-            );
-            let action = item_menu(&request_output.inner.response, false, None).or_else(|| {
-                headers
-                    .as_ref()
-                    .and_then(|response| item_menu(response, false, None))
-            });
-            if let Some(action) = action {
-                editor_action = Some((action, editor_context::repeater(tab)));
-            }
-            let response = flow
-                .as_ref()
-                .map(|f| {
-                    self.response_cache.get(
-                        f.id,
-                        &f.response,
-                        self.response_hex,
-                        self.engine.settings().max_message_bytes,
-                    )
-                })
-                .unwrap_or_default();
-            let response_output = http_editor(
-                &mut response_ui,
-                &mut response.as_ref(),
-                (
-                    "repeater-response",
-                    self.repeater_index,
-                    self.repeater_flow,
-                    self.response_hex,
-                ),
-            );
-            if let Some(saved) = &flow {
-                if let Some(action) = entry_menu(&response_output.inner.response, true) {
-                    editor_action = Some((action, Ok(saved.clone())));
-                }
-            } else if let Some(action) = item_menu(&response_output.inner.response, false, None) {
-                editor_action = Some((action, editor_context::repeater(tab)));
-            }
-        }
-        let mut p = self.engine.project.lock().unwrap();
-        if serde_json::to_string(&p.workspace.repeater).unwrap()
-            != serde_json::to_string(&tabs).unwrap()
-        {
-            p.workspace.repeater = tabs;
-            let result = p.save_workspace();
-            drop(p);
-            self.report(result);
-        } else {
-            drop(p);
-        }
-        if let Some((action, snapshot)) = editor_action {
-            self.editor_action(ui.ctx(), action, snapshot, None);
-        }
-    }
     fn intruder(&mut self, ui: &mut egui::Ui) {
         ui.heading("Intruder");
         let mut attack = self
@@ -2081,6 +2095,8 @@ impl Workbench {
                     .map(|listener| listener.address.to_string())
                     .unwrap_or_else(|| self.engine.settings().listen),
             );
+            ui.separator();
+            self.browser_controls(ui);
         });
         ui.separator();
         let parsed = serde_json::from_str::<crate::model::Settings>(&self.settings_json);
@@ -2251,6 +2267,7 @@ fn timestamp(milliseconds: u64, timezone: DisplayTimezone) -> String {
 impl eframe::App for Workbench {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.refresh();
+        self.poll_browser(ctx);
         self.advance_switch(ctx);
         json_preview::configure(
             ctx,
@@ -2275,10 +2292,20 @@ impl eframe::App for Workbench {
                 ui.label(self.engine.project.lock().unwrap().workspace.name.clone());
                 ui.separator();
                 ui.label(if self.engine.is_running() {
-                    "● Proxy running"
+                    "⏺ Proxy running"
                 } else {
                     "○ Proxy stopped"
                 });
+                if self.browser.process.is_some() {
+                    ui.separator();
+                    ui.label("⏺ Browser open");
+                }
+                if let Some(status) = self.mcp_status() {
+                    ui.separator();
+                    if ui.selectable_label(false, status).clicked() {
+                        self.page = Page::Mcp;
+                    }
+                }
             });
         });
         egui::SidePanel::left("nav")
@@ -2288,12 +2315,16 @@ impl eframe::App for Workbench {
                 for (page, name) in [
                     (Page::AppSettings, "Settings"),
                     (Page::Proxy, "Proxy"),
+                    (Page::Browser, "Browser"),
+                    (Page::Mcp, "MCP"),
                     (Page::Target, "Target"),
                     (Page::Intercept, "Intercept"),
                     (Page::History, "History"),
                     (Page::Repeater, "Repeater"),
                     (Page::Intruder, "Intruder"),
                     (Page::Scanner, "Scanner"),
+                    (Page::Decoder, "Decoder"),
+                    (Page::Comparer, "Comparer"),
                     (Page::Alerts, &self.alerts.label()),
                     (Page::Plugins, "Plugins"),
                 ] {
@@ -2314,7 +2345,15 @@ impl eframe::App for Workbench {
             });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            let scroll_page = matches!(self.page, Page::AppSettings | Page::Proxy | Page::Plugins);
+            let scroll_page = matches!(
+                self.page,
+                Page::AppSettings
+                    | Page::Proxy
+                    | Page::Browser
+                    | Page::Mcp
+                    | Page::Decoder
+                    | Page::Plugins
+            );
             let show_page = |ui: &mut egui::Ui| match self.page {
                 Page::AppSettings => self.projects(ui),
                 Page::Target => self.target(ui),
@@ -2347,11 +2386,22 @@ impl eframe::App for Workbench {
                 Page::Repeater => self.repeater(ui),
                 Page::Intruder => self.intruder(ui),
                 Page::Scanner => self.scanner(ui),
+                Page::Decoder => self.decoder(ui),
+                Page::Comparer => self.comparer_page(ui),
                 Page::Proxy => self.settings(ui),
+                Page::Browser => self.browser_page(ui),
+                Page::Mcp => self.mcp_page(ui),
                 Page::Alerts => self.alerts.show(ui, self.preferences.timezone()),
                 Page::Plugins => {
                     ui.heading("Plugins");
-                    ui.label("Plugins are planned for a future release.");
+                    ui.label("Ferrite does not load third-party code yet.");
+                    ui.add_space(6.0);
+                    ui.label("To automate Ferrite or connect AI assistants today, use the MCP server: it exposes history, Repeater, scanner and WebSocket data and in-scope request sending, with permissions, scope enforcement and an audit trail.");
+                    if ui.button("Open MCP settings").clicked() {
+                        self.page = Page::Mcp;
+                    }
+                    ui.add_space(6.0);
+                    ui.weak("A sandboxed WebAssembly plugin system (capability-based, resource-limited, with scope-enforced network access) is proposed in docs/PLUGINS.md.");
                 }
             };
             if scroll_page {
@@ -2364,6 +2414,9 @@ impl eframe::App for Workbench {
             }
         });
         self.switch_dialog(ctx);
+        self.browser_dialogs(ctx);
+        self.mcp_dialogs(ctx);
+        self.comment_dialog(ctx);
         if let Some(mut export) = self.history_export.take() {
             match export.show(ctx) {
                 ExportOutcome::Saved(message) => self.notify("History", message),
@@ -2384,6 +2437,10 @@ impl eframe::App for Workbench {
         if let Some(cancel) = &self.attack_cancel {
             let _ = cancel.send(true);
         }
+        self.shutdown_browser();
+        self.mcp.deny_all();
+        // Dropping the bridge disconnects clients and removes the endpoint file.
+        self.mcp_view.server.take();
         self.stop();
         self.persist();
     }
@@ -2392,6 +2449,7 @@ impl eframe::App for Workbench {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::model::RepeaterTab;
 
     #[test]
     fn selected_save_file_becomes_active_project() {

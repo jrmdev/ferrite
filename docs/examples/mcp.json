@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ferrite": {
+      "command": "/path/to/ferrite",
+      "args": ["mcp"]
+    }
+  }
+}

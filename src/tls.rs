@@ -141,6 +141,16 @@ impl Authority {
             .collect::<Vec<_>>()
             .join(":")
     }
+    /// Base64 SHA-256 of the CA SubjectPublicKeyInfo (the RFC 7469 pin format
+    /// accepted by Chromium's `--ignore-certificate-errors-spki-list`). Only
+    /// public key material is used.
+    pub fn spki_sha256_base64(&self) -> Result<String> {
+        use base64::Engine as _;
+        let der = self.der();
+        let spki = certificate_spki(der.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("CA certificate has no SubjectPublicKeyInfo"))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki)))
+    }
     pub fn server_config(&self, host: &str) -> Result<Arc<ServerConfig>> {
         let state = self.state.read().unwrap();
         let mut cache = state.cache.lock().unwrap();
@@ -165,9 +175,76 @@ impl Authority {
     }
 }
 
+/// Split one DER element into (tag, header length, total length).
+fn der_element(input: &[u8]) -> Option<(u8, usize, usize)> {
+    let tag = *input.first()?;
+    let first = *input.get(1)?;
+    let (length, header) = if first < 0x80 {
+        (first as usize, 2)
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return None;
+        }
+        let mut length = 0usize;
+        for index in 0..count {
+            length = (length << 8) | *input.get(2 + index)? as usize;
+        }
+        (length, 2 + count)
+    };
+    let total = header.checked_add(length)?;
+    (total <= input.len()).then_some((tag, header, total))
+}
+
+/// Return the encoded SubjectPublicKeyInfo of an X.509 certificate.
+fn certificate_spki(certificate: &[u8]) -> Option<&[u8]> {
+    const SEQUENCE: u8 = 0x30;
+    let (tag, header, total) = der_element(certificate)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    let body = &certificate[header..total];
+    let (tag, header, total) = der_element(body)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    let mut fields = &body[header..total];
+    // Optional explicit [0] version, then serial, signature, issuer, validity, subject.
+    if fields.first() == Some(&0xa0) {
+        fields = &fields[der_element(fields)?.2..];
+    }
+    for _ in 0..5 {
+        fields = &fields[der_element(fields)?.2..];
+    }
+    let (tag, _, total) = der_element(fields)?;
+    (tag == SEQUENCE).then(|| &fields[..total])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spki_pin_matches_the_ca_public_key_encoding() {
+        use base64::Engine as _;
+        use p256::pkcs8::EncodePublicKey;
+        let mut project = Project::temporary();
+        let authority = Authority::load(&mut project).unwrap();
+        let key = SigningKey::from_pkcs8_der(&project.ca_key().unwrap()).unwrap();
+        let spki = p256::PublicKey::from(key.verifying_key())
+            .to_public_key_der()
+            .unwrap();
+        assert_eq!(
+            authority.spki_sha256_base64().unwrap(),
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki.as_bytes()))
+        );
+        let other = Authority::load(&mut Project::temporary()).unwrap();
+        assert_ne!(
+            authority.spki_sha256_base64().unwrap(),
+            other.spki_sha256_base64().unwrap()
+        );
+        assert!(certificate_spki(b"\x30\x03\x02\x01").is_none());
+    }
 
     #[test]
     fn site_certificate_identifies_its_project_ca() {

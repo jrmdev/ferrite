@@ -36,6 +36,18 @@ jobs:
           name: ferrite-${{ runner.os }}
           path: target/release/${{ matrix.executable }}
 
+  browser-e2e:
+    # Launches the runner's Google Chrome through a live listener. Hosted
+    # runner sandbox policies vary, so this check reports without blocking.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --no-default-features --test browser -- --nocapture
+        env:
+          FERRITE_BROWSER_TESTS: "1"
+
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: test-build

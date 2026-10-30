@@ -1,12 +1,5 @@
 use eframe::egui;
 
-pub(super) fn is_display_text(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
-        text.chars()
-            .all(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\t'))
-    })
-}
-
 pub(super) fn message_view(bytes: &[u8], all_hex: bool) -> String {
     if all_hex {
         return super::hex(bytes);
@@ -50,6 +43,11 @@ fn editor(
     content: Content,
 ) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
     let id = ui.make_persistent_id(("http-editor", document));
+    let kind = match content {
+        Content::Http => super::highlight::Kind::Http,
+        Content::Json => super::highlight::Kind::Json,
+        Content::Raw => super::highlight::Kind::Plain,
+    };
     let preview = match content {
         Content::Http => super::json_preview::preview(ui.ctx(), id, text.as_str()),
         Content::Json => super::json_preview::preview_payload(ui.ctx(), id, text.as_str()),
@@ -64,17 +62,19 @@ fn editor(
         }
         ui.data_mut(|data| data.insert_temp(key.with("edit"), edit));
         if !text.is_mutable() || !edit {
-            return render(ui, &mut preview.as_ref(), key);
+            return render(ui, &mut preview.as_ref(), key, kind);
         }
     }
-    render(ui, text, id)
+    render(ui, text, id, kind)
 }
 
 fn render(
     ui: &mut egui::Ui,
     text: &mut dyn egui::TextBuffer,
     id: egui::Id,
+    kind: super::highlight::Kind,
 ) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
+    let mut layouter = super::highlight::layouter(kind, id);
     let viewport = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     let available = viewport.size();
     let height = available.y.max(1.0);
@@ -106,6 +106,7 @@ fn render(
                 .vertical_align(egui::Align::Min)
                 .cursor_at_end(false)
                 .code_editor()
+                .layouter(&mut layouter)
                 .show(ui)
         })
 }

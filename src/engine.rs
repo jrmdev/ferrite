@@ -295,7 +295,21 @@ impl Engine {
         intercept: bool,
     ) -> Result<Exchange> {
         Ok(self
-            .execute_upgradable(request, dest, tool, intercept)
+            .execute_upgradable(request, dest, tool, intercept, false)
+            .await?
+            .0)
+    }
+    /// Send without interception, refusing any URL outside the target scope
+    /// regardless of the Drop out of scope setting. The check uses the same
+    /// settings snapshot as the send, so a scope change cannot race it.
+    pub async fn execute_in_scope(
+        &self,
+        request: Message,
+        dest: Destination,
+        tool: &str,
+    ) -> Result<Exchange> {
+        Ok(self
+            .execute_upgradable(request, dest, tool, false, true)
             .await?
             .0)
     }
@@ -305,6 +319,7 @@ impl Engine {
         dest: Destination,
         tool: &str,
         intercept: bool,
+        require_scope: bool,
     ) -> Result<(Exchange, Option<Stream>)> {
         let mut upgrade = None;
         let started = Instant::now();
@@ -330,8 +345,9 @@ impl Engine {
             note: String::new(),
         };
         let result: Result<Message> = async {
+            let enforce_scope = settings.drop_out_of_scope || require_scope;
             ensure!(
-                !settings.drop_out_of_scope || settings.scope.contains(&url),
+                !enforce_scope || settings.scope.contains(&url),
                 "Request is outside target scope"
             );
             let in_scope = settings.scope.contains(&url);
@@ -354,7 +370,7 @@ impl Engine {
             // Recheck edited targets so scope policy cannot be bypassed with the editor.
             let effective_url = request.url(&dest);
             ensure!(
-                !settings.drop_out_of_scope || settings.scope.contains(&effective_url),
+                !enforce_scope || settings.scope.contains(&effective_url),
                 "Edited request is outside target scope"
             );
             flow.url = effective_url;
@@ -677,7 +693,7 @@ impl Engine {
     }
     async fn respond(&self, mut stream: Stream, request: Message, dest: Destination) -> Result<()> {
         let (flow, upgrade) = self
-            .execute_upgradable(request, dest, "Proxy", true)
+            .execute_upgradable(request, dest, "Proxy", true, false)
             .await?;
         if let Some(mut upstream) = upgrade {
             stream.write_all(&flow.response).await?;

@@ -391,3 +391,55 @@ pub fn from_editor(text: &str) -> Result<Message> {
     bytes.extend_from_slice(body.as_bytes());
     Message::parse(&bytes)
 }
+
+/// True when bytes display faithfully as editable text.
+pub fn is_display_text(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        text.chars()
+            .all(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\t'))
+    })
+}
+
+/// Lowercase hex in rows of 24 bytes, as used by the message editors.
+pub fn hex_dump(bytes: &[u8]) -> String {
+    bytes
+        .chunks(24)
+        .map(|row| {
+            row.iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse editor hex, ignoring whitespace.
+pub fn parse_hex(text: &str) -> Result<Vec<u8>> {
+    let s: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    ensure!(
+        s.len().is_multiple_of(2) && s.is_ascii(),
+        "Hex needs complete byte pairs"
+    );
+    (0..s.len())
+        .step_by(2)
+        .map(|i| Ok(u8::from_str_radix(&s[i..i + 2], 16)?))
+        .collect()
+}
+
+/// Editor representation of message bytes: text when faithful, else hex.
+pub fn editor_text(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if is_display_text(bytes) => (text.into(), false),
+        _ => (hex_dump(bytes), true),
+    }
+}
+
+/// Parse an editor buffer (text or hex) into a message.
+pub fn from_editor_buffer(text: &str, is_hex: bool) -> Result<Message> {
+    if is_hex {
+        Message::parse(&parse_hex(text)?)
+    } else {
+        from_editor(text)
+    }
+}

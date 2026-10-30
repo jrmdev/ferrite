@@ -221,8 +221,14 @@ pub struct Exchange {
     pub error: Option<String>,
     pub note: String,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepeaterTab {
+    /// Stable identity used by the UI and MCP clients; 0 until assigned.
+    #[serde(default)]
+    pub id: u64,
+    /// Optional collection the tab is grouped under.
+    #[serde(default)]
+    pub group: String,
     pub name: String,
     pub destination: String,
     #[serde(default)]
@@ -305,6 +311,8 @@ impl Default for Workspace {
             color_scheme: ColorScheme::default(),
             settings: Settings::default(),
             repeater: vec![RepeaterTab {
+                id: 1,
+                group: String::new(),
                 name: "1".into(),
                 destination: "https://example.com".into(),
                 request_hex: false,
@@ -319,6 +327,64 @@ impl Default for Workspace {
     }
 }
 
+impl Workspace {
+    /// Give every Repeater tab a unique non-zero ID, keeping existing ones.
+    pub fn assign_repeater_ids(&mut self) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut next = self.repeater.iter().map(|t| t.id).max().unwrap_or(0);
+        for tab in &mut self.repeater {
+            if tab.id == 0 || !seen.insert(tab.id) {
+                next += 1;
+                tab.id = next;
+                seen.insert(next);
+            }
+        }
+    }
+    pub fn next_repeater_id(&self) -> u64 {
+        self.repeater.iter().map(|t| t.id).max().unwrap_or(0) + 1
+    }
+    pub fn repeater_tab(&self, id: u64) -> Option<&RepeaterTab> {
+        self.repeater.iter().find(|t| t.id == id)
+    }
+    pub fn repeater_tab_mut(&mut self, id: u64) -> Option<&mut RepeaterTab> {
+        self.repeater.iter_mut().find(|t| t.id == id)
+    }
+}
+
 fn default_enabled() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspaces_from_older_versions_gain_repeater_ids() {
+        // A v0.1.1 workspace: Repeater tabs have no id or group.
+        let mut old = serde_json::to_value(Workspace::default()).unwrap();
+        let tab = serde_json::json!({
+            "name": "1", "destination": "https://a.test", "request": "GET / HTTP/1.1\r\n\r\n", "history": [3]
+        });
+        old["repeater"] = serde_json::json!([tab.clone(), tab]);
+        old["history_filter"]
+            .as_object_mut()
+            .unwrap()
+            .remove("annotated_only");
+        let mut workspace: Workspace = serde_json::from_value(old).unwrap();
+        assert!(
+            workspace
+                .repeater
+                .iter()
+                .all(|t| t.id == 0 && t.group.is_empty())
+        );
+        workspace.assign_repeater_ids();
+        assert_eq!(
+            workspace.repeater.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(workspace.repeater_tab(2).unwrap().history, [3]);
+        assert_eq!(workspace.next_repeater_id(), 3);
+        assert!(!workspace.history_filter.annotated_only);
+    }
 }

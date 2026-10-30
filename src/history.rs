@@ -16,6 +16,72 @@ fn deserialize_hidden_extensions<'de, D: Deserializer<'de>>(
     })
 }
 
+/// A colour mark for an exchange in History.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Highlight {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Cyan,
+    Blue,
+    Purple,
+    Grey,
+}
+impl Highlight {
+    pub const ALL: [Self; 8] = [
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Cyan,
+        Self::Blue,
+        Self::Purple,
+        Self::Grey,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Cyan => "Cyan",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+            Self::Grey => "Grey",
+        }
+    }
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::Red => [220, 70, 70],
+            Self::Orange => [230, 140, 50],
+            Self::Yellow => [220, 200, 60],
+            Self::Green => [70, 180, 90],
+            Self::Cyan => [60, 190, 200],
+            Self::Blue => [70, 120, 220],
+            Self::Purple => [160, 90, 210],
+            Self::Grey => [140, 140, 140],
+        }
+    }
+    pub fn parse(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|h| h.label().eq_ignore_ascii_case(label.trim()))
+    }
+}
+
+/// User notes on an exchange, stored separately from captured bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Annotation {
+    pub comment: String,
+    pub highlight: Option<Highlight>,
+}
+impl Annotation {
+    pub fn is_empty(&self) -> bool {
+        self.comment.trim().is_empty() && self.highlight.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistoryFilter {
@@ -35,6 +101,8 @@ pub struct HistoryFilter {
     pub hide_extensions: bool,
     #[serde(deserialize_with = "deserialize_hidden_extensions")]
     pub hidden_extensions: String,
+    /// Only exchanges with a comment or highlight.
+    pub annotated_only: bool,
 }
 
 impl Default for HistoryFilter {
@@ -55,6 +123,7 @@ impl Default for HistoryFilter {
             only_extensions: "asp,aspx,jsp,php".into(),
             hide_extensions: false,
             hidden_extensions: DEFAULT_HIDDEN_EXTENSIONS.into(),
+            annotated_only: false,
         }
     }
 }
@@ -229,8 +298,13 @@ impl HistoryFilter {
 }
 
 impl CompiledFilter<'_> {
-    pub fn matches(&self, flow: &Exchange, scope: &Scope) -> bool {
+    /// Whether an exchange passes the filter. Searches also match the
+    /// exchange's comment.
+    pub fn matches(&self, flow: &Exchange, scope: &Scope, annotation: Option<&Annotation>) -> bool {
         let f = self.filter;
+        if f.annotated_only && annotation.is_none_or(Annotation::is_empty) {
+            return false;
+        }
         if !f.tools.as_ref().map_or_else(
             || f.tool.matches(&flow.tool),
             |tools| tools.matches(&flow.tool),
@@ -284,6 +358,7 @@ impl CompiledFilter<'_> {
                 flow.tool.as_bytes(),
                 &flow.request,
                 &flow.response,
+                annotation.map_or(&[][..], |a| a.comment.as_bytes()),
             ]
             .iter()
             .any(|bytes| search.is_match(bytes));

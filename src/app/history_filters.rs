@@ -8,12 +8,13 @@ pub(super) fn show(ui: &mut egui::Ui, filter: &mut HistoryFilter) {
             ui.label("Search");
             ui.add(
                 egui::TextEdit::singleline(&mut filter.search)
-                    .hint_text("URL, request or response")
+                    .hint_text("URL, request, response or comment")
                     .desired_width(280.0),
             );
             ui.checkbox(&mut filter.regex, "Regex");
             ui.checkbox(&mut filter.case_sensitive, "Case sensitive");
             ui.checkbox(&mut filter.negative_search, "Negative search");
+            ui.checkbox(&mut filter.annotated_only, "Only commented or highlighted");
             if ui.button("Reset filters").clicked() {
                 *filter = HistoryFilter::default();
             }

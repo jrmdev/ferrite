@@ -37,15 +37,21 @@ Built for speed, Ferrite uses a native UI and asynchronous networking. A small m
 ## Tools
 
 - **Proxy** — Capture HTTP and HTTPS traffic through a local listener. Configure upstream HTTP or SOCKS5 proxies, TLS verification, match-and-replace rules, and the proxy CA certificate.
+- **Browser** — Open a dedicated Chromium, Chrome, Edge or Brave window that is already routed through the listener and trusts Ferrite's CA, with an isolated profile. Navigate, list and close tabs from Ferrite. See [built-in browser](docs/BROWSER.md).
+- **MCP** — Let AI clients such as Claude Code inspect history, the site map, Repeater, scanner findings and WebSockets, and send in-scope requests through Ferrite, with approvals, rate limits, credential redaction and an audit trail. See [MCP server](docs/MCP.md).
 - **Target** — Browse captured hosts and paths in a site map and manage which URLs are in scope.
 - **Intercept** — Pause, inspect, edit, forward, or drop HTTP requests and responses and WebSocket messages.
 - **History** — Search, filter, sort, inspect, and export captured exchanges. A WebSockets view lists sessions and their messages.
-- **Repeater** — Edit and resend requests in named tabs, inspect responses, and navigate previous sends.
+- **Repeater** — Edit and resend requests in named tabs grouped into collections; duplicate, close and move tabs, navigate previous sends, and compare a response with the previous send.
 - **Intruder** — Run payload-based attacks using Sniper, Battering Ram, Pitchfork, and Cluster Bomb modes, with configurable concurrency and pacing.
 - **Scanner** — Run passive checks on new in-scope traffic and active checks on selected requests. Review findings and evidence, manage checks in the Library, and export reports.
+- **Decoder** — Chain Base64, Base64URL, URL, HTML entity, hex, Unicode escape and gzip transforms, inspect JWTs (without treating them as valid), and hash with MD5, SHA-1 and SHA-2.
+- **Comparer** — Compare two requests or responses side by side with line, word or character highlights. Send items from any context menu or from Repeater.
 - **Alerts** — Review connection errors, failed exchanges, and application activity.
 - **Settings** — Manage projects, appearance, display timezone, and JSON formatting.
-- **Plugins** — Reserved for future extension support.
+- **Plugins** — Not yet available; automation uses MCP. A sandboxed WebAssembly design is proposed in [extensibility](docs/PLUGINS.md).
+
+Message editors highlight HTTP syntax and JSON, XML/HTML and form bodies, and offer a find bar. History rows can carry comments and colour highlights, which are searchable and filterable.
 
 ## Getting started
 
@@ -55,10 +61,9 @@ Install Rust 1.96 or newer, then start Ferrite:
 cargo run --release -- --project assessment.ferrite
 ```
 
-1. Open **Proxy** and select **Start listener**.
-2. Configure your browser to use `127.0.0.1:8080` as its HTTP and HTTPS proxy.
-3. For HTTPS inspection, export the public CA certificate from **Proxy** and trust it in your test browser.
-4. Add your target to scope, then inspect traffic in **History** or send requests to **Repeater**, **Intruder**, or **Scanner**.
+1. Open **Proxy** and select **Open browser** (Ferrite offers to start the listener). Browse your target in the window that opens; HTTPS works without installing the CA.
+2. Alternatively, select **Start listener**, set `127.0.0.1:8080` as the HTTP and HTTPS proxy of another browser or device, and trust the public CA certificate exported from **Proxy**.
+3. Add your target to scope, then inspect traffic in **History** or send requests to **Repeater**, **Intruder**, **Scanner**, **Decoder** or **Comparer**.
 
 Passive scanning is enabled by default for new projects and analyzes new in-scope exchanges without sending additional requests. Active scans reuse captured credentials; intrusive checks require explicit enablement. Scanner does not automatically crawl, log in, or execute a browser.
 
@@ -69,6 +74,19 @@ cargo run --release --no-default-features -- --headless --project assessment.fer
 ```
 
 Press Ctrl-C to stop the listener. Run `ferrite --help` for more options.
+
+## AI assistants (MCP)
+
+1. Open **MCP** in Ferrite and select **Enable MCP server**.
+2. Register Ferrite with Claude Code (the MCP page shows this command with your path):
+
+   ```sh
+   claude mcp add ferrite -- /path/to/ferrite mcp
+   ```
+
+3. Ask Claude, for example: "Using Ferrite, list the in-scope endpoints that take parameters and resend the last login request as another user."
+
+Sending requests asks for your approval by default and is always limited to the target scope; active scans are disabled until you allow them. Credential headers are shown to the client as `[REDACTED]` and restored by Ferrite when requests are resent. Every call is recorded in the project's audit trail. Without the window, `ferrite mcp --headless --project assessment.ferrite` serves a project directly. See [MCP server](docs/MCP.md) for the tool reference and security model.
 
 ## Projects and traffic
 
@@ -88,7 +106,34 @@ cargo test --no-default-features --all-targets
 cargo build --release --locked
 ```
 
+`tests/mcp.rs` drives the real `ferrite mcp` binary over stdio. The managed browser test needs Chromium or Chrome and runs on request:
+
+```sh
+FERRITE_BROWSER_TESTS=1 cargo test --test browser
+```
+
 The project uses egui for the desktop UI, Tokio for networking, redb for project storage, and Rustls with RustCrypto for TLS. The RustCrypto TLS provider is experimental. See [architecture](docs/ARCHITECTURE.md) for implementation details.
+
+## Platform support
+
+| | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Proxy, tools, projects | Verified | CI build and tests | CI build and tests |
+| Managed browser | Verified with Chrome for Testing 153 | Detection of Chrome, Chromium, Edge and Brave; untested against a real browser | Detection of Chrome, Chromium, Edge and Brave; untested against a real browser |
+| Orphan prevention | Browser exits with Ferrite, even if Ferrite is killed | Closed on normal exit only | Closed on normal exit only |
+| MCP relay and headless | Verified end to end | CI tests | CI tests |
+
+## Known limitations
+
+- The browser is a separate managed window, not embedded in Ferrite.
+- Some Chromium background requests to Google services cannot be disabled by switches; filter History by scope to hide them.
+- MCP supports the stdio transport; the authenticated Streamable HTTP transport is structured for but not yet implemented. Response bodies returned to MCP clients are not redacted.
+- Ferrite does not load third-party plugins yet.
+- History keeps a full in-memory copy of exchanges for display, as in earlier versions; MCP reads use a separate lock-free reader.
+
+## Configuration
+
+Application settings (theme, timezone, CA, browser and MCP settings) live in `settings.json` in Ferrite's configuration directory (for example `~/.config/ferrite` on Linux). Set `FERRITE_CONFIG_DIR` to use another directory, for example for a portable installation.
 
 ## License
 
