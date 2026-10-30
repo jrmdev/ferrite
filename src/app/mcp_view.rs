@@ -16,14 +16,6 @@ pub(super) struct State {
     last_error: Option<String>,
 }
 
-fn quote(path: &str) -> String {
-    if path.contains([' ', '"', '\'']) {
-        format!("\"{}\"", path.replace('"', "\\\""))
-    } else {
-        path.into()
-    }
-}
-
 impl Workbench {
     pub(super) fn start_mcp(&mut self) {
         if self.mcp_view.server.is_some() || self.mcp_view.starting {
@@ -160,7 +152,7 @@ impl Workbench {
     pub(super) fn mcp_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("MCP server");
         ui.add(
-            egui::Label::new(RichText::new("Lets local AI clients that speak the Model Context Protocol, such as Claude Code or Cursor, read this project and send in-scope requests through Ferrite. Captured traffic is returned to the client, which may forward it to its model provider.").weak())
+            egui::Label::new(RichText::new("Lets local MCP clients, agents and harnesses read this project and send in-scope requests through Ferrite. Captured traffic is returned to the client, which may forward it to a model provider.").weak())
                 .wrap(),
         );
         ui.add_space(6.0);
@@ -309,33 +301,26 @@ impl Workbench {
     }
 
     fn mcp_setup(&mut self, ui: &mut egui::Ui) {
-        subsection_heading(ui, "Connect Claude Code");
+        subsection_heading(ui, "Connect an MCP client");
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "ferrite".into());
-        let command = format!("claude mcp add ferrite -- {} mcp", quote(&exe));
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {"ferrite": {"command": exe, "args": ["mcp"]}}
         }))
         .unwrap_or_default();
         ui.label("1. Keep this window open with the MCP server enabled.");
-        ui.label("2. Register Ferrite with Claude Code:");
-        ui.horizontal(|ui| {
-            ui.add(egui::Label::new(RichText::new(&command).monospace()).wrap());
-            if ui.small_button("Copy").clicked() {
-                ui.ctx().copy_text(command.clone());
-            }
-        });
-        ui.label(
-            "   or add this to a project's .mcp.json (also used by Cursor and other clients):",
-        );
+        ui.label("2. Add a stdio MCP server to your client using this example configuration:");
         ui.horizontal(|ui| {
             ui.add(egui::Label::new(RichText::new(&json).monospace()));
             if ui.small_button("Copy").clicked() {
                 ui.ctx().copy_text(json.clone());
             }
         });
-        ui.label("3. Ask Claude, for example: \"Using Ferrite, list in-scope endpoints that take parameters and resend the latest login request with a different user.\"");
+        ui.weak("Configuration formats and file locations vary by client. Use the executable as the command and mcp as its argument.");
+        ui.label(
+            "3. Start or reconnect your client and use its MCP tools to interact with Ferrite.",
+        );
         ui.weak("Without this window, `ferrite mcp --headless --project FILE` serves a project directly (see ferrite mcp --help).");
     }
 
@@ -412,17 +397,5 @@ impl Workbench {
                     ui.end_row();
                 }
             });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn executable_paths_with_spaces_are_quoted() {
-        assert_eq!(super::quote("/usr/bin/ferrite"), "/usr/bin/ferrite");
-        assert_eq!(
-            super::quote(r"C:\Program Files\Ferrite\ferrite.exe"),
-            r#""C:\Program Files\Ferrite\ferrite.exe""#
-        );
     }
 }

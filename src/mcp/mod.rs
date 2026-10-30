@@ -1,6 +1,6 @@
 //! Model Context Protocol (MCP) support.
 //!
-//! Ferrite exposes its live engine to MCP clients such as Claude Code through
+//! Ferrite exposes its live engine to MCP clients through
 //! tools defined in [`tools`]. The protocol layer ([`server`]) uses the
 //! official `rmcp` SDK over stdio and talks to a [`server::Backend`]:
 //!

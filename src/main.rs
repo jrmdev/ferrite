@@ -70,7 +70,7 @@ Usage: ferrite mcp [--endpoint-file FILE]
        ferrite mcp --headless [--project FILE] [--listen IP:PORT] [--start-proxy]
                    [--allow-requests] [--allow-active-scans] [--include-credentials]
 
-Without --headless, relays an MCP client (for example Claude Code) to the
+Without --headless, relays an MCP client over stdio to the
 running Ferrite window. Enable MCP in Ferrite's MCP page first.
 
 --headless runs Ferrite without a window and owns the project exclusively.

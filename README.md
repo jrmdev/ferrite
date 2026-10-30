@@ -2,7 +2,7 @@
 
 Ferrite is a free, native desktop workbench for HTTP security testing. Inspired by Burp Proxy, it is an independent implementation written from scratch in Rust, with its own interface and project format.
 
-Built for speed, Ferrite uses a native UI and asynchronous networking. A small memory footprint (5x - 10x smaller memory usage compared to Burp Proxy).
+Built for speed, Ferrite uses a native UI and asynchronous networking.
 
 ## Screenshots
 
@@ -38,7 +38,7 @@ Built for speed, Ferrite uses a native UI and asynchronous networking. A small m
 
 - **Proxy** — Capture HTTP and HTTPS traffic through a local listener. Configure upstream HTTP or SOCKS5 proxies, TLS verification, match-and-replace rules, and the proxy CA certificate.
 - **Browser** — Open a dedicated Chromium, Chrome, Edge or Brave window that is already routed through the listener and trusts Ferrite's CA, with an isolated profile. Navigate, list and close tabs from Ferrite. See [built-in browser](docs/BROWSER.md).
-- **MCP** — Let AI clients such as Claude Code inspect history, the site map, Repeater, scanner findings and WebSockets, and send in-scope requests through Ferrite, with approvals, rate limits, credential redaction and an audit trail. See [MCP server](docs/MCP.md).
+- **MCP** — Let MCP clients, agents and harnesses inspect history, the site map, Repeater, scanner findings and WebSockets, and send in-scope requests through Ferrite, with approvals, rate limits, credential redaction and an audit trail. See [MCP server](docs/MCP.md).
 - **Target** — Browse captured hosts and paths in a site map and manage which URLs are in scope.
 - **Intercept** — Pause, inspect, edit, forward, or drop HTTP requests and responses and WebSocket messages.
 - **History** — Search, filter, sort, inspect, and export captured exchanges. A WebSockets view lists sessions and their messages.
@@ -75,16 +75,11 @@ cargo run --release --no-default-features -- --headless --project assessment.fer
 
 Press Ctrl-C to stop the listener. Run `ferrite --help` for more options.
 
-## AI assistants (MCP)
+## MCP clients and agents
 
 1. Open **MCP** in Ferrite and select **Enable MCP server**.
-2. Register Ferrite with Claude Code (the MCP page shows this command with your path):
-
-   ```sh
-   claude mcp add ferrite -- /path/to/ferrite mcp
-   ```
-
-3. Ask Claude, for example: "Using Ferrite, list the in-scope endpoints that take parameters and resend the last login request as another user."
+2. Add a stdio MCP server in your client or harness. Use the full path to the Ferrite executable as the command and `mcp` as its argument. The MCP page provides a copyable JSON example; configuration formats and locations vary by client.
+3. Start or reconnect your client, then use Ferrite's tools. For example, ask an agent: "Using Ferrite, list the in-scope endpoints that take parameters and resend the last login request as another user."
 
 Sending requests asks for your approval by default and is always limited to the target scope; active scans are disabled until you allow them. Credential headers are shown to the client as `[REDACTED]` and restored by Ferrite when requests are resent. Every call is recorded in the project's audit trail. Without the window, `ferrite mcp --headless --project assessment.ferrite` serves a project directly. See [MCP server](docs/MCP.md) for the tool reference and security model.
 
@@ -106,11 +101,7 @@ cargo test --no-default-features --all-targets
 cargo build --release --locked
 ```
 
-`tests/mcp.rs` drives the real `ferrite mcp` binary over stdio. The managed browser test needs Chromium or Chrome and runs on request:
-
-```sh
-FERRITE_BROWSER_TESTS=1 cargo test --test browser
-```
+MCP and managed browser unit tests run as part of the test suite.
 
 The project uses egui for the desktop UI, Tokio for networking, redb for project storage, and Rustls with RustCrypto for TLS. The RustCrypto TLS provider is experimental. See [architecture](docs/ARCHITECTURE.md) for implementation details.
 

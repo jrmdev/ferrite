@@ -1,20 +1,16 @@
 # MCP server
 
-Ferrite includes a native [Model Context Protocol](https://modelcontextprotocol.io) server, so MCP clients such as Claude Code and Cursor can inspect Ferrite's live project and send requests through its engine. Results appear in the AI client; traffic, Repeater tabs and an audit trail appear in Ferrite.
+Ferrite includes a native [Model Context Protocol](https://modelcontextprotocol.io) server, so compatible MCP clients, agents and harnesses can inspect Ferrite's live project and send requests through its engine. Results appear in the client; traffic, Repeater tabs and an audit trail appear in Ferrite.
 
 The server exposes tools only. It contains no LLM integration, makes no decisions for the client, and sends nothing anywhere on its own.
 
-## Quick start with Claude Code
+## Quick start
 
 1. Start Ferrite and open **MCP** in the sidebar.
 2. Select **Enable MCP server**. The status shows `Listening on 127.0.0.1:<port> (loopback only, token required)`.
-3. Register Ferrite with Claude Code (the MCP page shows this command with your executable path and a **Copy** button):
+3. In your MCP client or agent harness, add a server using the **stdio** transport. Set the command to the full path to the Ferrite executable and the arguments to `mcp`. The MCP page shows a configuration with your executable path and a **Copy** button.
 
-   ```sh
-   claude mcp add ferrite -- /path/to/ferrite mcp
-   ```
-
-   Or add it to a project's `.mcp.json` (see [examples/mcp.json](examples/mcp.json)):
+   For clients that use an `mcpServers` JSON object, the configuration looks like this (see [examples/mcp.json](examples/mcp.json)):
 
    ```json
    {
@@ -24,19 +20,20 @@ The server exposes tools only. It contains no LLM integration, makes no decision
    }
    ```
 
-4. Start Claude Code. The MCP page lists it under **Connected clients**.
-5. Ask, for example:
+   Configuration formats and file locations differ between clients; consult your client's MCP setup instructions. On Windows, use the path to `ferrite.exe` and escape backslashes in JSON. The client launches `ferrite mcp` as a subprocess; do not configure the loopback bridge address as an MCP HTTP endpoint.
+4. Start or reconnect the client. Connected clients appear on Ferrite's MCP page.
+5. Use the client's tool interface or ask its agent, for example:
    - "Using Ferrite, summarise the in-scope endpoints and which take parameters."
    - "Show me the last POST to /login in Ferrite and resend it with the username changed to bob."
    - "Search Ferrite's history for responses that contain stack traces."
 
-When Claude sends a request, Ferrite asks you to approve it (default **Ask each time**), records it in History with the tool `MCP`, and lists the call in the **Audit trail**.
+When a client sends a request, Ferrite asks you to approve it (default **Ask each time**), records it in History with the tool `MCP`, and lists the call in the **Audit trail**.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    C[Claude Code / MCP client] -- stdio JSON-RPC --> R["ferrite mcp (relay)"]
+    C[MCP client / agent / harness] -- stdio JSON-RPC --> R["ferrite mcp (relay)"]
     R -- loopback TCP + 256-bit token --> H[MCP host in the Ferrite window]
     H --> T[Tool executor]
     T --> E[Engine: routing, upstream proxy, TLS, scope]
@@ -145,7 +142,7 @@ ferrite mcp --headless --project assessment.ferrite --start-proxy --listen 127.0
 | `--allow-active-scans` | Allow starting and cancelling active scans |
 | `--include-credentials` | Return credential header values |
 
-Example Claude Code configuration for a headless project:
+Example JSON configuration for a headless project (adapt it to your client's format):
 
 ```json
 {
@@ -172,8 +169,4 @@ Set scope in the GUI before handing a project to a headless server: a new projec
 
 ## Testing
 
-`tests/mcp.rs` runs the real `ferrite` binary as an MCP server and speaks JSON-RPC over stdio, as Claude Code does. It covers the relay to a live engine (initialisation, tool listing, every read-only tool family, redaction and server-side restoration, scope enforcement including absolute-URL mismatches, Repeater tab creation and sends, interactive denial, passive scanner findings, audit entries, and the offline error) and headless mode (exclusive project ownership, persistent audit trail, default denial).
-
-```sh
-cargo test --test mcp
-```
+Run the project's tests with `cargo test --all-targets`. MCP unit tests cover the server's tool definitions, permissions, redaction and local relay behavior.

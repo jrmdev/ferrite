@@ -889,10 +889,17 @@ mod tests {
             if marked {
                 std::fs::write(path.join(PROFILE_MARKER), b"x").unwrap();
             }
-            std::fs::File::open(&path)
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
+            #[cfg(windows)]
+            let directory = {
+                use std::os::windows::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS permits opening directories.
+                    .open(&path)
+            };
+            #[cfg(not(windows))]
+            let directory = std::fs::File::open(&path);
+            directory.unwrap().set_modified(old).unwrap();
             path
         };
         let stale = make("ferrite-browser-stale", true);
