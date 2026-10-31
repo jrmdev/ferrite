@@ -1089,27 +1089,26 @@ impl Workbench {
                 );
                 let query = self.timezone_search.to_lowercase();
                 for option in [DisplayTimezone::Utc, DisplayTimezone::Local] {
-                    if option.label().to_lowercase().contains(&query) {
-                        if ui
+                    if option.label().to_lowercase().contains(&query)
+                        && ui
                             .selectable_value(&mut timezone, option, option.label())
                             .clicked()
-                        {
-                            ui.close();
-                        }
+                    {
+                        ui.close();
                     }
                 }
                 for zone in chrono_tz::TZ_VARIANTS {
-                    if zone != chrono_tz::UTC && zone.name().to_lowercase().contains(&query) {
-                        if ui
+                    if zone != chrono_tz::UTC
+                        && zone.name().to_lowercase().contains(&query)
+                        && ui
                             .selectable_value(
                                 &mut timezone,
                                 DisplayTimezone::Named(zone),
                                 zone.name(),
                             )
                             .clicked()
-                        {
-                            ui.close();
-                        }
+                    {
+                        ui.close();
                     }
                 }
             });

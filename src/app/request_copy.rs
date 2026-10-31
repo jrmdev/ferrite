@@ -381,10 +381,10 @@ mod tests {
                 let count = stream.read(&mut chunk).unwrap();
                 assert!(count > 0);
                 bytes.extend_from_slice(&chunk[..count]);
-                if let Some(head) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                    if bytes.len() >= head + 4 + 3 {
-                        break;
-                    }
+                if let Some(head) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                    && bytes.len() >= head + 4 + 3
+                {
+                    break;
                 }
             }
             stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing").unwrap();
