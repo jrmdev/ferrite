@@ -13,6 +13,7 @@ mod browser_view;
 mod comparer_view;
 mod decoder_view;
 mod editor_context;
+mod editor_font;
 mod highlight;
 mod history_export;
 mod history_filters;
@@ -343,6 +344,7 @@ enum EntryAction {
     CopyUrl,
     CopyCurl,
     CopyPython,
+    CopyPowerShell,
     /// Copy the request (false) or response (true) as text.
     CopyMessage(bool),
     /// Send the request (false) or response (true) to a Comparer slot.
@@ -375,7 +377,8 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
                 ("Request", EntryAction::CopyMessage(false)),
                 ("Response", EntryAction::CopyMessage(true)),
                 ("as curl", EntryAction::CopyCurl),
-                ("as Python requests", EntryAction::CopyPython),
+                ("as Python", EntryAction::CopyPython),
+                ("as PowerShell", EntryAction::CopyPowerShell),
             ] {
                 if ui.button(label).clicked() {
                     action = Some(value);
@@ -514,6 +517,7 @@ impl Workbench {
         preferences: Preferences,
     ) -> Self {
         theme::apply(ctx, preferences.scheme());
+        editor_font::apply(ctx, preferences.editor_font());
         json_preview::configure(
             ctx,
             engine.project.lock().unwrap().workspace.beautify_json,
@@ -1017,14 +1021,13 @@ impl Workbench {
         }
     }
     fn projects(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.add_space(8.0);
         ui.heading("Global settings");
         subsection_heading(ui, "Color scheme");
         let mut scheme = self.preferences.scheme();
         let previous = scheme;
-        egui::ComboBox::from_label("Theme")
+        egui::ComboBox::from_id_salt("global-color-scheme")
             .selected_text(scheme.label())
+            .height(300.0)
             .show_ui(ui, |ui| {
                 for option in ColorScheme::ALL {
                     ui.selectable_value(&mut scheme, option, option.label());
@@ -1034,9 +1037,42 @@ impl Workbench {
             let result = self.preferences.set_scheme(scheme);
             if self.report(result).is_some() {
                 theme::apply(ui.ctx(), scheme);
+                editor_font::apply(ui.ctx(), self.preferences.editor_font());
             }
         }
-        ui.label("The color scheme applies to all projects.");
+        ui.weak("The color scheme applies to all projects.");
+        ui.add_space(12.0);
+        subsection_heading(ui, "Editor font");
+        let mut font = self.preferences.editor_font().clone();
+        let previous = font.clone();
+        egui::ComboBox::from_id_salt("global-editor-font")
+            .selected_text(if font.face.is_empty() {
+                "Default monospace"
+            } else {
+                &font.face
+            })
+            .height(300.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut font.face, String::new(), "Default monospace");
+                for face in editor_font::faces() {
+                    ui.selectable_value(&mut font.face, face.clone(), face);
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut font.size)
+                    .range(8.0..=36.0)
+                    .speed(0.5)
+                    .suffix(" pt"),
+            );
+        });
+        if font != previous {
+            let result = self.preferences.set_editor_font(font.clone());
+            if self.report(result).is_some() {
+                editor_font::apply(ui.ctx(), &font);
+            }
+        }
+        ui.weak("Applies to editors across all projects.");
         ui.add_space(12.0);
         subsection_heading(ui, "Timezone");
         let mut timezone = self.preferences.timezone();
@@ -1045,6 +1081,7 @@ impl Workbench {
             .selected_text(timezone.label())
             .width(280.0)
             .height(300.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.timezone_search)
@@ -1053,16 +1090,26 @@ impl Workbench {
                 let query = self.timezone_search.to_lowercase();
                 for option in [DisplayTimezone::Utc, DisplayTimezone::Local] {
                     if option.label().to_lowercase().contains(&query) {
-                        ui.selectable_value(&mut timezone, option, option.label());
+                        if ui
+                            .selectable_value(&mut timezone, option, option.label())
+                            .clicked()
+                        {
+                            ui.close();
+                        }
                     }
                 }
                 for zone in chrono_tz::TZ_VARIANTS {
                     if zone != chrono_tz::UTC && zone.name().to_lowercase().contains(&query) {
-                        ui.selectable_value(
-                            &mut timezone,
-                            DisplayTimezone::Named(zone),
-                            zone.name(),
-                        );
+                        if ui
+                            .selectable_value(
+                                &mut timezone,
+                                DisplayTimezone::Named(zone),
+                                zone.name(),
+                            )
+                            .clicked()
+                        {
+                            ui.close();
+                        }
                     }
                 }
             });
@@ -1144,10 +1191,11 @@ impl Workbench {
             }
         });
         if busy {
-            ui.label("Switching projects will stop the proxy and settle active work.");
+            ui.weak("Switching projects will stop the proxy and settle active work.");
         }
-        ui.add_space(12.0);
-        ui.add(egui::Label::new("Disk projects automatically save settings, HTTP history, Repeater tabs and sends, and Intruder configuration and results. Save a temporary project to keep it on disk.").wrap());
+        ui.add_space(1.0);
+        ui.weak("Disk projects automatically save settings, HTTP history, Repeater tabs and sends, and Intruder configuration and results.");
+        ui.weak("Save a temporary project to keep it on disk.");
     }
     fn public_ca(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1374,12 +1422,16 @@ impl Workbench {
     }
     fn exchange_action(&mut self, ctx: &egui::Context, flows: Vec<Exchange>, action: EntryAction) {
         match action {
-            EntryAction::CopyUrl | EntryAction::CopyCurl | EntryAction::CopyPython => {
+            EntryAction::CopyUrl
+            | EntryAction::CopyCurl
+            | EntryAction::CopyPython
+            | EntryAction::CopyPowerShell => {
                 if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
                     let text = match action {
                         EntryAction::CopyUrl => Ok(flow.url.clone()),
                         EntryAction::CopyCurl => request_copy::curl(flow),
                         EntryAction::CopyPython => request_copy::python(flow),
+                        EntryAction::CopyPowerShell => request_copy::powershell(flow),
                         _ => unreachable!(),
                     };
                     if let Some(text) = self.report(text) {
@@ -1574,25 +1626,6 @@ impl Workbench {
         }
     }
     fn flow_view(&mut self, ui: &mut egui::Ui, flow: &Exchange) {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Send to Repeater").clicked() {
-                self.send_to_repeater(flow);
-            }
-            if ui.button("Send to Intruder").clicked() {
-                self.send_to_intruder(flow);
-            }
-            ui.checkbox(&mut self.response_hex, "Hex");
-            if ui.button("Send to Scanner").clicked() {
-                self.send_to_scanner(vec![flow.clone()]);
-            }
-            let title = format!("{} {}", flow.method, flow.url);
-            ui.add(
-                egui::Label::new(RichText::new(&title).strong())
-                    .truncate()
-                    .show_tooltip_when_elided(false),
-            )
-            .on_hover_text(&title);
-        });
         if let Some(e) = &flow.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
@@ -1603,8 +1636,18 @@ impl Workbench {
             self.response_hex,
             self.engine.settings().max_message_bytes,
         );
-        highlight::find_bar(ui, &[("request", &request), ("response", &response)]);
-        ui.separator();
+        egui::TopBottomPanel::bottom(ui.id().with("flow-find"))
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                highlight::find_bar(
+                    ui,
+                    &[("request", &request), ("response", &response)],
+                    |ui| {
+                        ui.checkbox(&mut self.response_hex, "Hex");
+                    },
+                );
+            });
         let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
         subsection_heading(&mut request_ui, "Request");
         subsection_heading(&mut response_ui, "Response");
@@ -2612,6 +2655,7 @@ mod layout_tests {
             EntryAction::CopyUrl,
             EntryAction::CopyCurl,
             EntryAction::CopyPython,
+            EntryAction::CopyPowerShell,
         ] {
             let output = ctx.run(egui::RawInput::default(), |ctx| {
                 app.editor_action(ctx, action, editor_context::repeater(&tab), None);
@@ -2631,8 +2675,14 @@ mod layout_tests {
             assert!(copied.contains("https://example.test:8443/edited?q=1"));
             if !matches!(action, EntryAction::CopyUrl) {
                 assert!(copied.contains("POST"));
-                assert!(copied.contains("id=secret"));
-                assert!(copied.contains("new body"));
+                if matches!(action, EntryAction::CopyPython) {
+                    assert!(copied.contains("\"id\": \"secret\""));
+                } else {
+                    assert!(copied.contains("id=secret"));
+                }
+                if !matches!(action, EntryAction::CopyPowerShell) {
+                    assert!(copied.contains("new body"));
+                }
             }
         }
         assert!(app.rows.is_empty());

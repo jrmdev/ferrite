@@ -250,15 +250,31 @@ pub enum ColorScheme {
     PaleGrey,
     PalePurple,
     PaleYellow,
+    DesertDusk,
+    RetroSunset,
+    NeonNoir,
+    Cappuccino,
+    DesertMirage,
+    EmeraldOdyssey,
+    AutumnOrchard,
+    CobaltSky,
 }
 
 impl ColorScheme {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 19] = [
         Self::Dark,
         Self::Light,
         Self::Dracula,
         Self::Nord,
         Self::SolarizedDark,
+        Self::DesertDusk,
+        Self::RetroSunset,
+        Self::NeonNoir,
+        Self::Cappuccino,
+        Self::DesertMirage,
+        Self::EmeraldOdyssey,
+        Self::AutumnOrchard,
+        Self::CobaltSky,
         Self::PaleBlue,
         Self::PaleGreen,
         Self::PaleRed,
@@ -280,6 +296,14 @@ impl ColorScheme {
             Self::PaleGrey => "Pale Grey",
             Self::PalePurple => "Pale Purple",
             Self::PaleYellow => "Pale Yellow",
+            Self::DesertDusk => "Desert Dusk",
+            Self::RetroSunset => "Retro Sunset",
+            Self::NeonNoir => "Neon Noir",
+            Self::Cappuccino => "Cappuccino",
+            Self::DesertMirage => "Desert Mirage",
+            Self::EmeraldOdyssey => "Emerald Odyssey",
+            Self::AutumnOrchard => "Autumn Orchard",
+            Self::CobaltSky => "Cobalt Sky",
         }
     }
 }

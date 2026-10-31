@@ -30,6 +30,22 @@ pub(super) fn websocket_editor(
     )
 }
 
+/// Pending messages must always edit the original payload directly.
+pub(super) fn websocket_intercept_editor(
+    ui: &mut egui::Ui,
+    text: &mut dyn egui::TextBuffer,
+    document: impl std::hash::Hash,
+    hex: bool,
+) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
+    let id = ui.make_persistent_id(("http-editor", document));
+    let kind = if hex {
+        super::highlight::Kind::Plain
+    } else {
+        super::highlight::Kind::Json
+    };
+    render(ui, text, id, kind)
+}
+
 enum Content {
     Http,
     Json,
@@ -176,6 +192,39 @@ mod tests {
         });
         assert_eq!(viewed.unwrap().inner.galley.job.text, expected);
         assert_eq!(hex, expected);
+    }
+
+    #[test]
+    fn websocket_intercept_edits_original_json_even_when_beautify_is_enabled() {
+        let ctx = egui::Context::default();
+        super::super::json_preview::configure(&ctx, true, 1);
+        let mut payload = "{\"value\":1}".to_owned();
+        let mut viewed = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                viewed = Some(websocket_intercept_editor(
+                    ui,
+                    &mut payload,
+                    "ws-pending",
+                    false,
+                ));
+            });
+        });
+        let editor = viewed.unwrap().inner;
+        assert_eq!(editor.galley.job.text, "{\"value\":1}");
+        editor.response.request_focus();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("x".into())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    websocket_intercept_editor(ui, &mut payload, "ws-pending", false);
+                });
+            },
+        );
+        assert!(payload.contains('x'));
     }
 
     #[test]

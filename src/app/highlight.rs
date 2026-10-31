@@ -67,29 +67,35 @@ pub(super) fn set_find_term(ctx: &egui::Context, term: &str) {
 }
 
 /// A find field that highlights matches in the visible message editors.
-pub(super) fn find_bar(ui: &mut egui::Ui, parts: &[(&str, &str)]) {
+pub(super) fn find_bar(
+    ui: &mut egui::Ui,
+    parts: &[(&str, &str)],
+    controls: impl FnOnce(&mut egui::Ui),
+) {
     let mut term = find_term(ui.ctx());
     ui.horizontal(|ui| {
         ui.label("Find");
+        let search_width = (ui.available_width() * 0.3).clamp(70.0, 240.0);
         if ui
             .add(
                 egui::TextEdit::singleline(&mut term)
                     .hint_text("Highlight text in both messages")
-                    .desired_width(240.0),
+                    .desired_width(search_width),
             )
             .changed()
         {
             set_find_term(ui.ctx(), &term);
         }
+        controls(ui);
         if !term.is_empty() {
             let counts: Vec<String> = parts
                 .iter()
                 .map(|(label, text)| format!("{} in {label}", matches(text, &term).len()))
                 .collect();
-            ui.weak(counts.join(" · "));
             if ui.small_button("Clear").clicked() {
                 set_find_term(ui.ctx(), "");
             }
+            ui.add(egui::Label::new(egui::RichText::new(counts.join(" · ")).weak()).truncate());
         }
     });
 }
@@ -458,6 +464,8 @@ pub(super) fn layouter(
         let text = buffer.as_str();
         let find = find_term(ui.ctx());
         let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let font_sources =
+            ui.fonts_mut(|fonts| fonts.definitions().families.get(&font.family).cloned());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(
             &(
@@ -469,6 +477,7 @@ pub(super) fn layouter(
                 ui.visuals().text_color(),
                 ui.visuals().weak_text_color(),
                 &font.family,
+                &font_sources,
                 font.size.to_bits(),
                 ui.ctx().pixels_per_point().to_bits(),
             ),

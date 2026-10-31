@@ -1,4 +1,5 @@
 use super::http_editor::websocket_editor;
+use super::http_editor::websocket_intercept_editor;
 use super::{editable, hex, split_panes, timestamp, unhex};
 use crate::{
     display_timezone::DisplayTimezone,
@@ -629,7 +630,7 @@ impl State {
             ));
             ui.label("Forward preserves the complete original payload.");
         } else {
-            websocket_editor(
+            websocket_intercept_editor(
                 ui,
                 &mut self.edit,
                 ("ws-intercept", item.id, self.edit_hex),

@@ -21,6 +21,25 @@ struct Stored {
     browser: BrowserSettings,
     #[serde(default)]
     mcp: McpSettings,
+    #[serde(default)]
+    editor_font: EditorFont,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorFont {
+    /// Empty means the bundled monospace font.
+    pub face: String,
+    pub size: f32,
+}
+
+impl Default for EditorFont {
+    fn default() -> Self {
+        Self {
+            face: String::new(),
+            size: 13.0,
+        }
+    }
 }
 
 /// Ferrite's configuration directory: `FERRITE_CONFIG_DIR`, or
@@ -54,6 +73,7 @@ impl Preferences {
                 timezone: DisplayTimezone::default(),
                 browser: BrowserSettings::default(),
                 mcp: McpSettings::default(),
+                editor_font: EditorFont::default(),
                 ca_key: match project.ca_key() {
                     Some(key) => key,
                     None => Authority::generate_key()?,
@@ -111,6 +131,23 @@ impl Preferences {
 
     pub fn scheme(&self) -> ColorScheme {
         self.stored.color_scheme
+    }
+    pub fn editor_font(&self) -> &EditorFont {
+        &self.stored.editor_font
+    }
+    pub fn set_editor_font(&mut self, font: EditorFont) -> Result<()> {
+        anyhow::ensure!(
+            font.size.is_finite() && (8.0..=36.0).contains(&font.size),
+            "Editor font size must be between 8 and 36"
+        );
+        let updated = Self::with_lock(&self.path, || {
+            let mut latest = Self::read(&self.path)?;
+            latest.stored.editor_font = font;
+            latest.write(true)?;
+            Ok(latest.stored)
+        })?;
+        self.stored = updated;
+        Ok(())
     }
     pub fn ca_key(&self) -> &[u8] {
         &self.stored.ca_key
@@ -274,10 +311,12 @@ mod tests {
         let fingerprint = Authority::from_key(old.ca_key()).unwrap().fingerprint();
         let mut saved = serde_json::to_value(&old.stored).unwrap();
         saved.as_object_mut().unwrap().remove("timezone");
+        saved.as_object_mut().unwrap().remove("editor_font");
         std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
         let mut first = Preferences::load_at(&path, &project).unwrap();
         let mut second = Preferences::load_at(&path, &project).unwrap();
         assert_eq!(first.timezone(), DisplayTimezone::Utc);
+        assert_eq!(first.editor_font(), &EditorFont::default());
         assert_eq!(first.browser(), &BrowserSettings::default());
         // MCP is opt-in and asks before sending requests by default.
         assert!(!first.mcp().enabled);
@@ -302,12 +341,33 @@ mod tests {
             .set_timezone(DisplayTimezone::Named(chrono_tz::Asia::Kolkata))
             .unwrap();
         second.set_scheme(ColorScheme::Light).unwrap();
+        first
+            .set_editor_font(EditorFont {
+                face: "Example Mono".into(),
+                size: 18.0,
+            })
+            .unwrap();
+        assert!(
+            first
+                .set_editor_font(EditorFont {
+                    face: String::new(),
+                    size: 0.0
+                })
+                .is_err()
+        );
         let reloaded = Preferences::load_at(&path, &Project::temporary()).unwrap();
         assert_eq!(
             reloaded.timezone(),
             DisplayTimezone::Named(chrono_tz::Asia::Kolkata)
         );
         assert_eq!(reloaded.scheme(), ColorScheme::Light);
+        assert_eq!(
+            reloaded.editor_font(),
+            &EditorFont {
+                face: "Example Mono".into(),
+                size: 18.0
+            }
+        );
         assert_eq!(reloaded.browser(), &browser);
         assert_eq!(
             Authority::from_key(reloaded.ca_key())

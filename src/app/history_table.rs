@@ -27,12 +27,12 @@ const COLUMNS: [(SortColumn, &str, f32); 10] = [
     (SortColumn::Id, "#", 50.0),
     (SortColumn::Timestamp, "Timestamp", 200.0),
     (SortColumn::Status, "Status", 70.0),
-    (SortColumn::Type, "Type", 100.0),
-    (SortColumn::Bytes, "Bytes", 80.0),
-    (SortColumn::Duration, "Duration (ms)", 100.0),
-    (SortColumn::Tool, "Tool", 80.0),
-    (SortColumn::Method, "Method", 70.0),
-    (SortColumn::Comment, "Comment", 90.0),
+    (SortColumn::Type, "Type", 80.0),
+    (SortColumn::Bytes, "Bytes", 65.0),
+    (SortColumn::Duration, "Duration (ms)", 90.0),
+    (SortColumn::Tool, "Tool", 65.0),
+    (SortColumn::Method, "Method", 60.0),
+    (SortColumn::Comment, "Comment", 75.0),
     (SortColumn::Url, "URL", 240.0),
 ];
 
@@ -272,7 +272,7 @@ pub(super) fn show(
                     }
                     if let Some(value) = entry_menu(&response, true) {
                         let ids = if matches!(value, EntryAction::Intruder | EntryAction::CopyUrl
-                            | EntryAction::CopyCurl | EntryAction::CopyPython | EntryAction::CopyMessage(_)
+                            | EntryAction::CopyCurl | EntryAction::CopyPython | EntryAction::CopyPowerShell | EntryAction::CopyMessage(_)
                             | EntryAction::Comparer(..) | EntryAction::Decoder(_)) { vec![flow.id] }
                             else { visible.iter().filter(|id| selection.ids.contains(id)).copied().collect() };
                         action = Some((ids, value));

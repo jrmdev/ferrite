@@ -39,10 +39,12 @@ pub(super) fn message_background(visuals: &egui::Visuals) -> Color32 {
 
 pub(super) fn status_color(visuals: &egui::Visuals, status: u16) -> Color32 {
     let rgb = match (visuals.dark_mode, status / 100) {
+        (false, 1) => [132, 75, 0],
         (false, 2) => [24, 100, 49],
         (false, 3) => [30, 56, 120],
         (false, 4) => [128, 32, 64],
         (false, 5) => [112, 44, 148],
+        (true, 1) => [238, 183, 87],
         (true, 2) => [94, 184, 120],
         (true, 3) => [125, 155, 230],
         (true, 4) => [224, 132, 156],
@@ -60,7 +62,9 @@ pub fn apply(ctx: &egui::Context, scheme: ColorScheme) {
         | ColorScheme::PaleRed
         | ColorScheme::PaleGrey
         | ColorScheme::PalePurple
-        | ColorScheme::PaleYellow => egui::Visuals::light(),
+        | ColorScheme::PaleYellow
+        | ColorScheme::Cappuccino
+        | ColorScheme::DesertMirage => egui::Visuals::light(),
         _ => egui::Visuals::dark(),
     };
     let palette = match scheme {
@@ -127,6 +131,64 @@ pub fn apply(ctx: &egui::Context, scheme: ColorScheme) {
             [147, 161, 161],
             [42, 161, 152],
         )),
+        // Adapted from Figma's named color combinations, with surface and text
+        // shades chosen for a readable, low-glare application interface.
+        ColorScheme::DesertDusk => Some((
+            [61, 34, 45],
+            [45, 24, 35],
+            [82, 45, 56],
+            [255, 237, 229],
+            [230, 128, 87],
+        )),
+        ColorScheme::RetroSunset => Some((
+            [49, 39, 28],
+            [35, 29, 23],
+            [69, 54, 39],
+            [255, 245, 221],
+            [255, 206, 27],
+        )),
+        ColorScheme::NeonNoir => Some((
+            [25, 25, 25],
+            [18, 18, 18],
+            [45, 45, 45],
+            [241, 247, 237],
+            [44, 255, 5],
+        )),
+        ColorScheme::Cappuccino => Some((
+            [235, 222, 204],
+            [250, 244, 235],
+            [215, 198, 177],
+            [67, 39, 1],
+            [113, 70, 25],
+        )),
+        ColorScheme::DesertMirage => Some((
+            [238, 229, 205],
+            [252, 248, 235],
+            [220, 211, 182],
+            [39, 39, 87],
+            [155, 52, 33],
+        )),
+        ColorScheme::EmeraldOdyssey => Some((
+            [11, 61, 48],
+            [7, 44, 35],
+            [0, 76, 59],
+            [245, 255, 251],
+            [114, 230, 202],
+        )),
+        ColorScheme::AutumnOrchard => Some((
+            [65, 24, 45],
+            [48, 16, 32],
+            [87, 37, 60],
+            [255, 239, 225],
+            [245, 190, 59],
+        )),
+        ColorScheme::CobaltSky => Some((
+            [21, 38, 78],
+            [13, 24, 57],
+            [33, 56, 103],
+            [233, 244, 255],
+            [130, 200, 229],
+        )),
         _ => None,
     };
     if let Some((background, panel, widget, text, accent)) = palette {
@@ -188,7 +250,68 @@ mod tests {
             apply(&ctx, scheme);
             assert_eq!(
                 ctx.style().visuals.dark_mode,
-                !scheme.label().starts_with("Pale") && scheme != ColorScheme::Light
+                !scheme.label().starts_with("Pale")
+                    && !matches!(
+                        scheme,
+                        ColorScheme::Light | ColorScheme::Cappuccino | ColorScheme::DesertMirage
+                    )
+            );
+        }
+    }
+
+    #[test]
+    fn figma_palettes_keep_text_readable_and_round_trip() {
+        fn luminance(color: Color32) -> f32 {
+            let channel = |value: u8| {
+                let value = value as f32 / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+        }
+        fn contrast(a: Color32, b: Color32) -> f32 {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        for scheme in [
+            ColorScheme::DesertDusk,
+            ColorScheme::RetroSunset,
+            ColorScheme::NeonNoir,
+            ColorScheme::Cappuccino,
+            ColorScheme::DesertMirage,
+            ColorScheme::EmeraldOdyssey,
+            ColorScheme::AutumnOrchard,
+            ColorScheme::CobaltSky,
+        ] {
+            let serialized = serde_json::to_string(&scheme).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ColorScheme>(&serialized).unwrap(),
+                scheme
+            );
+            let ctx = egui::Context::default();
+            apply(&ctx, scheme);
+            let visuals = &ctx.style().visuals;
+            let text = visuals.text_color();
+            for background in [
+                visuals.panel_fill,
+                visuals.window_fill,
+                visuals.widgets.inactive.bg_fill,
+                visuals.widgets.hovered.bg_fill,
+                visuals.widgets.active.bg_fill,
+                visuals.selection.bg_fill,
+            ] {
+                assert!(
+                    contrast(text, background) >= 4.5,
+                    "{scheme:?} text contrast is {}",
+                    contrast(text, background)
+                );
+            }
+            assert!(
+                contrast(visuals.hyperlink_color, visuals.panel_fill) >= 4.5,
+                "{scheme:?} link contrast"
             );
         }
     }

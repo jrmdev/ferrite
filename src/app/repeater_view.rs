@@ -288,8 +288,6 @@ impl Workbench {
                 ui.label(if busy { "Sending…" } else { "" });
             });
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut tab.request_hex, "Request is hex");
-                ui.checkbox(&mut self.response_hex, "Response as hex");
                 if ui
                     .add_enabled(
                         !tab.history.is_empty()
@@ -372,7 +370,19 @@ impl Workbench {
                     )
                 })
                 .unwrap_or_default();
-            super::highlight::find_bar(ui, &[("request", &tab.request), ("response", &response)]);
+            egui::TopBottomPanel::bottom(ui.id().with("repeater-find"))
+                .resizable(false)
+                .frame(egui::Frame::NONE)
+                .show_inside(ui, |ui| {
+                    super::highlight::find_bar(
+                        ui,
+                        &[("request", &tab.request), ("response", &response)],
+                        |ui| {
+                            ui.checkbox(&mut tab.request_hex, "Request is hex");
+                            ui.checkbox(&mut self.response_hex, "Response as hex");
+                        },
+                    );
+                });
             ui.separator();
             let [mut request_ui, mut response_ui] = split_panes(ui, "repeater-editors", false, 0.5);
             subsection_heading(&mut request_ui, "Request");
