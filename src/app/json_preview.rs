@@ -20,9 +20,10 @@ pub(super) fn configure(ctx: &egui::Context, enabled: bool, project: usize) {
         let config = data.get_temp_mut_or_default::<Config>(egui::Id::new("json-preview-config"));
         if config.enabled != enabled || config.project != project {
             config.epoch = config.epoch.wrapping_add(1);
+            config.enabled = enabled;
+            config.project = project;
+            data.remove::<Cache>(egui::Id::new("json-preview-cache"));
         }
-        config.enabled = enabled;
-        config.project = project;
     });
 }
 
@@ -78,8 +79,17 @@ fn cached_preview(
         cache
             .entries
             .push_back((key, Arc::from(text), rendered.clone()));
-        while cache.entries.len() > 8 {
-            cache.entries.pop_front();
+        let mut bytes: usize = cache
+            .entries
+            .iter()
+            .map(|(_, source, rendered)| {
+                source.len() + rendered.as_ref().map_or(0, |text| text.len())
+            })
+            .sum();
+        while cache.entries.len() > 8 || bytes > 4 * super::response_content::DISPLAY_LIMIT {
+            if let Some((_, source, rendered)) = cache.entries.pop_front() {
+                bytes -= source.len() + rendered.as_ref().map_or(0, |text| text.len());
+            }
         }
     });
     rendered.map(|text| (key, text))
@@ -188,6 +198,33 @@ fn format_json(headers: &str, body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_bounds_retained_bytes_and_releases_previous_project() {
+        let ctx = egui::Context::default();
+        let cache_id = egui::Id::new("json-preview-cache");
+        configure(&ctx, true, 1);
+        let payload = format!(
+            "{{\"x\":\"{}\"}}",
+            "x".repeat(super::super::response_content::DISPLAY_LIMIT / 2)
+        );
+        for id in 0..12 {
+            assert!(preview_payload(&ctx, egui::Id::new(id), &payload).is_some());
+        }
+        let cache = ctx.data(|data| data.get_temp::<Cache>(cache_id)).unwrap();
+        let bytes: usize = cache
+            .entries
+            .iter()
+            .map(|(_, source, rendered)| source.len() + rendered.as_ref().map_or(0, |s| s.len()))
+            .sum();
+        assert!(bytes <= 4 * super::super::response_content::DISPLAY_LIMIT);
+        assert!(cache.entries.len() < 8);
+        configure(&ctx, true, 2);
+        assert!(ctx.data(|data| data.get_temp::<Cache>(cache_id)).is_none());
+        preview_payload(&ctx, egui::Id::new("new"), "{}");
+        configure(&ctx, false, 2);
+        assert!(ctx.data(|data| data.get_temp::<Cache>(cache_id)).is_none());
+    }
 
     #[test]
     fn websocket_json_is_detected_without_headers_and_respects_the_project_setting() {

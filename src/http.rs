@@ -66,13 +66,28 @@ impl Message {
             .unwrap_or(0)
     }
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = format!("{}\r\n", self.start).into_bytes();
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(self.start.as_bytes());
+        out.extend_from_slice(b"\r\n");
         for (k, v) in &self.headers {
-            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            out.extend_from_slice(k.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(v.as_bytes());
+            out.extend_from_slice(b"\r\n");
         }
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
         out
+    }
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.start.len()
+            + 4
+            + self.body.len()
+            + self
+                .headers
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 4)
+                .sum::<usize>()
     }
     pub fn decode_content(&mut self, limit: usize) -> Result<()> {
         use std::io::Read;
@@ -441,5 +456,24 @@ pub fn from_editor_buffer(text: &str, is_hex: bool) -> Result<Message> {
         Message::parse(&parse_hex(text)?)
     } else {
         from_editor(text)
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn encoded_length_and_bytes_preserve_duplicate_headers_and_binary_bodies() {
+        let head = "HTTP/1.1 200 OK\r\nX-Test: café\r\nX-Test: second\r\n\r\n";
+        for body in [vec![], vec![0, 255, 13, 10], vec![42; 1024 * 1024]] {
+            let mut bytes = head.as_bytes().to_vec();
+            bytes.extend_from_slice(&body);
+            let message = Message::parse(&bytes).unwrap();
+            assert_eq!(message.encoded_len(), bytes.len());
+            assert_eq!(message.encode(), bytes);
+        }
+        let message = Message::parse(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(message.encoded_len(), message.encode().len());
     }
 }

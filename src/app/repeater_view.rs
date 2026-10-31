@@ -258,7 +258,7 @@ impl Workbench {
         }
         let selected = self.repeater_tab;
         if let Some(tab) = tabs.iter_mut().find(|t| t.id == selected) {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Name");
                 ui.add(egui::TextEdit::singleline(&mut tab.name).desired_width(120.0));
                 ui.label("Collection");
@@ -287,15 +287,30 @@ impl Workbench {
                 }
                 ui.label(if busy { "Sending…" } else { "" });
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut tab.request_hex, "Request is hex");
                 ui.checkbox(&mut self.response_hex, "Response as hex");
-                if ui.button("Previous").clicked() && !tab.history.is_empty() {
+                if ui
+                    .add_enabled(
+                        !tab.history.is_empty()
+                            && (self.repeater_flow.is_none() || self.repeater_cursor > 0),
+                        egui::Button::new("Previous"),
+                    )
+                    .clicked()
+                {
                     self.repeater_cursor = self.repeater_cursor.saturating_sub(1);
                     self.repeater_cursor = self.repeater_cursor.min(tab.history.len() - 1);
                     self.repeater_flow = Some(tab.history[self.repeater_cursor]);
                 }
-                if ui.button("Next").clicked() && !tab.history.is_empty() {
+                if ui
+                    .add_enabled(
+                        !tab.history.is_empty()
+                            && (self.repeater_flow.is_none()
+                                || self.repeater_cursor.saturating_add(1) < tab.history.len()),
+                        egui::Button::new("Next"),
+                    )
+                    .clicked()
+                {
                     self.repeater_cursor = (self.repeater_cursor + 1).min(tab.history.len() - 1);
                     self.repeater_flow = Some(tab.history[self.repeater_cursor]);
                 }
@@ -393,7 +408,7 @@ impl Workbench {
             );
             if let Some(saved) = &flow {
                 if let Some(action) = entry_menu(&response_output.inner.response, true) {
-                    editor_action = Some((action, Ok(saved.clone())));
+                    editor_action = Some((action, Ok((**saved).clone())));
                 }
             } else if let Some(action) = item_menu(&response_output.inner.response, false, None) {
                 editor_action = Some((action, editor_context::repeater(tab)));

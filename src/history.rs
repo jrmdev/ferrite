@@ -301,6 +301,14 @@ impl CompiledFilter<'_> {
     /// Whether an exchange passes the filter. Searches also match the
     /// exchange's comment.
     pub fn matches(&self, flow: &Exchange, scope: &Scope, annotation: Option<&Annotation>) -> bool {
+        self.matches_using(flow, annotation, |url| scope.contains(url))
+    }
+    pub(crate) fn matches_using(
+        &self,
+        flow: &Exchange,
+        annotation: Option<&Annotation>,
+        in_scope: impl FnOnce(&str) -> bool,
+    ) -> bool {
         let f = self.filter;
         if f.annotated_only && annotation.is_none_or(Annotation::is_empty) {
             return false;
@@ -308,7 +316,7 @@ impl CompiledFilter<'_> {
         if !f.tools.as_ref().map_or_else(
             || f.tool.matches(&flow.tool),
             |tools| tools.matches(&flow.tool),
-        ) || (f.in_scope_only && !scope.contains(&flow.url))
+        ) || (f.in_scope_only && !in_scope(&flow.url))
             || (f.hide_without_responses && flow.response.is_empty())
             || (f.parameterized_only && !has_parameters(flow))
         {

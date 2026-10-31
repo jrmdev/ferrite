@@ -120,7 +120,7 @@ The project uses egui for the desktop UI, Tokio for networking, redb for project
 - Some Chromium background requests to Google services cannot be disabled by switches; filter History by scope to hide them.
 - MCP supports the stdio transport; the authenticated Streamable HTTP transport is structured for but not yet implemented. Response bodies returned to MCP clients are not redacted.
 - Ferrite does not load third-party plugins yet.
-- History keeps a full in-memory copy of exchanges for display, as in earlier versions; MCP reads use a separate lock-free reader.
+- History retains complete exchanges for display, so memory still grows with captured traffic. Incremental refreshes reuse unchanged exchanges, and temporary projects share their stored exchanges with the UI; MCP reads use a separate lock-free reader.
 
 ## Configuration
 

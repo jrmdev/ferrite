@@ -32,7 +32,7 @@ const COLUMNS: [(SortColumn, &str, f32); 10] = [
     (SortColumn::Duration, "Duration (ms)", 100.0),
     (SortColumn::Tool, "Tool", 80.0),
     (SortColumn::Method, "Method", 70.0),
-    (SortColumn::Comment, "Comment", 140.0),
+    (SortColumn::Comment, "Comment", 90.0),
     (SortColumn::Url, "URL", 240.0),
 ];
 
@@ -123,7 +123,7 @@ pub(super) fn show(
     let mut action = None;
     let original_sort = *sort;
     rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
-    let initial_ids: Vec<_> = rows.iter().map(|flow| flow.id).collect();
+    let mut initial_ids: Vec<_> = rows.iter().map(|flow| flow.id).collect();
     let offset = viewport.offset_for(&initial_ids, *sort);
     let invert_stripes = viewport.invert_stripes_for(&initial_ids, *sort);
     let height = ui.available_height();
@@ -137,7 +137,13 @@ pub(super) fn show(
             .focused
             .and_then(|id| initial_ids.iter().position(|row| *row == id)),
         initial_ids.len(),
+        ((height - 26.0).max(0.0) / 22.0) as usize,
     );
+    if ui.memory(|memory| memory.has_focus(focus_id))
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+    {
+        selection.select_all(&initial_ids);
+    }
     if let Some(index) = target {
         selection.click(initial_ids[index], &initial_ids, false, false, false);
     }
@@ -188,9 +194,12 @@ pub(super) fn show(
                 }
             }).body(|mut body| {
                 // Sort after rendering headers so a click updates rows in the same frame.
-                rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
-                let visible: Vec<_> = rows.iter().map(|flow| flow.id).collect();
-                selection.retain_visible(&visible);
+                if *sort != original_sort {
+                    rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
+                    initial_ids.clear();
+                    initial_ids.extend(rows.iter().map(|flow| flow.id));
+                }
+                let visible = &initial_ids;
                 // Insert the stripes behind the cells so selection/hover fills still take precedence.
                 let painter = body.ui_mut().painter().clone();
                 let background = painter.add(egui::Shape::Noop);
@@ -258,7 +267,7 @@ pub(super) fn show(
                     if response.clicked() || response.secondary_clicked() {
                         response.ctx.memory_mut(|memory| memory.request_focus(focus_id));
                         let modifiers = response.ctx.input(|input| input.modifiers);
-                        selection.click(flow.id, &visible, modifiers.command || modifiers.ctrl,
+                        selection.click(flow.id, visible, modifiers.command || modifiers.ctrl,
                             modifiers.shift, response.secondary_clicked());
                     }
                     if let Some(value) = entry_menu(&response, true) {
@@ -278,8 +287,7 @@ pub(super) fn show(
                 });
                 painter.set(background, egui::Shape::Vec(stripes));
             });
-            let ids: Vec<_> = rows.iter().map(|flow| flow.id).collect();
-            viewport.record(&ids, output.state.offset.y, original_sort, invert_stripes);
+            viewport.record(&initial_ids, output.state.offset.y, original_sort, invert_stripes);
         });
     action
 }
@@ -412,7 +420,36 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             }]);
         }
-        assert_eq!(selection.focused, Some(22));
+        frame(vec![egui::Event::Key {
+            key: egui::Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(vec![egui::Event::Key {
+            key: egui::Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(vec![egui::Event::Key {
+            key: egui::Key::PageUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }]);
+        assert!(selection.focused.is_some_and(|id| id < 22 && id > 1));
+        assert_eq!(selection.ids.len(), 30);
         let ids: Vec<_> = (1..=30).rev().collect();
         assert!(viewport.offset_for(&ids, sort) > 0.0);
     }

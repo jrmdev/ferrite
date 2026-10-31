@@ -1,7 +1,7 @@
 //! Syntax highlighting and find matches for message editors. Highlighting
 //! only changes how text is drawn; the text itself is never modified.
 use eframe::egui::{self, Color32, text::LayoutJob};
-use std::{hash::Hasher, sync::Arc};
+use std::{collections::VecDeque, hash::Hasher, sync::Arc};
 
 /// Text beyond this many bytes is drawn without syntax colours.
 const HIGHLIGHT_LIMIT: usize = 512 * 1024;
@@ -178,7 +178,25 @@ fn http_head(text: &str, offset: usize, p: &Palette, spans: &mut Spans, visuals:
             } else {
                 push(spans, start, start + first.len(), p.accent);
                 let version = content.rfind(" HTTP/").unwrap_or(content.len());
-                push(spans, start + first.len(), start + version, p.text);
+                let target_start = first.len();
+                let target = &content[target_start..version];
+                if let Some(query) = target.split('#').next().unwrap_or(target).find('?') {
+                    let query_start = target_start + query + 1;
+                    let query_end = content[query_start..version]
+                        .find('#')
+                        .map_or(version, |fragment| query_start + fragment);
+                    push(spans, start + target_start, start + query_start - 1, p.text);
+                    push(spans, start + query_start - 1, start + query_start, p.weak);
+                    form(
+                        &content[query_start..query_end],
+                        start + query_start,
+                        p,
+                        spans,
+                    );
+                    push(spans, start + query_end, start + version, p.text);
+                } else {
+                    push(spans, start + target_start, start + version, p.text);
+                }
                 push(spans, start + version, position, p.weak);
             }
         } else if let Some(colon) = content.find(':') {
@@ -322,7 +340,7 @@ fn form(text: &str, offset: usize, p: &Palette, spans: &mut Spans) {
                     spans,
                     offset + position + eq + 1,
                     offset + position + content.len(),
-                    p.text,
+                    p.string,
                 );
             }
             None => push(
@@ -426,7 +444,12 @@ pub(super) fn layout(
     job
 }
 
-/// A layouter for `TextEdit` that caches the galley by content.
+#[derive(Clone, Default)]
+struct LayoutCache {
+    entries: VecDeque<(egui::Id, u64, u64, Arc<egui::Galley>)>,
+}
+
+/// Keep only recent visible layouts, rather than one large galley per exchange.
 pub(super) fn layouter(
     kind: Kind,
     id: egui::Id,
@@ -434,6 +457,7 @@ pub(super) fn layouter(
     move |ui, buffer, wrap_width| {
         let text = buffer.as_str();
         let find = find_term(ui.ctx());
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(
             &(
@@ -442,20 +466,45 @@ pub(super) fn layouter(
                 kind,
                 wrap_width.to_bits(),
                 ui.visuals().dark_mode,
+                ui.visuals().text_color(),
+                ui.visuals().weak_text_color(),
+                &font.family,
+                font.size.to_bits(),
+                ui.ctx().pixels_per_point().to_bits(),
             ),
             &mut hasher,
         );
         let key = hasher.finish();
-        let cache = id.with("highlight-cache");
-        if let Some((cached, galley)) = ui.data(|d| d.get_temp::<(u64, Arc<egui::Galley>)>(cache))
-            && cached == key
-        {
+        let cache_id = egui::Id::new("highlight-layout-cache");
+        let frame = ui.ctx().cumulative_frame_nr();
+        let cached = ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<LayoutCache>(cache_id);
+            cache
+                .entries
+                .retain(|(_, _, used, _)| frame.saturating_sub(*used) <= 1);
+            let index = cache
+                .entries
+                .iter()
+                .position(|(entry, hash, _, _)| *entry == id && *hash == key)?;
+            let (entry, hash, _, galley) = cache.entries.remove(index)?;
+            cache
+                .entries
+                .push_back((entry, hash, frame, galley.clone()));
+            Some(galley)
+        });
+        if let Some(galley) = cached {
             return galley;
         }
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
         let job = layout(text, kind, &find, font, wrap_width, ui.visuals());
         let galley = ui.fonts_mut(|f| f.layout_job(job));
-        ui.data_mut(|d| d.insert_temp(cache, (key, galley.clone())));
+        ui.data_mut(|data| {
+            let cache = data.get_temp_mut_or_default::<LayoutCache>(cache_id);
+            cache.entries.retain(|(entry, _, _, _)| *entry != id);
+            cache.entries.push_back((id, key, frame, galley.clone()));
+            while cache.entries.len() > 8 {
+                cache.entries.pop_front();
+            }
+        });
         galley
     }
 }
@@ -463,6 +512,45 @@ pub(super) fn layouter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_cache_evicts_old_documents_and_tracks_font_changes() {
+        let ctx = egui::Context::default();
+        let cache_id = egui::Id::new("highlight-layout-cache");
+        for frame in 0..20 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut render = layouter(Kind::Http, egui::Id::new(frame));
+                    let text = "GET / HTTP/1.1\r\n\r\n";
+                    let first = render(ui, &text, 400.0);
+                    assert!(Arc::ptr_eq(&first, &render(ui, &text, 400.0)));
+                    ui.style_mut()
+                        .text_styles
+                        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(24.0));
+                    let larger = render(ui, &text, 400.0);
+                    assert!(larger.size().y > first.size().y);
+                });
+            });
+            let cache = ctx
+                .data(|data| data.get_temp::<LayoutCache>(cache_id))
+                .unwrap();
+            assert!(cache.entries.len() <= 2);
+        }
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for document in 100..120 {
+                    layouter(Kind::Plain, egui::Id::new(document))(ui, &"text", 400.0);
+                }
+            });
+        });
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<LayoutCache>(cache_id))
+                .unwrap()
+                .entries
+                .len(),
+            8
+        );
+    }
 
     fn colours(text: &str, kind: Kind, find: &str) -> Vec<(String, Color32, bool)> {
         let visuals = egui::Visuals::dark();
@@ -515,6 +603,7 @@ mod tests {
             "POST / HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\n\nuser=al&pw=x";
         let sections = colours(form, Kind::Http, "");
         assert!(sections.contains(&("user".into(), p.key, false)));
+        assert!(sections.contains(&("al".into(), p.string, false)));
         assert!(sections.contains(&("&".into(), p.weak, false)));
         // Unterminated and binary-looking input must not panic or lose text.
         colours("GET / HTTP/1.1\n\n{\"open", Kind::Http, "");
@@ -523,6 +612,36 @@ mod tests {
         colours("HTTP/1.1", Kind::Http, "");
         colours("HTTP/1.1 200", Kind::Http, "1");
         colours("{\"a\\é", Kind::Json, "");
+    }
+
+    #[test]
+    fn query_and_form_parameters_include_values_and_preserve_text() {
+        let p = Palette::new(&egui::Visuals::dark());
+        for request in [
+            "GET /path?name=caf%C3%A9&empty=&flag&x=a=b#fragment HTTP/1.1\r\n\r\n",
+            "GET /path?name=caf%C3%A9&empty=&flag&x=a=b",
+            "POST / HTTP/1.1\nContent-Type: application/x-www-form-urlencoded; charset=utf-8\n\nname=caf%C3%A9&empty=&flag&x=a=b",
+        ] {
+            let sections = colours(request, Kind::Http, "");
+            for key in ["name", "empty", "flag", "x"] {
+                assert!(
+                    sections.contains(&(key.into(), p.key, false)),
+                    "{key}: {sections:?}"
+                );
+            }
+            for value in ["caf%C3%A9", "a=b"] {
+                assert!(
+                    sections.contains(&(value.into(), p.string, false)),
+                    "{value}: {sections:?}"
+                );
+            }
+        }
+        let sections = colours("GET /path#fragment?key=value HTTP/1.1", Kind::Http, "");
+        assert!(
+            !sections
+                .iter()
+                .any(|(text, color, _)| text == "key" && *color == p.key)
+        );
     }
 
     #[test]

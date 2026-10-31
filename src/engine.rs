@@ -435,7 +435,7 @@ impl Engine {
                 response.remove("Content-Length");
                 response.remove("Transfer-Encoding");
                 ensure!(
-                    response.encode().len() <= settings.max_message_bytes,
+                    response.encoded_len() <= settings.max_message_bytes,
                     "Edited response exceeds message limit"
                 );
                 return Ok(response);
@@ -455,7 +455,7 @@ impl Engine {
                 response.normalize_length();
             }
             ensure!(
-                response.encode().len() <= settings.max_message_bytes,
+                response.encoded_len() <= settings.max_message_bytes,
                 "Edited response exceeds message limit"
             );
             Ok(response)
@@ -472,7 +472,7 @@ impl Engine {
             }
         }
         flow.duration_ms = started.elapsed().as_millis() as u64;
-        self.project.lock().unwrap().insert(flow.clone())?;
+        self.project.lock().unwrap().record(&flow)?;
         self.activity.fetch_add(1, Ordering::SeqCst);
         self.enqueue_passive(&flow);
         Ok((flow, upgrade))

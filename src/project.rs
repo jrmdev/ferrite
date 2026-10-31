@@ -9,8 +9,17 @@ use std::{
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const FLOWS: TableDefinition<u64, &[u8]> = TableDefinition::new("exchanges");
+
+fn database_builder() -> redb::Builder {
+    let mut builder = Database::builder();
+    // The UI also retains message bodies; avoid redb's 1 GiB default per project.
+    builder.set_cache_size(64 * 1024 * 1024);
+    builder
+}
 mod annotations;
 mod audit;
+mod history_cache;
+mod history_reader;
 mod scanner;
 mod websockets;
 use crate::websocket::{CapturedMessage, MessageSummary, Session};
@@ -22,6 +31,7 @@ pub struct Project {
     pub workspace: Workspace,
     secret: Option<Vec<u8>>,
     next_id: u64,
+    history_changes: history_cache::Changes,
     ws_sessions: BTreeMap<u64, Session>,
     ws_summaries: BTreeMap<(u64, u64), MessageSummary>,
     ws_memory: BTreeMap<(u64, u64), CapturedMessage>,
@@ -31,68 +41,7 @@ pub struct Project {
     annotations: BTreeMap<u64, crate::history::Annotation>,
 }
 
-/// Read access to stored exchanges that does not hold the project lock, so
-/// long scans never delay proxy recording. Disk projects read a consistent
-/// redb snapshot; temporary projects read a snapshot of shared exchanges.
-pub struct HistoryReader {
-    db: Option<Arc<Database>>,
-    memory: Vec<Arc<Exchange>>,
-}
-impl HistoryReader {
-    pub fn get(&self, id: u64) -> Result<Option<Exchange>> {
-        if let Some(db) = &self.db {
-            let tx = db.begin_read()?;
-            Ok(tx
-                .open_table(FLOWS)?
-                .get(id)?
-                .map(|v| serde_json::from_slice(v.value()))
-                .transpose()?)
-        } else {
-            Ok(self
-                .memory
-                .binary_search_by_key(&id, |flow| flow.id)
-                .ok()
-                .map(|index| (*self.memory[index]).clone()))
-        }
-    }
-    pub fn len(&self) -> Result<u64> {
-        if let Some(db) = &self.db {
-            use redb::ReadableTableMetadata;
-            Ok(db.begin_read()?.open_table(FLOWS)?.len()?)
-        } else {
-            Ok(self.memory.len() as u64)
-        }
-    }
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
-    }
-    /// Visit exchanges newest first with IDs below `before`, until `visit`
-    /// returns false.
-    pub fn scan_desc(
-        &self,
-        before: Option<u64>,
-        mut visit: impl FnMut(Exchange) -> Result<bool>,
-    ) -> Result<()> {
-        let end = before.unwrap_or(u64::MAX);
-        if let Some(db) = &self.db {
-            let tx = db.begin_read()?;
-            let table = tx.open_table(FLOWS)?;
-            for item in table.range(..end)?.rev() {
-                let (_, value) = item?;
-                if !visit(serde_json::from_slice(value.value())?)? {
-                    break;
-                }
-            }
-        } else {
-            for flow in self.memory.iter().rev().filter(|flow| flow.id < end) {
-                if !visit((**flow).clone())? {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-}
+pub use history_reader::HistoryReader;
 
 impl Project {
     pub fn temporary() -> Self {
@@ -103,6 +52,7 @@ impl Project {
             workspace: Workspace::default(),
             secret: None,
             next_id: 1,
+            history_changes: Default::default(),
             ws_sessions: BTreeMap::new(),
             ws_summaries: BTreeMap::new(),
             ws_memory: BTreeMap::new(),
@@ -142,8 +92,9 @@ impl Project {
         }
     }
     pub fn open_existing(path: &Path) -> Result<Self> {
-        let db =
-            Database::open(path).with_context(|| format!("Open project {}", path.display()))?;
+        let db = database_builder()
+            .open(path)
+            .with_context(|| format!("Open project {}", path.display()))?;
         Self::from_database(db, path)
     }
     pub fn create(path: &Path) -> Result<Self> {
@@ -157,7 +108,8 @@ impl Project {
         opts.open(path)
             .with_context(|| format!("Create {}", path.display()))?;
         let result = (|| {
-            let db = Database::create(path)
+            let db = database_builder()
+                .create(path)
                 .with_context(|| format!("Create project {}", path.display()))?;
             Self::from_database(db, path)
         })();
@@ -206,6 +158,7 @@ impl Project {
             workspace,
             secret,
             next_id,
+            history_changes: Default::default(),
             ws_sessions: BTreeMap::new(),
             ws_summaries: BTreeMap::new(),
             ws_memory: BTreeMap::new(),
@@ -253,18 +206,26 @@ impl Project {
         Ok(())
     }
     pub fn insert(&mut self, flow: Exchange) -> Result<()> {
+        self.store_exchange(std::borrow::Cow::Owned(flow))
+    }
+    pub(crate) fn record(&mut self, flow: &Exchange) -> Result<()> {
+        self.store_exchange(std::borrow::Cow::Borrowed(flow))
+    }
+    fn store_exchange(&mut self, flow: std::borrow::Cow<'_, Exchange>) -> Result<()> {
+        let id = flow.id;
         let next_id = flow.id.checked_add(1).context("Exchange ID exhausted")?;
         if let Some(db) = &self.db {
-            let bytes = serde_json::to_vec(&flow)?;
+            let bytes = serde_json::to_vec(flow.as_ref())?;
             let tx = db.begin_write()?;
             {
                 tx.open_table(FLOWS)?.insert(flow.id, bytes.as_slice())?;
             }
             tx.commit()?;
         } else {
-            self.memory.insert(flow.id, Arc::new(flow));
+            self.memory.insert(flow.id, Arc::new(flow.into_owned()));
         }
         self.next_id = self.next_id.max(next_id);
+        self.history_changes.record(id);
         Ok(())
     }
     pub fn delete(&mut self, ids: &[u64]) -> Result<()> {
@@ -275,9 +236,10 @@ impl Project {
                 .is_some_and(|s| s.state == crate::websocket::SessionState::Open)),
             "Close the active WebSocket session before deleting its handshake"
         );
+        let deleted: std::collections::HashSet<_> = ids.iter().copied().collect();
         let mut workspace = self.workspace.clone();
         for tab in &mut workspace.repeater {
-            tab.history.retain(|id| !ids.contains(id));
+            tab.history.retain(|id| !deleted.contains(id));
         }
         if let Some(db) = &self.db {
             let bytes = serde_json::to_vec(&workspace)?;
@@ -297,11 +259,14 @@ impl Project {
                 self.memory.remove(id);
             }
         }
+        for id in ids {
+            self.history_changes.record(*id);
+        }
         self.workspace = workspace;
-        self.ws_sessions.retain(|id, _| !ids.contains(id));
-        self.ws_summaries.retain(|(id, _), _| !ids.contains(id));
-        self.ws_memory.retain(|(id, _), _| !ids.contains(id));
-        self.annotations.retain(|id, _| !ids.contains(id));
+        self.ws_sessions.retain(|id, _| !deleted.contains(id));
+        self.ws_summaries.retain(|(id, _), _| !deleted.contains(id));
+        self.ws_memory.retain(|(id, _), _| !deleted.contains(id));
+        self.annotations.retain(|id, _| !deleted.contains(id));
         Ok(())
     }
     pub fn get(&self, id: u64) -> Result<Option<Exchange>> {
@@ -340,7 +305,7 @@ impl Project {
             .unwrap_or_else(|| Path::new("."));
         let staged = tempfile::NamedTempFile::new_in(directory)?.into_temp_path();
         {
-            let db = Database::create(&staged)?;
+            let db = database_builder().create(&staged)?;
             let mut disk = Self::from_database(db, path)?;
             disk.workspace = self.workspace.clone();
             if disk.workspace.name == "Temporary project"
@@ -352,9 +317,7 @@ impl Project {
             if let Some(secret) = &self.secret {
                 disk.set_ca_key(secret.clone())?;
             }
-            for flow in self.list()? {
-                disk.insert(flow)?;
-            }
+            self.copy_history(&mut disk)?;
             self.copy_websockets(&mut disk)?;
             self.copy_scanner(&mut disk)?;
             self.copy_audit(&mut disk)?;
@@ -380,6 +343,7 @@ impl Project {
             }
         }
         disk.next_id = disk.next_id.max(self.next_id);
+        disk.history_changes = self.history_changes.clone();
         *self = disk;
         Ok(())
     }
@@ -395,7 +359,8 @@ impl Project {
             .open(path)
             .with_context(|| format!("Create {}", path.display()))?;
         let result = (|| -> Result<()> {
-            let db = Database::create(path)
+            let db = database_builder()
+                .create(path)
                 .with_context(|| format!("Create project {}", path.display()))?;
             let mut dest = Self::from_database(db, path)?;
             dest.workspace = self.workspace.clone();
@@ -403,9 +368,7 @@ impl Project {
             if let Some(secret) = &self.secret {
                 dest.set_ca_key(secret.clone())?;
             }
-            for flow in self.list()? {
-                dest.insert(flow)?;
-            }
+            self.copy_history(&mut dest)?;
             self.copy_websockets(&mut dest)?;
             self.copy_scanner(&mut dest)?;
             self.copy_audit(&mut dest)?;

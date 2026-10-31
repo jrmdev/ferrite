@@ -112,7 +112,8 @@ pub struct Workbench {
     fallback_dirty: bool,
     scope_include: String,
     scope_exclude: String,
-    rows: Vec<Exchange>,
+    rows: Vec<Arc<Exchange>>,
+    history_revision: Option<u64>,
     history_sort: [HistorySort; 2],
     history_selection: [HistorySelection; 2],
     history_viewport: [HistoryViewport; 2],
@@ -216,6 +217,7 @@ fn table_arrow_navigation(
     id: egui::Id,
     selected: Option<usize>,
     len: usize,
+    page_rows: usize,
 ) -> Option<usize> {
     ui.interact(
         egui::Rect::NOTHING,
@@ -230,6 +232,10 @@ fn table_arrow_navigation(
             -1
         } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
             1
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+            -2
+        } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+            2
         } else {
             0
         }
@@ -238,6 +244,8 @@ fn table_arrow_navigation(
     match direction {
         -1 if current > 0 => Some(current - 1),
         1 if current + 1 < len => Some(current + 1),
+        -2 if current > 0 => Some(current.saturating_sub(page_rows.max(1))),
+        2 if current + 1 < len => Some(current.saturating_add(page_rows.max(1)).min(len - 1)),
         _ => None,
     }
 }
@@ -563,6 +571,7 @@ impl Workbench {
             scope_include: s.scope.include.join("\n"),
             scope_exclude: s.scope.exclude.join("\n"),
             rows: vec![],
+            history_revision: None,
             history_sort: [HistorySort::default(); 2],
             history_selection: Default::default(),
             history_viewport: Default::default(),
@@ -668,14 +677,15 @@ impl Workbench {
         }
         let current = self.engine.activity.load(Ordering::SeqCst);
         if current != self.seen {
-            let list = self.engine.project.lock().unwrap().list();
-            if let Some(rows) = self.report(list) {
-                let previous_ids: std::collections::BTreeSet<_> =
-                    self.rows.iter().map(|flow| flow.id).collect();
-                for flow in &rows {
-                    if !previous_ids.contains(&flow.id)
-                        && let Some(error) = &flow.error
-                    {
+            let updates = self
+                .engine
+                .project
+                .lock()
+                .unwrap()
+                .sync_history(&mut self.rows, &mut self.history_revision);
+            if let Some(added) = self.report(updates) {
+                for flow in added {
+                    if let Some(error) = &flow.error {
                         self.alerts.push_at(
                             flow.timestamp_ms,
                             Level::Error,
@@ -684,7 +694,6 @@ impl Workbench {
                         );
                     }
                 }
-                self.rows = rows;
                 self.seen = current;
             }
         }
@@ -768,6 +777,7 @@ impl Workbench {
             self.listener_was_running = false;
             self.project_path = path;
             self.rows.clear();
+            self.history_revision = None;
             self.seen = u64::MAX;
             self.websocket_view = websocket_view::State::default();
             self.scanner_view = scanner_view::State::default();
@@ -1176,16 +1186,22 @@ impl Workbench {
     }
 
     fn search_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Search");
-            ui.text_edit_singleline(&mut self.search);
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("Search");
+            ui.text_edit_singleline(&mut self.search)
+                .labelled_by(label.id);
             ui.checkbox(&mut self.search_regex, "Regex");
             ui.checkbox(&mut self.case_sensitive, "Case sensitive");
             ui.checkbox(&mut self.scope_only, "In scope");
         });
     }
-    fn filtered(&self, flow: &Exchange, pattern: Option<&regex::bytes::Regex>) -> bool {
-        if self.scope_only && !self.engine.settings().scope.contains(&flow.url) {
+    fn filtered(
+        &self,
+        flow: &Exchange,
+        pattern: Option<&regex::bytes::Regex>,
+        in_scope: &impl Fn(&str) -> bool,
+    ) -> bool {
+        if self.scope_only && !in_scope(&flow.url) {
             return false;
         }
         if self.search.is_empty() {
@@ -1266,18 +1282,27 @@ impl Workbench {
             }
         };
         let scope = self.engine.settings().scope;
+        let in_scope = scope_matcher(
+            &scope,
+            if intruder_only {
+                self.scope_only
+            } else {
+                filter.in_scope_only
+            },
+        );
         let annotations = self.engine.project.lock().unwrap().annotations().clone();
         let mut rows: Vec<_> = self
             .rows
             .iter()
+            .map(Arc::as_ref)
             .filter(|r| {
                 if intruder_only {
-                    r.tool.starts_with("Intruder") && self.filtered(r, pattern.as_ref())
+                    r.tool.starts_with("Intruder") && self.filtered(r, pattern.as_ref(), &in_scope)
                 } else {
                     self.websocket_view.reveal_handshake == Some(r.id)
-                        || compiled
-                            .as_ref()
-                            .is_some_and(|filter| filter.matches(r, &scope, annotations.get(&r.id)))
+                        || compiled.as_ref().is_some_and(|filter| {
+                            filter.matches_using(r, annotations.get(&r.id), &in_scope)
+                        })
                 }
             })
             .collect();
@@ -1288,6 +1313,13 @@ impl Workbench {
             self.history_selection[usize::from(intruder_only)].ids.len()
         )).on_hover_text("Ctrl/Cmd-click to toggle rows; Shift-click to select a range. Right-click to export the selection.");
         let [mut list, mut detail] = split_panes(ui, "history-detail", true, 0.38);
+        if rows.is_empty() {
+            list.weak(if self.rows.is_empty() {
+                "No captured exchanges yet. Start the listener in Proxy or send a request from Repeater."
+            } else {
+                "No exchanges match the current filters. Adjust the search or reset the filters."
+            });
+        }
         let action = history_table::show(
             &mut list,
             &mut rows,
@@ -1317,6 +1349,7 @@ impl Workbench {
         if matches!(action, EntryAction::Delete) {
             let result = self.engine.project.lock().unwrap().delete(ids);
             if self.report(result).is_some() {
+                let ids: std::collections::HashSet<_> = ids.iter().copied().collect();
                 self.rows.retain(|flow| !ids.contains(&flow.id));
                 if self.selected.is_some_and(|id| ids.contains(&id)) {
                     self.selected = None;
@@ -1335,7 +1368,7 @@ impl Workbench {
         let by_id: BTreeMap<_, _> = self.rows.iter().map(|flow| (flow.id, flow)).collect();
         let flows = ids
             .iter()
-            .filter_map(|id| by_id.get(id).map(|flow| (*flow).clone()))
+            .filter_map(|id| by_id.get(id).map(|flow| (***flow).clone()))
             .collect();
         self.exchange_action(ctx, flows, action);
     }
@@ -1541,7 +1574,7 @@ impl Workbench {
         }
     }
     fn flow_view(&mut self, ui: &mut egui::Ui, flow: &Exchange) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Send to Repeater").clicked() {
                 self.send_to_repeater(flow);
             }
@@ -1892,9 +1925,10 @@ impl Workbench {
         }
         self.search_bar(ui);
         let pattern = self.search_pattern().ok();
+        let in_scope = scope_matcher(&self.engine.settings().scope, self.scope_only);
         let mut sites: BTreeMap<String, SiteNode> = BTreeMap::new();
         for flow in &self.rows {
-            if !self.filtered(flow, pattern.as_ref()) {
+            if !self.filtered(flow, pattern.as_ref(), &in_scope) {
                 continue;
             }
             let origin = flow.destination.origin();
@@ -2223,18 +2257,41 @@ impl Workbench {
         ui.label("Invisible mode accepts origin-form HTTP and direct TLS with SNI. DNS overrides route redirected hosts back to the real server. When invisible mode is enabled, a fallback target can handle clients without Host/SNI.");
     }
 }
+fn scope_matcher(scope: &crate::model::Scope, enabled: bool) -> impl Fn(&str) -> bool + use<> {
+    let compile = |patterns: &[String]| {
+        patterns
+            .iter()
+            .filter(|_| enabled)
+            .filter_map(|p| regex::Regex::new(p).ok())
+            .collect::<Vec<_>>()
+    };
+    let include = compile(&scope.include);
+    let exclude = compile(&scope.exclude);
+    move |url| include.iter().any(|r| r.is_match(url)) && !exclude.iter().any(|r| r.is_match(url))
+}
+
 #[derive(Default)]
 struct SiteNode {
     children: BTreeMap<String, SiteNode>,
     ids: Vec<u64>,
 }
 impl SiteNode {
-    fn all_ids(&self) -> Vec<u64> {
+    fn first_id(&self) -> Option<u64> {
         self.ids
-            .iter()
+            .first()
             .copied()
-            .chain(self.children.values().flat_map(Self::all_ids))
-            .collect()
+            .or_else(|| self.children.values().find_map(Self::first_id))
+    }
+    fn all_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.collect_ids(&mut ids);
+        ids
+    }
+    fn collect_ids(&self, ids: &mut Vec<u64>) {
+        ids.extend_from_slice(&self.ids);
+        for child in self.children.values() {
+            child.collect_ids(ids);
+        }
     }
 }
 fn site_node(
@@ -2254,7 +2311,7 @@ fn site_node(
     }
     for (path, child) in &node.children {
         let header = egui::CollapsingHeader::new(path)
-            .id_salt((path, child.all_ids().first()))
+            .id_salt((path, child.first_id()))
             .show(ui, |ui| site_node(ui, child, selected, action));
         if let Some(value) = entry_menu(&header.header_response, false) {
             *action = Some((child.all_ids(), value));
@@ -2450,6 +2507,26 @@ impl eframe::App for Workbench {
 mod layout_tests {
     use super::*;
     use crate::model::RepeaterTab;
+
+    #[test]
+    fn compiled_display_scope_preserves_include_and_exclude_rules() {
+        for scope in [
+            crate::model::Scope::default(),
+            crate::model::Scope {
+                include: vec!["[".into(), r"^https://example\.test/".into()],
+                exclude: vec!["/logout".into(), "[".into()],
+            },
+        ] {
+            let compiled = scope_matcher(&scope, true);
+            for url in [
+                "https://example.test/",
+                "https://example.test/logout",
+                "https://other.test/",
+            ] {
+                assert_eq!(compiled(url), scope.contains(url));
+            }
+        }
+    }
 
     #[test]
     fn selected_save_file_becomes_active_project() {

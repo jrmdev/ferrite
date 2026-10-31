@@ -351,7 +351,7 @@ impl Engine {
         if let Err(error) = result {
             flow.error = Some(format!("{error:#}"));
         }
-        self.project.lock().unwrap().insert(flow.clone())?;
+        self.project.lock().unwrap().record(&flow)?;
         self.activity.fetch_add(1, Ordering::SeqCst);
         self.enqueue_passive(&flow);
         Ok(flow)

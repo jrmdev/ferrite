@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Default)]
 pub(super) struct HistorySelection {
@@ -8,8 +8,16 @@ pub(super) struct HistorySelection {
 }
 
 impl HistorySelection {
+    pub fn select_all(&mut self, visible: &[u64]) {
+        self.ids = visible.iter().copied().collect();
+        if !self.focused.is_some_and(|id| self.ids.contains(&id)) {
+            self.focused = visible.first().copied();
+        }
+        self.anchor = self.focused;
+    }
+
     pub fn retain_visible(&mut self, visible: &[u64]) {
-        let visible_ids: BTreeSet<_> = visible.iter().copied().collect();
+        let visible_ids: HashSet<_> = visible.iter().copied().collect();
         self.ids.retain(|id| visible_ids.contains(id));
         if self.anchor.is_some_and(|id| !visible_ids.contains(&id)) {
             self.anchor = None;

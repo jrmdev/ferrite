@@ -346,6 +346,8 @@ impl State {
         }
         let [mut table_ui, mut detail_ui] = split_panes(ui, "scanner-scans-split", true, 0.48);
         let table_height = table_ui.available_height().max(40.0);
+        let page_rows =
+            ((table_height - 24.0).max(0.0) / (24.0 + table_ui.spacing().item_spacing.y)) as usize;
         let focus_id = table_ui.id().with("scan-rows-focus");
         let target = super::table_arrow_navigation(
             &mut table_ui,
@@ -354,6 +356,7 @@ impl State {
                 .iter()
                 .position(|job| Some(job.id) == self.selected_scan),
             self.jobs.len(),
+            page_rows,
         );
         if let Some(index) = target {
             self.selected_scan = Some(self.jobs[index].id);
@@ -592,6 +595,7 @@ impl State {
                 .iter()
                 .position(|finding| Some(finding.id) == self.selected_finding),
             findings.len(),
+            ((height - 24.0).max(0.0) / 22.0) as usize,
         );
         if let Some(index) = target {
             self.selected_finding = Some(findings[index].id);
@@ -942,6 +946,7 @@ impl State {
                 self.selected_issue.as_deref() == Some(definition.id.as_str())
             }),
             sorted.len(),
+            ((height - 24.0).max(0.0) / 22.0) as usize,
         );
         if let Some(index) = target {
             self.selected_issue = Some(sorted[index].id.clone());

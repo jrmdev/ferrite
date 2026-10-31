@@ -78,7 +78,7 @@ A project has `metadata` and `exchanges` tables, plus `websocket_*`, `scanner_*`
 
 A completed exchange commits before its completion counter changes. Failed upstream requests are also recorded. A process interrupted during an active exchange can leave an ID gap and no final row for that exchange. Pending interception decisions are not resumed after restart, and opening a project never starts network tasks automatically.
 
-Save As refuses an existing file and copies completed history and metadata to a new database. Portable versioned JSON archives carry the workspace, all exchange bytes, IDs, Repeater references, and the CA key. Imports validate format/schema, settings, duplicate IDs, and history references before opening a separate memory project. Archive exports refuse existing destinations and create files with mode 0600 on Unix. Deletions remove exchanges and Repeater references in one transaction. Project formats are independent of Burp. Full-history UI caching is a known v1 scaling constraint; the next storage iteration should expose paged summaries and fetch message bodies on selection.
+Save As refuses an existing file and copies completed history and metadata to a new database. Portable versioned JSON archives carry the workspace, all exchange bytes, IDs, Repeater references, and the CA key. Imports validate format/schema, settings, duplicate IDs, and history references before opening a separate memory project. Archive exports refuse existing destinations and create files with mode 0600 on Unix. Deletions remove exchanges and Repeater references in one transaction. Project formats are independent of Burp. Project databases use an explicit 64 MiB read/write cache budget rather than the redb default of 1 GiB. History refreshes use a bounded journal of committed IDs, including replacements, deletions and out-of-order completions. Unchanged exchanges retain their shared allocations; temporary projects share those allocations with storage. Readers that outlive the journal reload a complete snapshot. History still retains full message bodies, so retained memory grows with traffic. Save As and save-to-disk copy exchanges one at a time without materializing another full history.
 
 ## Managed browser
 
@@ -100,7 +100,7 @@ Repeater tabs carry stable IDs (assigned on load for older projects) and an opti
 
 ## Portability
 
-Application and cryptographic implementations are Rust. OS socket, filesystem, windowing, and OpenGL APIs remain platform dependencies. redb avoids SQLite/C bundling. Rustls defaults are disabled, and rcgen uses a custom RustCrypto signer; no ring/AWS-LC/OpenSSL provider is enabled. Native rendering uses eframe/glow instead of an embedded web frontend.
+Application and cryptographic implementations are Rust. OS socket, filesystem, windowing, and OpenGL APIs remain platform dependencies. redb avoids SQLite/C bundling. Rustls defaults are disabled, and rcgen uses a custom RustCrypto signer; no ring/AWS-LC/OpenSSL provider is enabled. Native rendering uses eframe/wgpu instead of an embedded web frontend.
 
 The Linux release and local runtime are verified in this workspace, including the managed browser against Chrome for Testing 153 and the MCP relay and headless modes through the real binary. Windows GNU x64 and macOS ARM64 target checks cover the GUI, backend, CLI, and test targets. Linking and native execution on those platforms require the CI matrix.
 
@@ -115,3 +115,5 @@ Completed exchanges enqueue passive analysis when the project checkbox is enable
 Separate scanner job and finding tables persist checkpoints and immutable evidence. Existing workspace schemas receive default scanner settings. Reopening interrupts unfinished work; checkpoint versions prevent replay against changed probe generators. Saving a live temporary project retains running scanner state. Findings survive history deletion and preserve triage across deduplicated observations. Selected-request stored checks record control, mutation, and readback phases and identify the readback URL as the impacted URL.
 
 Scanner operating controls and the available checks are shown in the application.
+
+Message editor layout caches retain at most eight recent layouts and evict documents not viewed in the current or previous frame. JSON preview caches have both entry and byte limits and clear when projects or preview settings change. Display scope patterns compile once per view update. History table updates avoid duplicate sorting and selection-index construction within a frame.

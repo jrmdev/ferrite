@@ -240,6 +240,7 @@ impl State {
                 .iter()
                 .position(|session| Some(session.id) == selected_session),
             self.sessions.len(),
+            ((session_height - 25.0).max(0.0) / 24.0) as usize,
         );
         if let Some(index) = session_target {
             selected_session = Some(self.sessions[index].id);
@@ -339,6 +340,7 @@ impl State {
                 .iter()
                 .position(|message| Some(message.sequence) == selected),
             self.messages.len(),
+            ((table_height - 25.0).max(0.0) / 24.0) as usize,
         );
         if let Some(index) = message_target {
             selected = Some(self.messages[index].sequence);
