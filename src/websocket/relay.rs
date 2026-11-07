@@ -398,49 +398,53 @@ async fn receive(
     }
 }
 
-async fn forward(
-    engine: &Engine,
+struct ForwardContext<'a> {
+    engine: &'a Engine,
     id: u64,
-    url: &str,
+    url: &'a str,
     direction: Direction,
     writer: Writer,
-    mut rx: mpsc::Receiver<Packet>,
     timeout: Duration,
     retain_history: bool,
-) -> Result<()> {
-    let history_id = retain_history.then_some(id);
+}
+
+async fn forward(context: ForwardContext<'_>, mut rx: mpsc::Receiver<Packet>) -> Result<()> {
+    let history_id = context.retain_history.then_some(context.id);
     while let Some(packet) = rx.recv().await {
         let (receiver, automatic) = {
-            let mut queue = engine.websockets.pending.lock().unwrap();
-            let automatic = engine
+            let mut queue = context.engine.websockets.pending.lock().unwrap();
+            let automatic = context
+                .engine
                 .websockets
                 .batches
                 .lock()
                 .unwrap()
-                .get(&(id, direction))
+                .get(&(context.id, context.direction))
                 .filter(|(through, _)| packet.sequence <= *through)
                 .map(|(_, decision)| *decision);
-            let settings = engine.settings();
+            let settings = context.engine.settings();
             if automatic.is_none()
-                && engine.websockets.enabled()
-                && (!settings.intercept_in_scope_only || settings.scope.contains(url))
+                && context.engine.websockets.enabled()
+                && (!settings.intercept_in_scope_only || settings.scope.contains(context.url))
             {
-                let permit = engine
+                let permit = context
+                    .engine
                     .interception_slots
                     .clone()
                     .try_acquire_owned()
                     .context("Interception queue is full")?;
-                let pending_id = engine
+                let pending_id = context
+                    .engine
                     .websockets
                     .next_pending
                     .fetch_add(1, Ordering::SeqCst);
                 let (reply, receiver) = oneshot::channel();
                 let item = Intercepted {
                     id: pending_id,
-                    session_id: id,
+                    session_id: context.id,
                     sequence: packet.sequence,
-                    url: url.into(),
-                    direction,
+                    url: context.url.into(),
+                    direction: context.direction,
                     kind: packet.kind,
                     payload: packet.payload.clone(),
                 };
@@ -465,11 +469,11 @@ async fn forward(
             Decision::Forward(packet.payload.to_vec())
         };
         match decision {
-            Decision::Drop => finish(engine, history_id, packet.sequence, None, None)?,
+            Decision::Drop => finish(context.engine, history_id, packet.sequence, None, None)?,
             Decision::Forward(payload) => {
-                let result = write(&writer, packet.kind, &payload, timeout).await;
+                let result = write(&context.writer, packet.kind, &payload, context.timeout).await;
                 finish(
-                    engine,
+                    context.engine,
                     history_id,
                     packet.sequence,
                     Some(&payload),
@@ -574,24 +578,28 @@ pub(crate) async fn run_with_history(
                 retain_history
             ),
             forward(
-                engine,
-                flow.id,
-                &flow.url,
-                Direction::ClientToServer,
-                up_writer.clone(),
+                ForwardContext {
+                    engine,
+                    id: flow.id,
+                    url: &flow.url,
+                    direction: Direction::ClientToServer,
+                    writer: up_writer.clone(),
+                    timeout,
+                    retain_history,
+                },
                 client_rx,
-                timeout,
-                retain_history
             ),
             forward(
-                engine,
-                flow.id,
-                &flow.url,
-                Direction::ServerToClient,
-                down_writer.clone(),
+                ForwardContext {
+                    engine,
+                    id: flow.id,
+                    url: &flow.url,
+                    direction: Direction::ServerToClient,
+                    writer: down_writer.clone(),
+                    timeout,
+                    retain_history,
+                },
                 server_rx,
-                timeout,
-                retain_history
             ),
         )?;
         Ok::<(), anyhow::Error>(())
