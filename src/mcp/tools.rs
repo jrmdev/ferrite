@@ -545,6 +545,7 @@ async fn dispatch(host: &Arc<Host>, caller: &Caller, tool: &str, arguments: Valu
                 "include": settings.scope.include,
                 "exclude": settings.scope.exclude,
                 "drop_out_of_scope": settings.drop_out_of_scope,
+                "log_out_of_scope": settings.log_out_of_scope,
                 "intercept_in_scope_only": settings.intercept_in_scope_only,
                 "note": "Patterns are regular expressions matched against full URLs. Exclusions take precedence; an empty include list matches nothing."
             })
@@ -843,6 +844,7 @@ fn proxy_status(engine: &Engine) -> Value {
         },
         "verify_upstream_tls": settings.verify_tls,
         "drop_out_of_scope": settings.drop_out_of_scope,
+        "log_out_of_scope": settings.log_out_of_scope,
         "timeout_secs": settings.timeout_secs,
         "max_message_bytes": settings.max_message_bytes,
         "passive_scanning": settings.passive_scanning,

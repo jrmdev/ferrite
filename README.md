@@ -87,7 +87,7 @@ Sending requests asks for your approval by default and is always limited to the 
 
 Projects store captured traffic, tool configuration, findings, and results in a `.ferrite` file. Temporary projects can be saved to disk from **Settings**. Project files can contain credentials and other sensitive traffic.
 
-Scope uses URL regular expressions; an empty include list matches nothing. Captured traffic is not blocked by scope unless **Drop out of scope** is enabled. History filters change the displayed rows without deleting captured traffic.
+Scope uses URL regular expressions. An empty include list matches nothing. On the **Target** tab, enable **Drop out of scope messages** to block forwarding and omit those requests from History. Enabling Drop clears and disables **Log out of scope messages**. With dropping off, clear **Log out of scope messages** to forward out-of-scope proxy traffic without saving it in History. Logging is on by default. History filters change the displayed rows.
 
 Ferrite supports HTTP/1.1, HTTP/2, HTTPS interception, and WebSocket capture. Response previews decode supported content encodings, while JSON beautification formats the display without changing the stored or transmitted bytes.
 

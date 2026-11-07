@@ -3,6 +3,20 @@ use crate::model::Destination;
 use anyhow::{Result, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+mod body;
+pub(crate) use body::Http1Body;
+
+#[derive(Debug)]
+struct DecodedBodyLimit;
+
+impl std::fmt::Display for DecodedBodyLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Decompressed body exceeds message limit")
+    }
+}
+
+impl std::error::Error for DecodedBodyLimit {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub start: String,
@@ -10,6 +24,15 @@ pub struct Message {
     pub body: Vec<u8>,
 }
 impl Message {
+    /// Copy metadata for framing without duplicating a potentially large body.
+    pub(crate) fn clone_head(&self) -> Self {
+        Self {
+            start: self.start.clone(),
+            headers: self.headers.clone(),
+            body: Vec::new(),
+        }
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let split = bytes
             .windows(4)
@@ -90,17 +113,23 @@ impl Message {
                 .sum::<usize>()
     }
     pub fn decode_content(&mut self, limit: usize) -> Result<()> {
+        if let Some(body) = self.decoded_body(limit)? {
+            self.body = body;
+            self.remove("Content-Encoding");
+            self.normalize_length();
+        }
+        Ok(())
+    }
+
+    fn decoded_body(&self, limit: usize) -> Result<Option<Vec<u8>>> {
         use std::io::Read;
         let Some(encoding) = self.header("Content-Encoding") else {
-            return Ok(());
+            return Ok(None);
         };
         let decode = |reader: &mut dyn Read| -> Result<Vec<u8>> {
             let mut out = Vec::new();
             reader.take(limit as u64 + 1).read_to_end(&mut out)?;
-            ensure!(
-                out.len() <= limit,
-                "Decompressed body exceeds message limit"
-            );
+            ensure!(out.len() <= limit, DecodedBodyLimit);
             Ok(out)
         };
         let body = if encoding.eq_ignore_ascii_case("gzip") {
@@ -108,23 +137,50 @@ impl Message {
         } else if encoding.eq_ignore_ascii_case("deflate") {
             match decode(&mut flate2::read::ZlibDecoder::new(self.body.as_slice())) {
                 Ok(body) => body,
+                Err(error) if error.is::<DecodedBodyLimit>() => return Err(error),
                 Err(_) => decode(&mut flate2::read::DeflateDecoder::new(self.body.as_slice()))?,
             }
         } else {
-            return Ok(());
+            return Ok(None);
         };
-        self.body = body;
-        self.remove("Content-Encoding");
-        self.normalize_length();
-        Ok(())
+        Ok(Some(body))
+    }
+
+    pub(crate) fn decode_for_proxy(&mut self, limit: usize) -> Result<bool> {
+        let decoded = match self.decoded_body(limit) {
+            Err(error) if error.is::<DecodedBodyLimit>() => return Ok(false),
+            result => result?,
+        };
+        let len = decoded.as_ref().unwrap_or(&self.body).len();
+        if len > 0 {
+            let mut head = self.clone_head();
+            if decoded.is_some() {
+                head.remove("Content-Encoding");
+            }
+            head.remove_hop_headers();
+            head.set("Connection", "close".into());
+            head.normalize_body_length(len);
+            if len > limit.saturating_sub(head.encoded_len()) {
+                return Ok(false);
+            }
+        }
+        if let Some(body) = decoded {
+            self.body = body;
+            self.remove("Content-Encoding");
+            self.normalize_length();
+        }
+        Ok(true)
     }
     pub fn normalize_length(&mut self) {
+        self.normalize_body_length(self.body.len());
+    }
+    pub(crate) fn normalize_body_length(&mut self, len: usize) {
         self.remove("Transfer-Encoding");
         self.remove("Trailer");
         let had_length = self.header("Content-Length").is_some();
         self.remove("Content-Length");
-        if had_length || !self.body.is_empty() {
-            self.set("Content-Length", self.body.len().to_string());
+        if had_length || len > 0 {
+            self.set("Content-Length", len.to_string());
         }
     }
     pub fn destination(
@@ -253,7 +309,7 @@ async fn line<R: AsyncRead + Unpin>(r: &mut BufReader<R>, budget: usize) -> Resu
         }
     }
 }
-async fn read_head<R: AsyncRead + Unpin>(
+pub(crate) async fn read_head<R: AsyncRead + Unpin>(
     r: &mut BufReader<R>,
     limit: usize,
 ) -> Result<(Message, usize)> {
@@ -297,6 +353,81 @@ pub async fn read_request<R: AsyncRead + AsyncWrite + Unpin>(
     }
     read_body(r, msg, header_len, false, false, limit).await
 }
+pub(crate) fn content_length(msg: &Message) -> Result<Option<u64>> {
+    let mut length = None;
+    for (_, value) in msg
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+    {
+        ensure!(
+            !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+            "Invalid Content-Length"
+        );
+        let value = value.parse::<u64>()?;
+        ensure!(
+            length.is_none_or(|n| n == value),
+            "Conflicting Content-Length"
+        );
+        length = Some(value);
+    }
+    Ok(length)
+}
+
+pub(crate) fn response_has_body(msg: &Message, head: bool) -> bool {
+    !head && !(100..200).contains(&msg.status()) && !matches!(msg.status(), 204 | 304)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BodyFraming {
+    Empty,
+    Fixed(u64),
+    Chunked,
+    Close,
+}
+
+pub(crate) fn body_framing(msg: &Message, response: bool, head: bool) -> Result<BodyFraming> {
+    let length = content_length(msg)?;
+    let encodings: Vec<_> = msg
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("Transfer-Encoding"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    ensure!(
+        encodings.is_empty() || length.is_none(),
+        "Ambiguous Transfer-Encoding and Content-Length"
+    );
+    let no_body =
+        response && !response_has_body(msg, head) || (!response && msg.method() == "CONNECT");
+    if no_body {
+        return Ok(BodyFraming::Empty);
+    }
+    if !encodings.is_empty() {
+        ensure!(
+            encodings.len() == 1 && encodings[0].eq_ignore_ascii_case("chunked"),
+            "Unsupported transfer encoding"
+        );
+        Ok(BodyFraming::Chunked)
+    } else if let Some(size) = length {
+        Ok(BodyFraming::Fixed(size))
+    } else if response {
+        Ok(BodyFraming::Close)
+    } else {
+        Ok(BodyFraming::Empty)
+    }
+}
+
+fn chunk_size(line: &[u8]) -> Result<u64> {
+    let text = std::str::from_utf8(line)?.trim();
+    let size = text.split(';').next().unwrap_or("");
+    ensure!(
+        !size.is_empty() && size.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid chunk size"
+    );
+    Ok(u64::from_str_radix(size, 16)?)
+}
+
 async fn read_body<R: AsyncRead + Unpin>(
     r: &mut BufReader<R>,
     mut msg: Message,
@@ -305,80 +436,30 @@ async fn read_body<R: AsyncRead + Unpin>(
     head: bool,
     limit: usize,
 ) -> Result<Message> {
-    let lengths: Vec<_> = msg
-        .headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
-        .map(|(_, v)| v.parse::<usize>())
-        .collect::<std::result::Result<_, _>>()?;
-    ensure!(
-        lengths.windows(2).all(|x| x[0] == x[1]),
-        "Conflicting Content-Length"
-    );
-    let encodings: Vec<_> = msg
-        .headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("Transfer-Encoding"))
-        .map(|(_, v)| v.as_str())
-        .collect();
-    ensure!(
-        encodings.is_empty() || lengths.is_empty(),
-        "Ambiguous Transfer-Encoding and Content-Length"
-    );
-    let no_body = response
-        && (head
-            || (100..200).contains(&msg.status())
-            || msg.status() == 204
-            || msg.status() == 304)
-        || (!response && msg.method() == "CONNECT");
-    if no_body {
+    let framing = body_framing(&msg, response, head)?;
+    if (response && !response_has_body(&msg, head)) || (!response && msg.method() == "CONNECT") {
         return Ok(msg);
     }
     let remaining = limit.saturating_sub(header_len);
-    if !encodings.is_empty() {
-        ensure!(
-            encodings.len() == 1 && encodings[0].eq_ignore_ascii_case("chunked"),
-            "Unsupported transfer encoding"
-        );
-        let mut overhead = 0usize;
-        loop {
-            let l = line(r, 8192).await?;
-            overhead += l.len();
-            ensure!(overhead <= limit, "Chunk metadata exceeds limit");
-            let text = std::str::from_utf8(&l)?.trim();
-            let size = usize::from_str_radix(text.split(';').next().unwrap_or(""), 16)?;
+    if let BodyFraming::Fixed(size) = framing {
+        ensure!(size <= remaining as u64, "HTTP body exceeds limit");
+        msg.body.resize(size as usize, 0);
+        r.read_exact(&mut msg.body).await?;
+    } else {
+        let mut body = Http1Body::new(framing, limit, true);
+        while let Some(chunk) = body
+            .next(r, (remaining - msg.body.len()).saturating_add(1))
+            .await?
+        {
             ensure!(
-                size <= remaining.saturating_sub(msg.body.len()),
+                chunk.len() <= remaining - msg.body.len(),
                 "HTTP body exceeds limit"
             );
-            if size == 0 {
-                loop {
-                    let trailer = line(r, 8192).await?;
-                    overhead += trailer.len();
-                    ensure!(overhead <= limit, "Trailers exceed limit");
-                    if trailer == b"\r\n" {
-                        break;
-                    }
-                }
-                break;
-            }
-            let start = msg.body.len();
-            msg.body.resize(start + size, 0);
-            r.read_exact(&mut msg.body[start..]).await?;
-            let mut crlf = [0; 2];
-            r.read_exact(&mut crlf).await?;
-            ensure!(&crlf == b"\r\n", "Invalid chunk terminator");
+            msg.body.extend_from_slice(&chunk);
         }
-        msg.normalize_length();
-    } else if let Some(size) = lengths.first().copied() {
-        ensure!(size <= remaining, "HTTP body exceeds limit");
-        msg.body.resize(size, 0);
-        r.read_exact(&mut msg.body).await?;
-    } else if response {
-        r.take((remaining as u64) + 1)
-            .read_to_end(&mut msg.body)
-            .await?;
-        ensure!(msg.body.len() <= remaining, "HTTP body exceeds limit");
+        if matches!(framing, BodyFraming::Chunked) {
+            msg.normalize_length();
+        }
     }
     if !response
         && !matches!(

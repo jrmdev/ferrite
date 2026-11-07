@@ -1632,6 +1632,8 @@ impl Workbench {
         let response = self.response_cache.get(
             flow.id,
             &flow.response,
+            flow.omitted_response_body_bytes,
+            flow.streamed_response,
             self.response_hex,
             self.engine.settings().max_message_bytes,
         );
@@ -1912,12 +1914,8 @@ impl Workbench {
     }
     fn load_intercept(&mut self, item: &crate::engine::Intercepted) {
         self.intercept_id = Some(item.id);
-        self.intercept_omission = if item.stage == Stage::Response {
-            response_content::body_preview(&item.message, self.engine.settings().max_message_bytes)
-                .omitted
-        } else {
-            None
-        };
+        self.intercept_omission =
+            response_content::intercept_omission(item, self.engine.settings().max_message_bytes);
         if self.intercept_omission.is_some() {
             let headers = Message {
                 start: item.message.start.clone(),
@@ -1946,8 +1944,24 @@ impl Workbench {
             editor(&mut cols[0], &mut self.scope_include, 4, "include");
             editor(&mut cols[1], &mut self.scope_exclude, 4, "exclude");
         });
-        if ui.button("Apply scope").clicked() {
-            let mut s = self.engine.settings();
+        let mut s = self.engine.settings();
+        let (apply_scope, scope_policy_changed) = ui
+            .horizontal_wrapped(|ui| {
+                let apply_scope = ui.button("Apply scope").clicked();
+                let drop_changed = ui
+                    .checkbox(&mut s.drop_out_of_scope, "Drop out of scope messages")
+                    .changed();
+                s.normalize_scope_policy();
+                let log_changed = ui
+                    .add_enabled(
+                        !s.drop_out_of_scope,
+                        egui::Checkbox::new(&mut s.log_out_of_scope, "Log out of scope messages"),
+                    )
+                    .changed();
+                (apply_scope, drop_changed || log_changed)
+            })
+            .inner;
+        if apply_scope {
             s.scope.include = self
                 .scope_include
                 .lines()
@@ -1960,8 +1974,19 @@ impl Workbench {
                 .filter(|l| !l.is_empty())
                 .map(str::to_string)
                 .collect();
-            if self.report(self.engine.configure(s)).is_some() {
-                self.settings_json = serde_json::to_string_pretty(&self.engine.settings()).unwrap();
+        }
+        if (apply_scope || scope_policy_changed) && self.report(self.engine.configure(s)).is_some()
+        {
+            if let Ok(mut draft) =
+                serde_json::from_str::<crate::model::Settings>(&self.settings_json)
+            {
+                let settings = self.engine.settings();
+                draft.scope = settings.scope;
+                draft.drop_out_of_scope = settings.drop_out_of_scope;
+                draft.log_out_of_scope = settings.log_out_of_scope;
+                self.settings_json = serde_json::to_string_pretty(&draft).unwrap();
+            }
+            if apply_scope {
                 self.notify("Scope", "Scope saved. Exclusions take precedence; an empty include list matches nothing.");
             }
         }
@@ -2232,7 +2257,6 @@ impl Workbench {
                 ui.add(egui::DragValue::new(&mut s.timeout_secs).range(1..=3600));
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut s.drop_out_of_scope, "Drop out of scope");
                 ui.checkbox(&mut s.intercept_in_scope_only, "Intercept in scope only");
                 ui.checkbox(&mut s.rules_in_scope_only, "Rules in scope only");
             });
@@ -2292,10 +2316,12 @@ impl Workbench {
                 self.report(result);
             }
         }
-        egui::CollapsingHeader::new("Advanced JSON: DNS overrides, message limits, rule ordering")
-            .show(ui, |ui| {
-                editor(ui, &mut self.settings_json, 18, "settings-json");
-            });
+        egui::CollapsingHeader::new(
+            "Advanced JSON: DNS overrides, message limits, streaming, rule ordering",
+        )
+        .show(ui, |ui| {
+            editor(ui, &mut self.settings_json, 18, "settings-json");
+        });
         ui.label("Invisible mode accepts origin-form HTTP and direct TLS with SNI. DNS overrides route redirected hosts back to the real server. When invisible mode is enabled, a fallback target can handle clients without Host/SNI.");
     }
 }

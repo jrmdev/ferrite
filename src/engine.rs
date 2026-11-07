@@ -1,11 +1,12 @@
 use crate::{
     http::{Message, read_request},
-    model::{Destination, Exchange, Settings},
+    model::{Destination, Exchange, Settings, StreamCapture},
     project::Project,
     rules,
     tls::Authority,
-    transport::{self, Stream},
+    transport::{self, LiveBody, Stream},
 };
+mod streaming;
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
@@ -46,6 +47,12 @@ struct Pending {
     item: Intercepted,
     reply: oneshot::Sender<Decision>,
     _permit: tokio::sync::OwnedSemaphorePermit,
+}
+struct Execution {
+    flow: Exchange,
+    upgrade: Option<Stream>,
+    live: Option<LiveBody>,
+    retain_history: bool,
 }
 pub struct Engine {
     pub project: Mutex<Project>,
@@ -99,7 +106,8 @@ impl Engine {
     pub fn new_with_key(project: Project, key: &[u8]) -> Result<Arc<Self>> {
         Self::with_authority(project, Authority::from_key(key)?)
     }
-    fn with_authority(project: Project, authority: Authority) -> Result<Arc<Self>> {
+    fn with_authority(mut project: Project, authority: Authority) -> Result<Arc<Self>> {
+        project.workspace.settings.normalize_scope_policy();
         let settings = project.workspace.settings.clone();
         settings.validate()?;
         let engine = Arc::new(Self {
@@ -127,7 +135,8 @@ impl Engine {
     pub(crate) fn scanner_listener_address(&self) -> Option<SocketAddr> {
         *self.active_address.lock().unwrap()
     }
-    pub fn configure(&self, settings: Settings) -> Result<()> {
+    pub fn configure(&self, mut settings: Settings) -> Result<()> {
+        settings.normalize_scope_policy();
         settings.validate()?;
         let mut p = self.project.lock().unwrap();
         let previous = std::mem::replace(&mut p.workspace.settings, settings.clone());
@@ -295,23 +304,27 @@ impl Engine {
         intercept: bool,
     ) -> Result<Exchange> {
         Ok(self
-            .execute_upgradable(request, dest, tool, intercept, false)
+            .execute_upgradable(request, dest, tool, intercept, false, false)
             .await?
-            .0)
+            .flow)
     }
-    /// Send without interception, refusing any URL outside the target scope
-    /// regardless of the Drop out of scope setting. The check uses the same
-    /// settings snapshot as the send, so a scope change cannot race it.
+    /// Send without interception and always enforce target scope. The check
+    /// uses the same settings snapshot as the send.
     pub async fn execute_in_scope(
         &self,
         request: Message,
         dest: Destination,
         tool: &str,
     ) -> Result<Exchange> {
-        Ok(self
-            .execute_upgradable(request, dest, tool, false, true)
-            .await?
-            .0)
+        let execution = self
+            .execute_upgradable(request, dest, tool, false, true, false)
+            .await?;
+        if !execution.retain_history
+            && let Some(error) = execution.flow.error
+        {
+            anyhow::bail!(error);
+        }
+        Ok(execution.flow)
     }
     async fn execute_upgradable(
         &self,
@@ -320,8 +333,10 @@ impl Engine {
         tool: &str,
         intercept: bool,
         require_scope: bool,
-    ) -> Result<(Exchange, Option<Stream>)> {
+        relay_body: bool,
+    ) -> Result<Execution> {
         let mut upgrade = None;
+        let mut live = None;
         let started = Instant::now();
         let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let mut settings = self.settings();
@@ -339,18 +354,19 @@ impl Engine {
             method: request.method().into(),
             request: request.encode(),
             response: vec![],
+            omitted_response_body_bytes: None,
+            streamed_response: None,
             status: 0,
             duration_ms: 0,
             error: None,
             note: String::new(),
         };
+        let mut in_scope = settings.scope.contains(&url);
         let result: Result<Message> = async {
-            let enforce_scope = settings.drop_out_of_scope || require_scope;
             ensure!(
-                !enforce_scope || settings.scope.contains(&url),
+                !(settings.drop_out_of_scope || require_scope) || in_scope,
                 "Request is outside target scope"
             );
-            let in_scope = settings.scope.contains(&url);
             let do_rules = tool == "Proxy" && (!settings.rules_in_scope_only || in_scope);
             // Captured rules run before the interactive editor; manual changes win.
             if do_rules {
@@ -363,16 +379,23 @@ impl Engine {
                     .await?;
             }
             request.prepare_request(&dest)?;
+            let effective_url = request.url(&dest);
+            if intercept {
+                // Scope policy may have changed while the request was paused.
+                let active = self.settings.read().unwrap();
+                settings.scope.clone_from(&active.scope);
+                settings.drop_out_of_scope = active.drop_out_of_scope;
+                settings.log_out_of_scope = active.log_out_of_scope;
+            }
+            in_scope = settings.scope.contains(&effective_url);
+            ensure!(
+                !(settings.drop_out_of_scope || require_scope) || in_scope,
+                "Edited request is outside target scope"
+            );
             if crate::websocket::is_websocket(&request) {
                 crate::websocket::validate_request(&request)?;
                 request.remove("Sec-WebSocket-Extensions");
             }
-            // Recheck edited targets so scope policy cannot be bypassed with the editor.
-            let effective_url = request.url(&dest);
-            ensure!(
-                !enforce_scope || settings.scope.contains(&effective_url),
-                "Edited request is outside target scope"
-            );
             flow.url = effective_url;
             flow.method = request.method().into();
             flow.request = request.encode();
@@ -387,14 +410,26 @@ impl Engine {
                 upstream_request.start =
                     format!("{} {} HTTP/1.1", request.method(), request.target());
             }
-            let outcome = tokio::time::timeout(
-                Duration::from_secs(settings.timeout_secs),
-                transport::send_with_upgrade(&dest, &upstream_request, &settings),
-            )
-            .await
-            .context("Upstream request timed out")??;
+            let (outcome, body) =
+                tokio::time::timeout(Duration::from_secs(settings.timeout_secs), async {
+                    if relay_body {
+                        transport::send_proxy(&dest, &upstream_request, &settings, &flow.url).await
+                    } else {
+                        let outcome =
+                            transport::send_with_upgrade(&dest, &upstream_request, &settings)
+                                .await?;
+                        Ok((outcome, None))
+                    }
+                })
+                .await
+                .context("Upstream request timed out")??;
+            drop(upstream_request);
             let mut response = outcome.response;
             upgrade = outcome.upgrade;
+            live = body;
+            if live.is_some() {
+                return Ok(response);
+            }
             // Retain the actual handshake even when validation or interception fails.
             if response.status() == 101 {
                 flow.status = 101;
@@ -465,17 +500,39 @@ impl Engine {
             Ok(response) => {
                 flow.status = response.status();
                 flow.response = response.encode();
+                flow.streamed_response = live.as_ref().map(|body| StreamCapture {
+                    reason: body.reason,
+                    declared_bytes: body.declared,
+                    body_bytes: None,
+                });
             }
             Err(error) => {
                 upgrade = None;
+                live = None;
                 flow.error = Some(format!("{error:#}"));
             }
         }
         flow.duration_ms = started.elapsed().as_millis() as u64;
-        self.project.lock().unwrap().record(&flow)?;
-        self.activity.fetch_add(1, Ordering::SeqCst);
-        self.enqueue_passive(&flow);
-        Ok((flow, upgrade))
+        let retain_history = in_scope
+            || (!settings.drop_out_of_scope && (tool != "Proxy" || settings.log_out_of_scope));
+        if retain_history {
+            let recorded = self.project.lock().unwrap().record(&flow);
+            if live.is_some() {
+                if let Err(error) = recorded {
+                    self.log_error(format!("Could not record streaming response: {error:#}"));
+                }
+            } else {
+                recorded?;
+                self.enqueue_passive(&flow);
+            }
+            self.activity.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Execution {
+            flow,
+            upgrade,
+            live,
+            retain_history,
+        })
     }
     pub async fn start(self: &Arc<Self>) -> Result<Listener> {
         ensure!(
@@ -648,9 +705,14 @@ impl Engine {
                                 crate::http2::receive_request(request, settings.max_message_bytes)).await??;
                             let dest = if let Some(dest) = fixed { dest }
                                 else { request.destination(request_tls, settings.fallback.as_ref(), true)? };
-                            let flow = engine.execute(request, dest, "Proxy", true).await?;
+                            let Execution { flow, live, retain_history, .. } = engine.execute_upgradable(request, dest, "Proxy", true, false, true).await?;
+                            if let Some(live) = live {
+                                return engine.relay_response(flow, live, streaming::Downstream::Http2(&mut respond), retain_history).await;
+                            }
                             let response = if flow.error.is_some() {
-                                Message::parse(b"HTTP/2 502\r\nContent-Type: text/plain\r\n\r\nFerrite could not forward this request. See proxy history.\n")?
+                                let mut response = Message::parse(b"HTTP/2 502\r\nContent-Type: text/plain\r\n\r\n")?;
+                                response.body = proxy_error_body(retain_history).to_vec();
+                                response
                             } else { Message::parse(&flow.response)? };
                             let head = crate::http2::response_head(&response)?;
                             let body = respond.send_response(head, response.body.is_empty())?;
@@ -692,21 +754,43 @@ impl Engine {
         self.respond(Box::new(reader), request, dest).await
     }
     async fn respond(&self, mut stream: Stream, request: Message, dest: Destination) -> Result<()> {
-        let (flow, upgrade) = self
-            .execute_upgradable(request, dest, "Proxy", true, false)
+        let http10 = request.start.ends_with(" HTTP/1.0");
+        let Execution {
+            flow,
+            upgrade,
+            live,
+            retain_history,
+        } = self
+            .execute_upgradable(request, dest, "Proxy", true, false, true)
             .await?;
+        if let Some(live) = live {
+            return self
+                .relay_response(
+                    flow,
+                    live,
+                    streaming::Downstream::Http1 { stream, http10 },
+                    retain_history,
+                )
+                .await;
+        }
         if let Some(mut upstream) = upgrade {
             stream.write_all(&flow.response).await?;
             stream.flush().await?;
             if crate::websocket::is_websocket(&Message::parse(&flow.request)?) {
-                return crate::websocket::run(self, stream, upstream, &flow).await;
+                return crate::websocket::run_with_history(
+                    self,
+                    stream,
+                    upstream,
+                    &flow,
+                    retain_history,
+                )
+                .await;
             }
             tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
             return Ok(());
         }
         let bytes = if flow.error.is_some() {
-            // Detailed error stays in history, never interpolate it into an HTTP header.
-            let body = b"Ferrite could not forward this request. See proxy history.\n";
+            let body = proxy_error_body(retain_history);
             let mut bytes=format!("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",body.len()).into_bytes();
             bytes.extend_from_slice(body);
             bytes
@@ -724,9 +808,18 @@ impl Engine {
         };
         tokio::time::timeout(Duration::from_secs(self.settings().timeout_secs), async {
             stream.write_all(&bytes).await?;
-            stream.shutdown().await
+            stream.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
         })
         .await??;
         Ok(())
+    }
+}
+
+fn proxy_error_body(retain_history: bool) -> &'static [u8] {
+    if retain_history {
+        b"Ferrite could not forward this request. See proxy history.\n"
+    } else {
+        b"Ferrite could not forward this request.\n"
     }
 }

@@ -35,12 +35,12 @@ fn args() -> Result<Args> {
             }
             "--export-ca" => a.ca = Some(it.next().context("--export-ca requires a path")?.into()),
             "--help" | "-h" => {
-                println!(
-                    "Ferrite Workbench 0.1\n\nUsage: ferrite [--project FILE] [--listen IP:PORT] [--headless]\n               [--transparent] [--fallback URL] [--export-ca FILE]\n       ferrite mcp [--headless ...]   (MCP server; see ferrite mcp --help)\n\nWithout --project, uses a temporary in-memory project.\nHeadless proxy starts with interception disabled. Ctrl-C stops it.\n--export-ca writes only the public CA certificate (PEM).\nBuild without the GUI: cargo build --no-default-features"
-                );
+                attach_parent_console();
+                println!("Ferrite Workbench {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--version" | "-V" => {
+                attach_parent_console();
                 println!("Ferrite Workbench {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
@@ -49,6 +49,55 @@ fn args() -> Result<Args> {
     }
     Ok(a)
 }
+
+// Windows GUI binaries do not automatically inherit the launching terminal.
+// Preserve any redirected streams while attaching the remaining ones to it.
+#[cfg(all(windows, feature = "gui"))]
+fn attach_parent_console() {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+    }
+
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const STREAMS: [u32; 3] = [(-10_i32) as u32, (-11_i32) as u32, (-12_i32) as u32];
+    // SAFETY: These functions take process constants and handles returned by Windows.
+    unsafe {
+        let handles = STREAMS.map(|stream| GetStdHandle(stream));
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            for (stream, handle) in STREAMS.into_iter().zip(handles) {
+                if !handle.is_null() && handle as isize != -1 {
+                    SetStdHandle(stream, handle);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(all(windows, feature = "gui")))]
+fn attach_parent_console() {}
+
+const HELP: &str = "Usage: ferrite [OPTIONS]
+       ferrite mcp [OPTIONS]
+
+Options:
+  --headless           Run the proxy without a window; interception is disabled
+  --project FILE       Open a project file (default: temporary in-memory project)
+  --listen IP:PORT     Set the proxy listener address
+  --transparent        Enable transparent (invisible) proxy mode
+  --fallback URL       Set the fallback HTTP(S) destination
+  --export-ca FILE     Write the public CA certificate in PEM format to a new file
+  -h, --help           Show this help
+  -V, --version        Show the version
+
+Headless mode runs until Ctrl-C. CA export occurs before the application starts.
+Run `ferrite mcp --help` for MCP server options.
+Build without the GUI: cargo build --no-default-features";
+
 fn export_ca(engine: &Engine, path: &Path) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
@@ -69,6 +118,17 @@ const MCP_HELP: &str = "Ferrite Workbench MCP server (Model Context Protocol ove
 Usage: ferrite mcp [--endpoint-file FILE]
        ferrite mcp --headless [--project FILE] [--listen IP:PORT] [--start-proxy]
                    [--allow-requests] [--allow-active-scans] [--include-credentials]
+
+Options:
+  --endpoint-file FILE    Use this endpoint file for the window relay
+  --headless              Run the MCP server without a window
+  --project FILE          Open a project file in headless mode
+  --listen IP:PORT        Set the proxy listener address in headless mode
+  --start-proxy           Start the proxy listener in headless mode
+  --allow-requests        Pre-authorise sending requests
+  --allow-active-scans    Pre-authorise active scans
+  --include-credentials   Include credential headers in responses
+  -h, --help              Show this help
 
 Without --headless, relays an MCP client over stdio to the
 running Ferrite window. Enable MCP in Ferrite's MCP page first.
@@ -116,6 +176,7 @@ fn mcp_main(mut it: impl Iterator<Item = String>) -> Result<()> {
                 ))
             }
             "--help" | "-h" => {
+                attach_parent_console();
                 eprintln!("{MCP_HELP}");
                 return Ok(());
             }

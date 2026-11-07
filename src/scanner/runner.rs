@@ -198,11 +198,7 @@ fn spawn(engine: Arc<Engine>, job: ScanJob, retry_failed: bool) -> Result<()> {
                 failed.message = format!("{error:#}");
                 let _ = persist(&engine, &mut failed);
             }
-            engine
-                .errors
-                .lock()
-                .unwrap()
-                .push(format!("Scanner {id}: {error:#}"));
+            engine.log_error(format!("Scanner {id}: {error:#}"));
         }
         engine.scanner.runner.controls.lock().unwrap().remove(&id);
         notify(&engine);
@@ -1063,6 +1059,8 @@ mod tests {
             status: 302,
             duration_ms: 0,
             error: None,
+            omitted_response_body_bytes: None,
+            streamed_response: None,
             note: String::new(),
         }
     }

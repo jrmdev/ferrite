@@ -878,6 +878,8 @@ impl State {
         let response = self.response_cache.get(
             exchange.id,
             &exchange.response,
+            exchange.omitted_response_body_bytes,
+            exchange.streamed_response,
             self.hex,
             engine.settings().max_message_bytes,
         );
@@ -1432,6 +1434,8 @@ mod tests {
                     status: 200,
                     duration_ms: 1,
                     error: None,
+                    omitted_response_body_bytes: None,
+                    streamed_response: None,
                     note: String::new(),
                 },
             }],

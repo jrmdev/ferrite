@@ -1,4 +1,7 @@
-use crate::http::Message;
+use crate::{
+    http::Message,
+    model::{StreamCapture, StreamReason},
+};
 use anyhow::{Result, bail, ensure};
 use std::{borrow::Cow, io::Read, sync::Arc};
 
@@ -18,6 +21,16 @@ impl BodyOmitted {
             self.bytes
         )
     }
+}
+
+pub(super) fn intercept_omission(
+    item: &crate::engine::Intercepted,
+    limit: usize,
+) -> Option<BodyOmitted> {
+    if item.stage != crate::engine::Stage::Response {
+        return None;
+    }
+    body_preview(&item.message, limit).omitted
 }
 
 pub(super) struct BodyPreview {
@@ -82,14 +95,18 @@ impl Read for ZstdReader<'_> {
 /// Count decoded bytes while retaining at most the display budget. The original
 /// Message remains the source of truth for forwarding and export.
 pub(super) fn body_preview(message: &Message, limit: usize) -> BodyPreview {
+    body_preview_bytes(message, &message.body, limit)
+}
+
+fn body_preview_bytes(message: &Message, raw_body: &[u8], limit: usize) -> BodyPreview {
     let raw = || BodyPreview {
-        body: if message.body.len() <= DISPLAY_LIMIT {
-            message.body.clone()
+        body: if raw_body.len() <= DISPLAY_LIMIT {
+            raw_body.to_vec()
         } else {
             vec![]
         },
-        omitted: (message.body.len() > DISPLAY_LIMIT).then_some(BodyOmitted {
-            bytes: message.body.len(),
+        omitted: (raw_body.len() > DISPLAY_LIMIT).then_some(BodyOmitted {
+            bytes: raw_body.len(),
             at_least: false,
         }),
         decoded: false,
@@ -104,7 +121,7 @@ pub(super) fn body_preview(message: &Message, limit: usize) -> BodyPreview {
     if encodings.is_empty() || encodings.len() > 16 || encodings.iter().all(|s| s == "identity") {
         return raw();
     }
-    let mut reader: Reader<'_> = Box::new(message.body.as_slice());
+    let mut reader: Reader<'_> = Box::new(raw_body);
     for encoding in encodings.iter().rev() {
         reader = match encoding.as_str() {
             "identity" => reader,
@@ -149,8 +166,9 @@ pub(super) fn body_preview(message: &Message, limit: usize) -> BodyPreview {
         count += n;
         if count <= DISPLAY_LIMIT {
             body.extend_from_slice(&chunk[..n]);
-        } else {
-            body.clear();
+        } else if !body.is_empty() {
+            // An omitted preview must not pin the display-sized allocation.
+            body = Vec::new();
         }
         if count > limit {
             // A small caller budget still retains the legacy raw fallback.
@@ -275,10 +293,9 @@ fn display(bytes: &[u8], hex: bool, limit: usize) -> String {
             );
         }
         // Parse only the headers, avoiding Message::parse's large body copy.
-        if let Ok(mut message) = Message::parse(&bytes[..end + 4]) {
+        if let Ok(message) = Message::parse(&bytes[..end + 4]) {
             let preview = if message.header("Content-Encoding").is_some() {
-                message.body = raw_body.to_vec();
-                body_preview(&message, limit)
+                body_preview_bytes(&message, raw_body, limit)
             } else {
                 BodyPreview {
                     body: vec![],
@@ -308,21 +325,56 @@ fn display(bytes: &[u8], hex: bool, limit: usize) -> String {
     super::http_editor::message_view(bytes, hex)
 }
 
-/// Exchanges are immutable. Keep one rendered response and clear it on project switch.
+/// Keep one rendered response and refresh it when streaming metadata changes.
 #[derive(Default)]
 pub(super) struct ResponseCache {
-    entry: Option<((u64, bool, usize), Arc<str>)>,
+    entry: Option<(ResponseKey, Arc<str>)>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ResponseKey {
+    id: u64,
+    hex: bool,
+    limit: usize,
+    streamed: Option<StreamCapture>,
 }
 
 impl ResponseCache {
-    pub fn get(&mut self, id: u64, bytes: &[u8], hex: bool, limit: usize) -> Arc<str> {
-        let key = (id, hex, limit);
+    pub fn get(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+        omitted: Option<usize>,
+        streamed: Option<StreamCapture>,
+        hex: bool,
+        limit: usize,
+    ) -> Arc<str> {
+        let key = ResponseKey {
+            id,
+            hex,
+            limit,
+            streamed,
+        };
         if let Some((cached, text)) = &self.entry
             && *cached == key
         {
             return text.clone();
         }
-        let text: Arc<str> = display(bytes, hex, limit).into();
+        let text: Arc<str> = match (streamed.map(|stream| stream.reason), omitted) {
+            (Some(StreamReason::CaptureLimit), _) => "[Body too large to be displayed]".into(),
+            (Some(StreamReason::Policy), _) => "[Streaming response body omitted]".into(),
+            (None, Some(size)) => format!(
+                "{}{}",
+                String::from_utf8_lossy(bytes),
+                BodyOmitted {
+                    bytes: size,
+                    at_least: false
+                }
+                .notice(),
+            ),
+            (None, None) => display(bytes, hex, limit),
+        }
+        .into();
         self.entry = Some((key, text.clone()));
         text
     }
@@ -332,6 +384,46 @@ impl ResponseCache {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn live_response_shows_only_the_notice_and_refreshes_on_completion() {
+        let mut cache = ResponseCache::default();
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        let active = StreamCapture {
+            reason: StreamReason::Policy,
+            declared_bytes: None,
+            body_bytes: None,
+        };
+        let first = cache.get(1, head, None, Some(active), false, 1024);
+        assert_eq!(&*first, "[Streaming response body omitted]");
+        let complete = StreamCapture {
+            body_bytes: Some(128),
+            ..active
+        };
+        let last = cache.get(1, head, None, Some(complete), false, 1024);
+        assert_eq!(&*last, &*first);
+        assert!(!Arc::ptr_eq(&first, &last));
+        let oversized = StreamCapture {
+            reason: StreamReason::CaptureLimit,
+            ..complete
+        };
+        assert_eq!(
+            &*cache.get(1, head, None, Some(oversized), true, 1024),
+            "[Body too large to be displayed]"
+        );
+    }
+
+    #[test]
+    fn captured_oversized_response_displays_headers_and_omission_in_both_modes() {
+        let mut cache = ResponseCache::default();
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 9000\r\nX-Test: visible\r\n\r\n";
+        for hex in [false, true] {
+            assert_eq!(
+                &*cache.get(1, headers, Some(9000), None, hex, 1024),
+                "HTTP/1.1 200 OK\r\nContent-Length: 9000\r\nX-Test: visible\r\n\r\n[Body too large to be displayed (9000 bytes)]"
+            );
+        }
+    }
 
     #[test]
     fn display_guard_keeps_headers_and_only_omits_bodies_above_three_mib() {
@@ -369,6 +461,7 @@ mod tests {
             let message = message(encoding, compress(encoding, &body));
             let preview = body_preview(&message, 32 * 1024 * 1024);
             assert!(preview.body.is_empty());
+            assert_eq!(preview.body.capacity(), 0);
             assert_eq!(
                 preview.omitted,
                 Some(BodyOmitted {
@@ -531,15 +624,18 @@ mod tests {
     fn cached_response_is_reused_and_hex_or_limit_changes_refresh_it() {
         let bytes = message("br", compress("br", b"cached response")).encode();
         let mut cache = ResponseCache::default();
-        let first = cache.get(1, &bytes, false, 4096);
-        assert!(Arc::ptr_eq(&first, &cache.get(1, &bytes, false, 4096)));
+        let first = cache.get(1, &bytes, None, None, false, 4096);
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache.get(1, &bytes, None, None, false, 4096)
+        ));
         assert!(first.ends_with("cached response"));
         assert_eq!(
-            super::super::unhex(&cache.get(1, &bytes, true, 4096)).unwrap(),
+            super::super::unhex(&cache.get(1, &bytes, None, None, true, 4096)).unwrap(),
             bytes
         );
         assert_eq!(
-            &*cache.get(1, &bytes, false, 1),
+            &*cache.get(1, &bytes, None, None, false, 1),
             String::from_utf8_lossy(&bytes)
         );
     }

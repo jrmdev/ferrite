@@ -54,10 +54,7 @@ impl Drop for Capture<'_> {
                 }
                 Err(error) => self
                     .engine
-                    .errors
-                    .lock()
-                    .unwrap()
-                    .push(format!("Save interrupted scanner exchange: {error:#}")),
+                    .log_error(format!("Save interrupted scanner exchange: {error:#}")),
             }
         }
     }
@@ -161,10 +158,9 @@ impl Engine {
                     .saturating_add(flow.response.len())
                     > 64 * 1024 * 1024
             {
-                self.errors
-                    .lock()
-                    .unwrap()
-                    .push("Passive scanner queue is full; this exchange was not analyzed".into());
+                self.log_error(
+                    "Passive scanner queue is full; this exchange was not analyzed".into(),
+                );
                 return;
             }
             queue.push_back((flow.clone(), config));
@@ -215,16 +211,12 @@ impl Engine {
                 .clamp(1, 64);
                 if candidates.len() >= budget {
                     candidates.truncate(budget);
-                    engine.errors.lock().unwrap().push(format!("Passive analysis of exchange #{} reached its finding/evidence budget; additional results may be omitted",flow.id));
+                    engine.log_error(format!("Passive analysis of exchange #{} reached its finding/evidence budget; additional results may be omitted",flow.id));
                 }
                 if let Err(error) =
                     engine.record_scan_candidates(candidates, ScanMode::Passive, None, &flow)
                 {
-                    engine
-                        .errors
-                        .lock()
-                        .unwrap()
-                        .push(format!("Passive scanner: {error:#}"));
+                    engine.log_error(format!("Passive scanner: {error:#}"));
                 }
             }
         });
@@ -264,6 +256,8 @@ impl Engine {
             status: 0,
             duration_ms: 0,
             error: None,
+            omitted_response_body_bytes: None,
+            streamed_response: None,
             note: association.into(),
         };
         let mut capture = Capture {
@@ -355,5 +349,43 @@ impl Engine {
         self.activity.fetch_add(1, Ordering::SeqCst);
         self.enqueue_passive(&flow);
         Ok(flow)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::Project;
+
+    #[test]
+    fn passive_overload_keeps_diagnostics_bounded_without_a_ui_consumer() {
+        let mut project = Project::temporary();
+        project.workspace.settings.scope.include = vec!["^http://example.com/".into()];
+        let engine = Engine::new(project).unwrap();
+        // Hold the worker idle so the test deterministically fills the queue.
+        engine.scanner.passive_running.store(true, Ordering::SeqCst);
+        let flow = Exchange {
+            id: 1,
+            timestamp_ms: 0,
+            tool: "Proxy".into(),
+            destination: Destination::from_url("http://example.com/").unwrap(),
+            url: "http://example.com/".into(),
+            method: "GET".into(),
+            request: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            response: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            status: 200,
+            duration_ms: 0,
+            error: None,
+            note: String::new(),
+            omitted_response_body_bytes: None,
+            streamed_response: None,
+        };
+        for _ in 0..428 {
+            engine.enqueue_passive(&flow);
+        }
+        assert_eq!(engine.scanner.passive_queue.lock().unwrap().len(), 128);
+        let errors = engine.errors.lock().unwrap();
+        assert_eq!(errors.len(), 100);
+        assert!(errors.iter().all(|error| error.contains("queue is full")));
     }
 }

@@ -86,6 +86,8 @@ mod tests {
             status: 200,
             duration_ms: 0,
             error: None,
+            omitted_response_body_bytes: None,
+            streamed_response: None,
             note: String::new(),
         }
     }

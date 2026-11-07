@@ -16,6 +16,7 @@ use tokio::sync::{oneshot, watch};
 
 mod relay;
 pub use relay::run;
+pub(crate) use relay::run_with_history;
 
 pub fn now() -> u64 {
     SystemTime::now()

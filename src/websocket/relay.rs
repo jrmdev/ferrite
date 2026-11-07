@@ -174,12 +174,11 @@ async fn write(writer: &Writer, kind: Kind, payload: &[u8], timeout: Duration) -
 fn capture(
     engine: &Engine,
     id: u64,
-    sequence: &AtomicU64,
+    sequence: u64,
     direction: Direction,
     kind: Kind,
     payload: &[u8],
-) -> Result<u64> {
-    let sequence = sequence.fetch_add(1, Ordering::SeqCst);
+) -> Result<()> {
     let preview = if kind == Kind::Binary {
         payload
             .iter()
@@ -217,26 +216,18 @@ fn capture(
         session.close_reason = String::from_utf8_lossy(&payload[2..]).into_owned();
     }
     project.put_ws_session(session)?;
-    drop(project);
-    if kind.is_data() {
-        engine
-            .websockets
-            .received
-            .lock()
-            .unwrap()
-            .insert((id, direction), sequence);
-    }
     engine.websockets.activity.fetch_add(1, Ordering::SeqCst);
-    Ok(sequence)
+    Ok(())
 }
 
 fn finish(
     engine: &Engine,
-    id: u64,
+    history_id: Option<u64>,
     sequence: u64,
     forwarded: Option<&[u8]>,
     error: Option<String>,
 ) -> Result<()> {
+    let Some(id) = history_id else { return Ok(()) };
     let mut project = engine.project.lock().unwrap();
     let mut message = project
         .ws_message(id, sequence)?
@@ -274,7 +265,9 @@ async fn receive(
     closing: watch::Sender<bool>,
     limit: usize,
     timeout: Duration,
+    retain_history: bool,
 ) -> Result<()> {
+    let history_id = retain_history.then_some(id);
     // The dummy write side is unused: automatic control replies are disabled.
     let (mut reader, _) = after_handshake_split(
         CheckedRead::new(read, direction == Direction::ClientToServer),
@@ -344,8 +337,17 @@ async fn receive(
                 std::str::from_utf8(&payload[2..]).context("Invalid UTF-8 close reason")?;
             }
         }
-        let seq = capture(engine, id, sequence, direction, kind, &payload)?;
+        let seq = sequence.fetch_add(1, Ordering::SeqCst);
+        if retain_history {
+            capture(engine, id, seq, direction, kind, &payload)?;
+        }
         if kind.is_data() {
+            engine
+                .websockets
+                .received
+                .lock()
+                .unwrap()
+                .insert((id, direction), seq);
             let permit = match budget
                 .clone()
                 .try_acquire_many_owned(payload.len().max(1) as u32)
@@ -354,7 +356,7 @@ async fn receive(
                 Err(_) => {
                     finish(
                         engine,
-                        id,
+                        history_id,
                         seq,
                         None,
                         Some("WebSocket interception byte queue is full".into()),
@@ -371,7 +373,7 @@ async fn receive(
             if tx.try_send(packet).is_err() {
                 finish(
                     engine,
-                    id,
+                    history_id,
                     seq,
                     None,
                     Some("WebSocket message queue is full".into()),
@@ -382,7 +384,7 @@ async fn receive(
             let result = write(&write_to_peer, kind, &payload, timeout).await;
             finish(
                 engine,
-                id,
+                history_id,
                 seq,
                 Some(&payload),
                 result.as_ref().err().map(|e| format!("{e:#}")),
@@ -404,7 +406,9 @@ async fn forward(
     writer: Writer,
     mut rx: mpsc::Receiver<Packet>,
     timeout: Duration,
+    retain_history: bool,
 ) -> Result<()> {
+    let history_id = retain_history.then_some(id);
     while let Some(packet) = rx.recv().await {
         let (receiver, automatic) = {
             let mut queue = engine.websockets.pending.lock().unwrap();
@@ -461,12 +465,12 @@ async fn forward(
             Decision::Forward(packet.payload.to_vec())
         };
         match decision {
-            Decision::Drop => finish(engine, id, packet.sequence, None, None)?,
+            Decision::Drop => finish(engine, history_id, packet.sequence, None, None)?,
             Decision::Forward(payload) => {
                 let result = write(&writer, packet.kind, &payload, timeout).await;
                 finish(
                     engine,
-                    id,
+                    history_id,
                     packet.sequence,
                     Some(&payload),
                     result.as_ref().err().map(|e| format!("{e:#}")),
@@ -484,23 +488,35 @@ pub async fn run(
     upstream: Stream,
     flow: &Exchange,
 ) -> Result<()> {
-    let response = Message::parse(&flow.response)?;
-    let session = Session {
-        id: flow.id,
-        url: flow.url.replacen("http", "ws", 1),
-        opened_ms: now(),
-        closed_ms: None,
-        state: SessionState::Open,
-        subprotocol: response
-            .header("Sec-WebSocket-Protocol")
-            .unwrap_or("")
-            .into(),
-        message_count: 0,
-        close_code: None,
-        close_reason: String::new(),
-        error: None,
-    };
-    engine.project.lock().unwrap().put_ws_session(session)?;
+    run_with_history(engine, downstream, upstream, flow, true).await
+}
+
+pub(crate) async fn run_with_history(
+    engine: &Engine,
+    downstream: Stream,
+    upstream: Stream,
+    flow: &Exchange,
+    retain_history: bool,
+) -> Result<()> {
+    if retain_history {
+        let response = Message::parse(&flow.response)?;
+        let session = Session {
+            id: flow.id,
+            url: flow.url.replacen("http", "ws", 1),
+            opened_ms: now(),
+            closed_ms: None,
+            state: SessionState::Open,
+            subprotocol: response
+                .header("Sec-WebSocket-Protocol")
+                .unwrap_or("")
+                .into(),
+            message_count: 0,
+            close_code: None,
+            close_reason: String::new(),
+            error: None,
+        };
+        engine.project.lock().unwrap().put_ws_session(session)?;
+    }
     let (close, mut cancel) = watch::channel(false);
     engine
         .websockets
@@ -540,7 +556,8 @@ pub async fn run(
                 budget.clone(),
                 closing.clone(),
                 limit,
-                timeout
+                timeout,
+                retain_history
             ),
             receive(
                 engine,
@@ -553,7 +570,8 @@ pub async fn run(
                 budget,
                 closing,
                 limit,
-                timeout
+                timeout,
+                retain_history
             ),
             forward(
                 engine,
@@ -562,7 +580,8 @@ pub async fn run(
                 Direction::ClientToServer,
                 up_writer.clone(),
                 client_rx,
-                timeout
+                timeout,
+                retain_history
             ),
             forward(
                 engine,
@@ -571,7 +590,8 @@ pub async fn run(
                 Direction::ServerToClient,
                 down_writer.clone(),
                 server_rx,
-                timeout
+                timeout,
+                retain_history
             ),
         )?;
         Ok::<(), anyhow::Error>(())

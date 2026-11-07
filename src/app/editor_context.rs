@@ -25,6 +25,8 @@ fn request_snapshot(
         status: 0,
         duration_ms: 0,
         error: None,
+        omitted_response_body_bytes: None,
+        streamed_response: None,
         note: String::new(),
     })
 }
@@ -78,11 +80,7 @@ fn edited_intercept(
     limit: usize,
 ) -> anyhow::Result<Message> {
     let mut edited = decode_editor(text, is_hex)?;
-    if item.stage == Stage::Response
-        && super::response_content::body_preview(&item.message, limit)
-            .omitted
-            .is_some()
-    {
+    if super::response_content::intercept_omission(item, limit).is_some() {
         anyhow::ensure!(
             edited.body.is_empty(),
             "This body is hidden; edit only its HTTP headers"

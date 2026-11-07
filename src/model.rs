@@ -146,10 +146,13 @@ pub struct Settings {
     pub upstream: Upstream,
     pub scope: Scope,
     pub drop_out_of_scope: bool,
+    pub log_out_of_scope: bool,
     pub intercept_in_scope_only: bool,
     pub rules_in_scope_only: bool,
     pub rules: Vec<ReplaceRule>,
     pub timeout_secs: u64,
+    pub stream_idle_timeout_secs: u64,
+    pub streaming_url_patterns: Vec<String>,
     pub max_message_bytes: usize,
     pub verify_tls: bool,
 }
@@ -164,22 +167,35 @@ impl Default for Settings {
             upstream: Upstream::default(),
             scope: Scope::default(),
             drop_out_of_scope: false,
+            log_out_of_scope: true,
             intercept_in_scope_only: false,
             rules_in_scope_only: false,
             rules: vec![],
             timeout_secs: 30,
+            stream_idle_timeout_secs: 120,
+            streaming_url_patterns: vec![],
             max_message_bytes: 32 * 1024 * 1024,
             verify_tls: true,
         }
     }
 }
 impl Settings {
+    pub(crate) fn normalize_scope_policy(&mut self) {
+        if self.drop_out_of_scope {
+            self.log_out_of_scope = false;
+        }
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         let _: std::net::SocketAddr = self.listen.parse()?;
         self.scope.validate()?;
         anyhow::ensure!(
             self.timeout_secs > 0 && self.timeout_secs <= 3600,
             "Timeout must be 1..3600 seconds"
+        );
+        anyhow::ensure!(
+            self.stream_idle_timeout_secs <= 3600,
+            "Streaming idle timeout must be 0..3600 seconds"
         );
         anyhow::ensure!(
             (1024..=512 * 1024 * 1024).contains(&self.max_message_bytes),
@@ -200,6 +216,9 @@ impl Settings {
                 regex::bytes::Regex::new(&r.pattern)?;
             }
         }
+        for pattern in &self.streaming_url_patterns {
+            regex::Regex::new(pattern)?;
+        }
         for ip in self.dns_overrides.values() {
             let _: std::net::IpAddr = ip.parse()?;
         }
@@ -216,10 +235,41 @@ pub struct Exchange {
     pub method: String,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
+    /// Size of a relayed response body omitted from the capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_response_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streamed_response: Option<StreamCapture>,
     pub status: u16,
     pub duration_ms: u64,
     pub error: Option<String>,
     pub note: String,
+}
+
+impl Exchange {
+    pub fn response_length(&self) -> Option<u64> {
+        if let Some(stream) = self.streamed_response {
+            return stream.body_bytes.or(stream.declared_bytes);
+        }
+        Some(
+            self.omitted_response_body_bytes
+                .unwrap_or(self.response.len()) as u64,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamReason {
+    Policy,
+    CaptureLimit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCapture {
+    pub reason: StreamReason,
+    pub declared_bytes: Option<u64>,
+    /// None while the relay is active. Includes only payload accepted by the downstream writer.
+    pub body_bytes: Option<u64>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepeaterTab {

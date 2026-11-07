@@ -88,6 +88,16 @@ impl Workbench {
         self.repeater_busy.retain(|id| *id != tab_id);
         if let Some(flow) = self.report(result) {
             let mut project = self.engine.project.lock().unwrap();
+            if let Some(error) = flow.error {
+                let retained = project
+                    .get(flow.id)
+                    .and_then(|recorded| recorded.ok_or_else(|| anyhow::anyhow!(error)));
+                if retained.is_err() {
+                    drop(project);
+                    self.report(retained);
+                    return;
+                }
+            }
             if let Some(tab) = project.workspace.repeater_tab_mut(tab_id) {
                 tab.history.push(flow.id);
                 if self.repeater_tab == tab_id {
@@ -365,6 +375,8 @@ impl Workbench {
                     self.response_cache.get(
                         f.id,
                         &f.response,
+                        f.omitted_response_body_bytes,
+                        f.streamed_response,
                         self.response_hex,
                         self.engine.settings().max_message_bytes,
                     )

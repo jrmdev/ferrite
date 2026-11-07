@@ -74,6 +74,22 @@ impl super::Project {
                 *revision = Some(changes.revision);
                 return Ok(added);
             }
+            // Stream finalization updates existing rows. Preserve their order
+            // with O(k log n) lookups rather than scanning and sorting all n rows.
+            let replacements: Option<Vec<_>> = updates
+                .iter()
+                .map(|flow| {
+                    flow.as_ref()
+                        .and_then(|flow| rows.binary_search_by_key(&flow.id, |row| row.id).ok())
+                })
+                .collect();
+            if let Some(indices) = replacements {
+                for (index, flow) in indices.into_iter().zip(updates) {
+                    rows[index] = flow.unwrap();
+                }
+                *revision = Some(changes.revision);
+                return Ok(added);
+            }
             for flow in updates.iter().flatten() {
                 if rows.binary_search_by_key(&flow.id, |row| row.id).is_err() {
                     added.push(flow.clone());
@@ -129,6 +145,8 @@ mod tests {
             status: 200,
             duration_ms: 0,
             error: None,
+            omitted_response_body_bytes: None,
+            streamed_response: None,
             note: String::new(),
         }
     }
@@ -177,6 +195,48 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].response, b"updated");
             assert!(!Arc::ptr_eq(&original, &rows[0]));
+        }
+    }
+
+    #[test]
+    fn completing_streams_preserves_row_order_and_unchanged_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        for mut project in [
+            Project::temporary(),
+            Project::create(&dir.path().join("streams.ferrite")).unwrap(),
+        ] {
+            for id in 1..=5 {
+                project.insert(flow(id)).unwrap();
+            }
+            let (mut rows, mut revision) = (vec![], None);
+            project.sync_history(&mut rows, &mut revision).unwrap();
+            let original = rows.clone();
+            for id in [4, 2, 4] {
+                let mut completed = flow(id);
+                completed.streamed_response = Some(crate::model::StreamCapture {
+                    reason: crate::model::StreamReason::Policy,
+                    declared_bytes: None,
+                    body_bytes: Some(123),
+                });
+                project.insert(completed).unwrap();
+            }
+            assert!(
+                project
+                    .sync_history(&mut rows, &mut revision)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                [1, 2, 3, 4, 5]
+            );
+            for index in [0, 2, 4] {
+                assert!(Arc::ptr_eq(&original[index], &rows[index]));
+            }
+            for index in [1, 3] {
+                assert_eq!(rows[index].streamed_response.unwrap().body_bytes, Some(123));
+                assert!(!Arc::ptr_eq(&original[index], &rows[index]));
+            }
         }
     }
 

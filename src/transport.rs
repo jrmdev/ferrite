@@ -1,10 +1,12 @@
 use crate::{
-    http::{Message, read_message},
+    http::{Message, body_framing, read_head, read_message},
     model::{Destination, Settings, UpstreamKind},
     tls::provider,
 };
+mod response;
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
+pub(crate) use response::{IncomingResponse, LiveBody};
 use rustls::{
     ClientConfig, RootCertStore,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -237,7 +239,22 @@ pub async fn send_with_upgrade(
     request: &Message,
     settings: &Settings,
 ) -> Result<HttpOutcome> {
-    send_with_scope_check(dest, request, settings, None).await
+    let (incoming, upgrade) = open_response(dest, request, settings, None, false).await?;
+    Ok(HttpOutcome {
+        response: incoming.capture(settings, None).await?.0,
+        upgrade,
+    })
+}
+
+pub(crate) async fn send_proxy(
+    dest: &Destination,
+    request: &Message,
+    settings: &Settings,
+    url: &str,
+) -> Result<(HttpOutcome, Option<LiveBody>)> {
+    let (incoming, upgrade) = open_response(dest, request, settings, None, true).await?;
+    let (response, live) = incoming.capture(settings, Some(url)).await?;
+    Ok((HttpOutcome { response, upgrade }, live))
 }
 
 pub(crate) async fn send_scanner(
@@ -246,19 +263,17 @@ pub(crate) async fn send_scanner(
     settings: &Settings,
     scope_check: &(dyn Fn() -> bool + Sync),
 ) -> Result<Message> {
-    Ok(
-        send_with_scope_check(dest, request, settings, Some(scope_check))
-            .await?
-            .response,
-    )
+    let (incoming, _) = open_response(dest, request, settings, Some(scope_check), false).await?;
+    Ok(incoming.capture(settings, None).await?.0)
 }
 
-async fn send_with_scope_check(
+async fn open_response(
     dest: &Destination,
     request: &Message,
     settings: &Settings,
     scope_check: Option<&(dyn Fn() -> bool + Sync)>,
-) -> Result<HttpOutcome> {
+    proxy: bool,
+) -> Result<(IncomingResponse, Option<Stream>)> {
     let upgrading = request.header("Upgrade").is_some();
     let (mut stream, negotiated_h2) = connect_protocol(dest, settings, !upgrading, false).await?;
     ensure!(
@@ -275,12 +290,18 @@ async fn send_with_scope_check(
         && (negotiated_h2
             || (!dest.tls && explicit_h2 && settings.upstream.kind != UpstreamKind::Http))
     {
-        return Ok(HttpOutcome {
-            response: crate::http2::send(stream, dest, request, settings).await?,
-            upgrade: None,
-        });
+        let (response, body) = crate::http2::open_response(stream, dest, request, settings).await?;
+        return Ok((
+            IncomingResponse::http2(
+                response,
+                body,
+                request.method() == "HEAD",
+                settings.max_message_bytes,
+            )?,
+            None,
+        ));
     }
-    let mut outgoing = request.clone();
+    let mut outgoing = request.clone_head();
     outgoing.start = format!("{} {} HTTP/1.1", request.method(), request.target());
     if settings.upstream.kind == UpstreamKind::Http && !dest.tls {
         let host = settings
@@ -307,33 +328,37 @@ async fn send_with_scope_check(
         }
     }
     stream.write_all(&outgoing.encode()).await?;
+    stream.write_all(&request.body).await?;
     stream.flush().await?;
+    drop(outgoing);
     let mut reader = BufReader::new(stream);
     for _ in 0..16 {
-        let mut response = read_message(
-            &mut reader,
-            true,
-            request.method() == "HEAD",
-            settings.max_message_bytes,
-        )
-        .await?;
+        let (response, header_len) = read_head(&mut reader, settings.max_message_bytes).await?;
+        let status = response.status();
+        ensure!(
+            (100..=599).contains(&status),
+            "Invalid upstream HTTP status"
+        );
+        let framing = body_framing(&response, true, request.method() == "HEAD")?;
+        if (100..200).contains(&status) && status != 101 {
+            continue;
+        }
         if response.status() == 101 {
             ensure!(upgrading, "Unsolicited HTTP upgrade");
             // Keep BufReader: it may already contain the first upgraded bytes.
-            return Ok(HttpOutcome {
-                response,
-                upgrade: Some(Box::new(reader)),
-            });
+            return Ok((IncomingResponse::upgrade(response), Some(Box::new(reader))));
         }
-        if !(100..200).contains(&response.status()) {
-            if request.method() != "HEAD" && !matches!(response.status(), 204 | 304) {
-                response.decode_content(settings.max_message_bytes)?;
-            }
-            return Ok(HttpOutcome {
+        return Ok((
+            IncomingResponse::http1(
                 response,
-                upgrade: None,
-            });
-        }
+                reader,
+                framing,
+                header_len,
+                settings.max_message_bytes,
+                !proxy,
+            ),
+            None,
+        ));
     }
     bail!("Too many informational HTTP responses")
 }

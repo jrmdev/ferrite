@@ -84,7 +84,7 @@ impl HistorySort {
             SortColumn::Type => {
                 short_content_type(&a.response).cmp(&short_content_type(&b.response))
             }
-            SortColumn::Bytes => a.response.len().cmp(&b.response.len()),
+            SortColumn::Bytes => a.response_length().cmp(&b.response_length()),
             SortColumn::Duration => a.duration_ms.cmp(&b.duration_ms),
             SortColumn::Tool => a.tool.cmp(&b.tool),
             SortColumn::Method => a.method.cmp(&b.method),
@@ -221,7 +221,7 @@ pub(super) fn show(
                     let values = [flow.id.to_string(), timestamp(flow.timestamp_ms, timezone),
                         if flow.error.is_some() { format!("{} (error)", flow.status) } else { flow.status.to_string() },
                         short_content_type(&flow.response),
-                        flow.response.len().to_string(), flow.duration_ms.to_string(),
+                        flow.response_length().map_or_else(|| "—".into(), |len| len.to_string()), flow.duration_ms.to_string(),
                         flow.tool.clone(), flow.method.clone(),
                         annotations.get(&flow.id).map(|a| a.comment.lines().next().unwrap_or("").to_string()).unwrap_or_default(),
                         flow.url.clone()];
@@ -555,6 +555,8 @@ mod tests {
             method: "GET".into(),
             request: vec![],
             error: None,
+            omitted_response_body_bytes: None,
+            streamed_response: None,
             note: String::new(),
         }
     }
