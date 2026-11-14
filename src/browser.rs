@@ -1,4 +1,4 @@
-//! Managed Chromium-family browser routed through the Ferrite listener.
+//! Managed browser routed through the Ferrite listener.
 //!
 //! The browser is a separate process with an isolated profile, so Ferrite's
 //! idle footprint is unchanged while it is closed. HTTPS trust is confined to
@@ -47,7 +47,7 @@ impl ProfileMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BrowserSettings {
-    /// Empty selects the first detected Chromium-family executable.
+    /// Empty selects the first detected supported browser executable.
     pub executable: String,
     pub profile: ProfileMode,
     /// Empty uses [`default_profile_dir`] for persistent profiles.
@@ -104,8 +104,8 @@ impl BrowserSettings {
                 continue;
             }
             ensure!(
-                arg.starts_with("--"),
-                "Browser arguments must be --switches; set the start URL separately: {arg}"
+                arg.starts_with('-') && arg.len() > 1,
+                "Browser arguments must be switches; set the start URL separately: {arg}"
             );
             let name = arg.split('=').next().unwrap_or(arg);
             ensure!(
@@ -164,9 +164,17 @@ pub fn resolve_proxy(settings: &BrowserSettings, listener: Option<SocketAddr>) -
 
 fn executable_names() -> &'static [&'static str] {
     if cfg!(windows) {
-        &["chrome.exe", "msedge.exe", "brave.exe", "chromium.exe"]
+        &[
+            "firefox.exe",
+            "chrome.exe",
+            "msedge.exe",
+            "brave.exe",
+            "chromium.exe",
+        ]
     } else {
         &[
+            "firefox",
+            "firefox-esr",
             "chromium",
             "chromium-browser",
             "google-chrome",
@@ -215,7 +223,7 @@ fn resolve_bundle(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
-/// Installed Chromium-family browsers in preference order.
+/// Installed browsers in preference order.
 pub fn candidates() -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = vec![];
     let mut push = |path: PathBuf| {
@@ -237,6 +245,8 @@ pub fn candidates() -> Vec<PathBuf> {
     {
         let home = dirs::home_dir();
         for app in [
+            "Firefox",
+            "Firefox Developer Edition",
             "Google Chrome",
             "Chromium",
             "Google Chrome for Testing",
@@ -262,6 +272,7 @@ pub fn candidates() -> Vec<PathBuf> {
                 r"Chromium\Application\chrome.exe",
                 r"Microsoft\Edge\Application\msedge.exe",
                 r"BraveSoftware\Brave-Browser\Application\brave.exe",
+                r"Mozilla Firefox\firefox.exe",
             ] {
                 push(Path::new(&base).join(relative));
             }
@@ -294,8 +305,16 @@ pub fn locate(settings: &BrowserSettings) -> Result<PathBuf> {
         return Ok(path);
     }
     candidates().into_iter().next().context(
-        "No Chromium, Google Chrome, Edge or Brave executable was found. Install one or choose its executable in Browser settings.",
+        "No supported browser executable was found. Install Firefox, Chromium, Google Chrome, Edge or Brave, or choose its executable in Browser settings.",
     )
+}
+
+pub fn is_firefox(executable: &Path) -> bool {
+    executable.file_stem().is_some_and(|name| {
+        name.to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("firefox")
+    })
 }
 
 pub fn default_profile_dir() -> Result<PathBuf> {
@@ -480,6 +499,51 @@ pub fn arguments(
     Ok(args)
 }
 
+fn firefox_preferences(profile: &Path, proxy: &str) -> Result<()> {
+    let (host, port) = proxy.rsplit_once(':').context("Invalid proxy address")?;
+    let host = host.trim_matches(['[', ']']);
+    let port: u16 = port.parse().context("Invalid proxy port")?;
+    let prefs = format!(
+        "user_pref(\"network.proxy.type\", 1);\nuser_pref(\"network.proxy.http\", \"{host}\");\nuser_pref(\"network.proxy.http_port\", {port});\nuser_pref(\"network.proxy.ssl\", \"{host}\");\nuser_pref(\"network.proxy.ssl_port\", {port});\nuser_pref(\"network.proxy.share_proxy_settings\", true);\nuser_pref(\"network.proxy.no_proxies_on\", \"\");\nuser_pref(\"network.trr.mode\", 5);\n"
+    );
+    std::fs::write(profile.join("user.js"), prefs).context("Configure Firefox proxy")
+}
+
+fn firefox_arguments(settings: &BrowserSettings, profile: &Path) -> Result<Vec<String>> {
+    settings.validate()?;
+    for arg in &settings.extra_args {
+        let switch = arg.split('=').next().unwrap_or(arg).trim();
+        ensure!(
+            ![
+                "-profile",
+                "--profile",
+                "-no-remote",
+                "--no-remote",
+                "-new-instance",
+                "--new-instance"
+            ]
+            .contains(&switch),
+            "Firefox profile and instance arguments are managed by Ferrite"
+        );
+    }
+    let mut args = vec![
+        "--no-remote".into(),
+        "--new-instance".into(),
+        "--profile".into(),
+        profile.display().to_string(),
+    ];
+    args.extend(settings.extra_args.iter().cloned());
+    args.push(
+        if settings.start_url.trim().is_empty() {
+            "about:blank"
+        } else {
+            settings.start_url.trim()
+        }
+        .into(),
+    );
+    Ok(args)
+}
+
 /// Background services that would otherwise add Chromium's own requests to
 /// the history. Some Google endpoints (account and GCM check-ins, component
 /// updates) cannot be disabled by switches; filter History by scope instead.
@@ -565,7 +629,12 @@ impl Browser {
                 Profile::Persistent(path)
             }
         };
-        let args = arguments(settings, profile.path(), proxy, spki)?;
+        let args = if is_firefox(&executable) {
+            firefox_preferences(profile.path(), proxy)?;
+            firefox_arguments(settings, profile.path())?
+        } else {
+            arguments(settings, profile.path(), proxy, spki)?
+        };
         let mut command = Command::new(&executable);
         command
             .args(&args)

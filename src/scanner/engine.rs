@@ -68,9 +68,7 @@ impl Engine {
         scan_id: Option<u64>,
         base: &Exchange,
     ) -> Result<usize> {
-        let definitions = checks::definitions();
         let mut project = self.project.lock().unwrap();
-        let previous_count = project.finding_count(scan_id);
         let settings = scan_id
             .and_then(|id| project.scan_job(id).map(|j| j.settings))
             .unwrap_or_else(|| project.workspace.scanner.clone());
@@ -79,7 +77,7 @@ impl Engine {
             if !settings.check_enabled(&candidate.issue_id) {
                 continue;
             }
-            let Some(definition) = definitions.iter().find(|d| d.id == candidate.issue_id) else {
+            let Some(definition) = checks::definition(&candidate.issue_id) else {
                 continue;
             };
             if mode == ScanMode::Passive
@@ -123,15 +121,15 @@ impl Engine {
                 notes: String::new(),
                 scan_ids: scan_id.into_iter().collect(),
             };
-            project.upsert_finding(finding)?;
-            count += 1;
+            let (_, attached) = project.upsert_finding_tracked(finding)?;
+            if attached {
+                count += 1;
+            }
         }
         if count > 0 {
             self.scanner.activity.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(project
-            .finding_count(scan_id)
-            .saturating_sub(previous_count))
+        Ok(count)
     }
 
     pub(crate) fn enqueue_passive(&self, flow: &Exchange) {

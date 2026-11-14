@@ -8,6 +8,8 @@ enum Kind {
     Xss,
     Redirect,
     Sql,
+    Input,
+    Transformation,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +53,20 @@ pub(super) fn definitions() -> Vec<IssueDefinition> {
             "A selected readback request starts returning a SQL parser diagnostic after a separate input submission. The finding is tentative because a parser diagnostic does not demonstrate exploitability.",
             "Use parameterized database queries when consuming stored data as well as when accepting the initial input.",
         ),
+        (
+            "input-stored",
+            "Input returned in response (stored)",
+            Severity::Information,
+            "A unique submitted marker appears when an unchanged selected readback request is replayed.",
+            "Review who can retrieve the stored input and apply context-appropriate encoding wherever it is returned.",
+        ),
+        (
+            "input-transformed-stored",
+            "Suspicious input transformation (stored)",
+            Severity::Information,
+            "Percent escapes, JavaScript escapes, or numeric character references in input are returned decoded in a subsequent readback.",
+            "Apply validation after canonicalization and apply output encoding where the stored value is returned.",
+        ),
     ]
     .into_iter()
     .map(|(id, name, severity, description, remediation)| IssueDefinition {
@@ -93,6 +109,8 @@ pub(super) fn plan(
         ("stored-xss", Kind::Xss),
         ("stored-redirect", Kind::Redirect),
         ("sql-second-order", Kind::Sql),
+        ("input-stored", Kind::Input),
+        ("input-transformed-stored", Kind::Transformation),
     ];
     if !settings.intrusive || !checks.iter().any(|(id, _)| enabled(settings, id)) {
         return Ok(vec![]);
@@ -113,19 +131,32 @@ pub(super) fn plan(
         }
         let digest: [u8; 32] = Sha256::digest(&readback.request).into();
         if seen.insert(digest) {
-            candidates.push(readback);
+            candidates.push((readback, request.method() == "GET"));
         }
     }
     let mut probes = Vec::new();
     let mut bytes = 0usize;
     'points: for point in insertion_points {
-        for readback in &candidates {
+        for &(readback, readback_is_get) in &candidates {
             for (id, kind) in checks {
                 if !enabled(settings, id) {
                     continue;
                 }
                 let token = format!("ferrite-stored-{}", nonce(base, &point.label, readback, id));
                 let variants = match kind {
+                    Kind::Input | Kind::Transformation => {
+                        if !reflection::supports_point(&point)
+                            || !matches!(source.method(), "POST" | "PUT" | "PATCH")
+                            || !readback_is_get
+                        {
+                            continue;
+                        }
+                        if kind == Kind::Input {
+                            vec![(token.clone(), token)]
+                        } else {
+                            reflection::transformed_payloads(&token).collect()
+                        }
+                    }
                     Kind::Xss => xss_payloads(&token),
                     Kind::Redirect => {
                         vec![(token.clone(), format!("https://{token}.invalid/ferrite"))]
@@ -278,6 +309,31 @@ pub(super) fn evaluate_series(
             continue;
         }
         let confidence = match marker.kind {
+            Kind::Input | Kind::Transformation => {
+                let Some((before, response)) = reflection::response(control.response)
+                    .zip(reflection::response(after.response))
+                else {
+                    continue;
+                };
+                if !reflection::same_request(
+                    &after.probe.request,
+                    &after.response.request,
+                    &after.response.destination,
+                ) || !reflection::same_request(
+                    &seed.probe.request,
+                    &seed.response.request,
+                    &seed.response.destination,
+                ) || seed.response.destination != seed.probe.destination
+                    || control.response.url != after.response.url
+                    || !(200..400).contains(&before.status())
+                    || !(200..400).contains(&response.status())
+                    || reflection::marker_location(&before, &marker.token).is_some()
+                    || reflection::marker_location(&response, &marker.token).is_none()
+                {
+                    continue;
+                }
+                Confidence::Certain
+            }
             Kind::Xss => {
                 let Some((message, contents)) = body(after.response) else {
                     continue;
@@ -328,6 +384,10 @@ pub(super) fn evaluate_series(
                         "The original readback request redirected to the unique injected .invalid destination after submission; the destination was not contacted.",
                     Kind::Sql =>
                         "The readback introduced a SQL parser diagnostic absent from its control and from both seed responses. This temporal differential needs manual verification and does not establish exploitable SQL injection.",
+                    Kind::Input =>
+                        "The unique marker appeared in the readback response and was absent from its control. Review who can retrieve this value and how it is used.",
+                    Kind::Transformation =>
+                        "The encoded probe marker appeared decoded in the readback response and was absent from its control.",
                 },
             ),
         );

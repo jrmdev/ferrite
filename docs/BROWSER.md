@@ -1,20 +1,22 @@
 # Built-in browser
 
-Ferrite can launch a dedicated Chromium-family browser (Chromium, Google Chrome, Microsoft Edge or Brave) that is already routed through the Ferrite listener and already trusts Ferrite's CA. Its traffic appears in **History**, **Intercept** and **Target** like any other proxied client.
+Ferrite can launch a dedicated browser (Firefox, Chromium, Google Chrome, Microsoft Edge or Brave) routed through the Ferrite listener. Chromium browsers trust Ferrite's CA automatically; Firefox needs the CA imported into its dedicated profile for HTTPS interception. Traffic appears in **History**, **Intercept** and **Target** like any other proxied client.
 
 The browser is a separate, Ferrite-managed process. It is not embedded in the Ferrite window, so it adds nothing to Ferrite's memory use while it is closed.
 
 ## Quick start
 
-1. Install Chromium, Google Chrome, Edge or Brave.
+1. Install Firefox, Chromium, Google Chrome, Edge or Brave.
 2. In **Proxy**, select **Open browser**. If the listener is stopped, Ferrite offers to start it first.
 3. Browse. Requests appear in **History**; enable interception in **Intercept** to pause them.
 
-The **Browser** page shows the process status, offers **Close**, **Restart**, a URL bar with back/forward/reload, the list of open tabs (focus or close each), and the browser settings.
+The **Browser** page shows the process status, offers **Close** and **Restart**, browser settings, and tab controls for Chromium-family browsers.
+
+Firefox launches in an isolated profile with proxy settings configured, including loopback targets. Ferrite does not yet control Firefox tabs from its Browser page. For HTTPS interception, export Ferrite's CA from **Proxy → Export CA**, then import it in Firefox under **Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import**. This changes trust only in the Firefox profile. Temporary profiles are deleted on exit, so use a persistent profile to retain the imported CA.
 
 ## What Ferrite configures
 
-Every launch uses these Ferrite-managed switches. They cannot be overridden from **Extra arguments**:
+Chromium launches use these Ferrite-managed switches. They cannot be overridden from **Extra arguments**:
 
 | Switch | Purpose |
 | --- | --- |
@@ -68,7 +70,7 @@ Browser settings are application-wide (stored with the theme and CA in Ferrite's
 | Profile | Temporary or persistent, with an optional directory |
 | Proxy | Empty follows the running Ferrite listener (wildcard binds use loopback). `host:port` routes elsewhere |
 | Start URL | `about:blank`, or an `http(s)` URL |
-| Extra arguments | One `--switch[=value]` per line, for example `--lang=en-AU` or `--window-size=1400,900` |
+| Extra arguments | One browser switch per line, for example `--lang=en-AU`, `-private-window` or `--window-size=1400,900` |
 | DevTools controls | Lets the Browser page list, open, navigate and close tabs, and close the browser gracefully |
 
 Changes apply to the next launch.
@@ -99,9 +101,9 @@ A managed external process gives a fully featured browser on all three platforms
 
 | Platform | Detection | Notes |
 | --- | --- | --- |
-| Linux | `PATH` (`chromium`, `chromium-browser`, `google-chrome`, `google-chrome-stable`, `microsoft-edge`, `brave-browser`), `/opt/google/chrome`, `/snap/bin/chromium` | Verified end to end with Chrome for Testing 153. Snap Chromium cannot read hidden directories under your home, so persistent profiles must use a non-hidden directory. Chromium refuses to run as root without `--no-sandbox`; add it only inside disposable containers |
+| Linux | `PATH` (`firefox`, `firefox-esr`, Chromium and Chromium-family names), `/opt/google/chrome`, `/snap/bin/chromium` | Snap Chromium cannot read hidden directories under your home, so persistent profiles must use a non-hidden directory. Chromium refuses to run as root without `--no-sandbox`; add it only inside disposable containers |
 | macOS | `/Applications` and `~/Applications` (Chrome, Chromium, Chrome for Testing, Edge, Brave, Canary) | Compiled and unit-tested in CI; not exercised against a real browser in this change |
-| Windows | `Program Files`, `Program Files (x86)` and `%LOCALAPPDATA%` (Chrome, Chromium, Edge, Brave) | Compiled and unit-tested in CI; not exercised against a real browser in this change |
+| Windows | `Program Files`, `Program Files (x86)` and `%LOCALAPPDATA%` (Firefox, Chrome, Chromium, Edge, Brave) | Firefox HTTPS interception requires importing Ferrite's CA into its profile |
 
 ## Testing
 

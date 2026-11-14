@@ -14,6 +14,19 @@ pub(super) struct State {
     draft: Option<McpSettings>,
     audit_search: String,
     last_error: Option<String>,
+    setup: Option<Setup>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Setup {
+    Choose,
+    Local,
+    Ssh,
+}
+
+// SSH passes its remote command to the remote user's shell as a string.
+fn quote_posix_shell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 impl Workbench {
@@ -152,7 +165,7 @@ impl Workbench {
     pub(super) fn mcp_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("MCP server");
         ui.add(
-            egui::Label::new(RichText::new("Lets local MCP clients, agents and harnesses read this project and send in-scope requests through Ferrite. Captured traffic is returned to the client, which may forward it to a model provider.").weak())
+            egui::Label::new(RichText::new("Lets MCP clients, agents and harnesses read this project and send in-scope requests through Ferrite. Captured traffic is returned to the client, which may forward it to a model provider.").weak())
                 .wrap(),
         );
         ui.add_space(6.0);
@@ -195,7 +208,7 @@ impl Workbench {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
         ui.add_space(8.0);
-        subsection_heading(ui, "Connected clients");
+        subsection_heading(ui, "Connected agents");
         let clients = self.mcp.clients();
         if clients.is_empty() {
             ui.weak(if self.mcp_view.server.is_some() {
@@ -301,26 +314,82 @@ impl Workbench {
     }
 
     fn mcp_setup(&mut self, ui: &mut egui::Ui) {
-        subsection_heading(ui, "Connect an MCP client");
+        if ui.button("Connect an AI agent").clicked() {
+            self.mcp_view.setup = Some(Setup::Choose);
+        }
+        let Some(setup) = self.mcp_view.setup else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("Where is the agent running?");
+            if ui
+                .selectable_label(setup == Setup::Local, "This machine")
+                .clicked()
+            {
+                self.mcp_view.setup = Some(Setup::Local);
+            }
+            if ui
+                .selectable_label(setup == Setup::Ssh, "Another machine")
+                .clicked()
+            {
+                self.mcp_view.setup = Some(Setup::Ssh);
+            }
+            if ui.small_button("Close").clicked() {
+                self.mcp_view.setup = None;
+            }
+        });
+        let Some(setup) = self.mcp_view.setup else {
+            return;
+        };
+        if setup == Setup::Choose {
+            return;
+        }
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "ferrite".into());
-        let json = serde_json::to_string_pretty(&serde_json::json!({
-            "mcpServers": {"ferrite": {"command": exe, "args": ["mcp"]}}
-        }))
-        .unwrap_or_default();
+        let config = match setup {
+            Setup::Local => serde_json::json!({
+                "mcpServers": {"ferrite": {"command": exe, "args": ["mcp"]}}
+            }),
+            Setup::Ssh => {
+                // Windows SSH servers may use cmd or PowerShell; their quoting differs.
+                let command = if cfg!(windows) {
+                    "REMOTE_FERRITE_COMMAND mcp".to_owned()
+                } else {
+                    format!("{} mcp", quote_posix_shell(&exe))
+                };
+                serde_json::json!({
+                    "mcpServers": {"ferrite": {"command": "ssh", "args": ["-T", "-o", "BatchMode=yes", "USER@FERRITE_HOST", command]}}
+                })
+            }
+            Setup::Choose => unreachable!(),
+        };
+        let json = serde_json::to_string_pretty(&config).unwrap_or_default();
         ui.label("1. Keep this window open with the MCP server enabled.");
-        ui.label("2. Add a stdio MCP server to your client using this example configuration:");
+        if setup == Setup::Ssh {
+            ui.label("2. On the agent's machine, configure SSH access to this machine with non-interactive authentication and a trusted host key. Use the same user account that runs Ferrite.");
+            ui.label("3. Add this stdio MCP server to the agent's client. Replace USER@FERRITE_HOST with the SSH username and address of this machine:");
+            if cfg!(windows) {
+                ui.weak("Replace REMOTE_FERRITE_COMMAND with the full Ferrite executable path, quoted for the SSH server's configured shell.");
+            }
+        } else {
+            ui.label("2. Add a stdio MCP server to your client using this example configuration:");
+        }
         ui.horizontal(|ui| {
             ui.add(egui::Label::new(RichText::new(&json).monospace()));
             if ui.small_button("Copy").clicked() {
                 ui.ctx().copy_text(json.clone());
             }
         });
-        ui.weak("Configuration formats and file locations vary by client. Use the executable as the command and mcp as its argument.");
-        ui.label(
-            "3. Start or reconnect your client and use its MCP tools to interact with Ferrite.",
-        );
+        ui.weak("Configuration formats and file locations vary by client.");
+        if setup == Setup::Ssh {
+            ui.weak("SSH must be installed on the agent's machine and enabled on the Ferrite machine. The SSH login must use the same Ferrite configuration directory as the window.");
+        }
+        ui.label(if setup == Setup::Ssh {
+            "4. Start or reconnect your client and use Ferrite's MCP tools."
+        } else {
+            "3. Start or reconnect your client and use Ferrite's MCP tools."
+        });
         ui.weak("Without this window, `ferrite mcp --headless --project FILE` serves a project directly (see ferrite mcp --help).");
     }
 
@@ -397,5 +466,18 @@ impl Workbench {
                     ui.end_row();
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_posix_shell;
+
+    #[test]
+    fn ssh_command_quotes_spaces_and_apostrophes() {
+        assert_eq!(
+            quote_posix_shell("/home/a user's/ferrite"),
+            "'/home/a user'\\''s/ferrite'"
+        );
     }
 }

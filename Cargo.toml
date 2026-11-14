@@ -22,6 +22,7 @@ gui = ["dep:eframe", "dep:egui-wgpu", "dep:egui_extras", "dep:rfd", "dep:fontdb"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+encoding_rs = "0.8"
 fs2 = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"], optional = true }
@@ -45,6 +46,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 url = "2"
 webpki-roots = "1"
+x509-parser = "0.18"
 h2 = "0.4"
 http = "1"
 bytes = "1"

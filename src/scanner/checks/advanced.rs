@@ -24,41 +24,47 @@ impl Matcher {
         matches!(self, Self::Series { family, .. }
             if matches!(family.as_str(), "cache-poison" | "cache-deception" | "cl-te" | "te-cl" | "put"))
     }
+
+    /// Only repeated metadata probes need their exchanges retained for series
+    /// evaluation. Single-response checks are decided immediately.
+    pub(super) fn series_result(&self) -> bool {
+        matches!(self, Self::Series { .. })
+    }
 }
 
 pub(super) fn definitions() -> Vec<IssueDefinition> {
     use Severity::*;
     [
-        ("csp-style", "CSP permits unsafe style execution", Low,true,false,false,"An enforced style policy permits unrestricted inline CSS or broad style sources.","Use nonces or hashes for inline styles and restrict style sources."),
-        ("csp-script-sources", "CSP permits broad script sources", Medium,true,false,false,"A script policy trusts arbitrary network sources without a nonce-based strict-dynamic policy.","Restrict script sources and use unpredictable nonces or content hashes."),
-        ("csp-form", "CSP does not restrict form destinations", Low,true,false,false,"A page with forms has a content security policy that does not constrain form submissions.","Set an explicit form-action policy appropriate to the application."),
+        ("csp-style", "CSP permits unsafe style execution", Information,true,false,false,"An enforced style policy permits unrestricted inline CSS or broad style sources.","Use nonces or hashes for inline styles and restrict style sources."),
+        ("csp-script-sources", "CSP permits broad script sources", Information,true,false,false,"A script policy trusts arbitrary network sources without a nonce-based strict-dynamic policy.","Restrict script sources and use unpredictable nonces or content hashes."),
+        ("csp-form", "CSP does not restrict form destinations", Information,true,false,false,"A page with forms has a content security policy that does not constrain form submissions.","Set an explicit form-action policy appropriate to the application."),
         ("csp-report-only", "Content security policy is report-only", Information,true,false,false,"The response supplies a reporting policy without an enforced CSP header.","Deploy an enforced policy after reviewing violation reports."),
         ("csp-not-enforced", "Content security policy not enforced", Information,true,false,false,"An HTML response has no enforced Content-Security-Policy header.","Deploy an appropriate enforced policy and review its directives."),
-        ("csp-malformed", "Malformed content security policy", Low,true,false,false,"A CSP directive contains invalid syntax or an unterminated source expression.","Correct the policy syntax and validate its browser interpretation."),
-        ("csp-script-library", "CSP trusts a script-hosting service", Low,true,false,false,"An enforced script allowlist includes a service that hosts user-selectable libraries or content.","Prefer nonces/hashes and review each trusted script host."),
-        ("flash-policy", "Permissive Flash cross-domain policy", Low,true,false,false,"A captured Flash cross-domain policy grants access to arbitrary domains.","Remove obsolete policies or allow only specific trusted origins."),
-        ("silverlight-policy", "Permissive Silverlight cross-domain policy", Low,true,false,false,"A captured Silverlight policy grants access to arbitrary domains.","Remove obsolete policies or allow only specific trusted origins."),
+        ("csp-malformed", "Malformed content security policy", Information,true,false,false,"A CSP directive contains invalid syntax or an unterminated source expression.","Correct the policy syntax and validate its browser interpretation."),
+        ("csp-script-library", "CSP trusts a script-hosting service", Information,true,false,false,"An enforced script allowlist includes a service that hosts user-selectable libraries or content.","Prefer nonces/hashes and review each trusted script host."),
+        ("flash-policy", "Permissive Flash cross-domain policy", High,true,false,false,"A captured Flash cross-domain policy grants access to arbitrary domains.","Remove obsolete policies or allow only specific trusted origins."),
+        ("silverlight-policy", "Permissive Silverlight cross-domain policy", High,true,false,false,"A captured Silverlight policy grants access to arbitrary domains.","Remove obsolete policies or allow only specific trusted origins."),
         ("database-connection", "Database connection string disclosed", Medium,true,false,false,"The response contains a database connection URI with embedded nonempty credentials.","Remove connection credentials from responses and rotate exposed secrets."),
         ("ssn-disclosure", "Possible social security number disclosed", Information,true,false,false,"A response labels a syntactically plausible US social security number.","Review whether the data is real and restrict or redact sensitive identifiers."),
         ("base64-parameter", "Base64-encoded structured input", Information,true,false,false,"A request parameter contains decodable JSON or XML wrapped in Base64.","Treat encoded data as untrusted; encoding provides no integrity protection."),
         ("graphql-endpoint", "GraphQL endpoint found", Information,true,false,false,"Captured request and response structures identify a GraphQL operation.","Apply authorization, query limits, and appropriate error handling to GraphQL."),
-        ("unencrypted-http", "Unencrypted HTTP communication", Information,true,false,false,"The captured HTTP exchange uses plaintext transport.","Use HTTPS when integrity or confidentiality is required."),
+        ("unencrypted-http", "Unencrypted HTTP communication", Low,true,false,false,"The captured HTTP exchange uses plaintext transport.","Use HTTPS when integrity or confidentiality is required."),
         ("cors-wildcard", "CORS allows arbitrary noncredentialed origins", Information,true,false,false,"The response permits cross-origin reads from any origin without browser credentials.","Confirm that the response is intended to be public."),
         ("html-comment-secret", "Sensitive-looking data in HTML comment", Low,true,false,false,"An HTML comment contains an explicitly labeled password or secret.","Remove secrets from delivered source and rotate exposed credentials."),
-        ("graphql-suggestions", "GraphQL field suggestions enabled", Information,false,true,false,"An invalid field query returns schema field suggestions.","Disable unnecessary field suggestions on production endpoints."),
-        ("graphql-content-type", "GraphQL accepts simple cross-site content type", Medium,false,true,false,"The endpoint executes a GraphQL operation submitted as text/plain.","Enforce the intended JSON media type and implement CSRF defenses."),
+        ("graphql-suggestions", "GraphQL field suggestions enabled", Low,false,true,false,"An invalid field query returns schema field suggestions.","Disable unnecessary field suggestions on production endpoints."),
+        ("graphql-content-type", "GraphQL accepts simple cross-site content type", Low,false,true,false,"The endpoint executes a GraphQL operation submitted as text/plain.","Enforce the intended JSON media type and implement CSRF defenses."),
         ("ldap-injection", "Possible LDAP injection", High,false,true,false,"A delimiter probe introduces an LDAP filter parser diagnostic absent from the baseline.","Use safe LDAP filter construction and context-specific escaping."),
         ("xpath-injection", "Possible XPath injection", High,false,true,false,"A delimiter probe introduces an XPath parser diagnostic absent from the baseline.","Use parameterized XPath expressions or strict context-specific escaping."),
         ("xml-injection", "Possible XML injection", Medium,false,true,false,"An input delimiter introduces an XML parser diagnostic absent from the baseline.","Build XML with a structured serializer and validate user-controlled values."),
         ("cors-null", "Credentialed CORS trusts the null origin", Medium,false,true,false,"An authenticated response authorizes the null origin and remains readable with credentials.","Do not trust the null origin for credentialed resources."),
-        ("cors-subdomain", "Credentialed CORS trusts arbitrary subdomains", Medium,false,true,false,"An authenticated response authorizes an attacker-controlled subdomain of the target domain.","Do not derive allowed CORS origins from a suffix or wildcard domain."),
-        ("cors-insecure-origin", "Credentialed CORS trusts an insecure origin", Medium,false,true,false,"An HTTPS resource authorizes an HTTP origin with credentials.","Only allow required authenticated HTTPS origins."),
+        ("cors-subdomain", "Credentialed CORS trusts arbitrary subdomains", Low,false,true,false,"An authenticated response authorizes an attacker-controlled subdomain of the target domain.","Do not derive allowed CORS origins from a suffix or wildcard domain."),
+        ("cors-insecure-origin", "Credentialed CORS trusts an insecure origin", Low,false,true,false,"An HTTPS resource authorizes an HTTP origin with credentials.","Only allow required authenticated HTTPS origins."),
         ("referer-dependent", "Referer-dependent response", Information,false,true,false,"Repeated requests change consistently when only Referer is changed.","Do not use Referer as the sole authentication or authorization control."),
         ("user-agent-dependent", "User-Agent-dependent response", Information,false,true,false,"Repeated requests change consistently when only User-Agent is changed.","Review whether client-dependent behavior exposes additional functionality."),
         ("spoofable-ip", "Spoofable client IP trust", Medium,false,true,false,"A denied resource becomes accessible only when a client IP forwarding header is supplied.","Trust forwarding headers only from explicitly trusted reverse proxies."),
         ("request-url-override", "Request URL override header accepted", Low,false,true,false,"A URL override header makes an otherwise nonexistent path return the selected resource.","Strip untrusted URL override headers at the trusted edge."),
         ("cache-poisoning", "Web cache poisoning", High,false,true,true,"A unique forwarded-host marker persists into a clean request served from cache.","Include relevant inputs in cache keys and remove untrusted routing metadata."),
-        ("cache-deception", "Web cache deception", High,false,true,true,"An authenticated response is cached under a static-looking path and retrieved without credentials.","Align cache rules with application routing and prevent caching of personalized responses."),
+        ("cache-deception", "Web cache deception", Medium,false,true,true,"An authenticated response is cached under a static-looking path and retrieved without credentials.","Align cache rules with application routing and prevent caching of personalized responses."),
         ("request-smuggling", "Possible HTTP request smuggling", High,false,true,true,"Repeated ambiguous-framing requests time out while matched unambiguous controls complete.","Reject ambiguous framing consistently at every intermediary and origin."),
         ("put-write", "HTTP PUT permits file creation", High,false,true,true,"A unique benign file written with PUT is retrievable by a separate GET request.","Disable unauthenticated write methods or enforce appropriate authorization."),
     ].into_iter().map(|(id,name,severity,passive,active,intrusive,description,remediation)|IssueDefinition{id:id.into(),name:name.into(),severity,passive,active,intrusive,description:description.into(),remediation:remediation.into(),references:vec![]}).collect()
@@ -83,22 +89,19 @@ fn strict_script(values: &[String]) -> bool {
             .any(|s| s.starts_with("'nonce-") || s.starts_with("'sha"))
 }
 
-pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
-    let Ok(request) = Message::parse(&flow.request) else {
-        return vec![];
-    };
-    let Ok(response) = Message::parse(&flow.response) else {
-        return vec![];
-    };
+/// Passive checks over already parsed messages and an already decoded body.
+/// `checks::passive` calls this directly so an exchange is parsed and
+/// decompressed once per worker instead of once per module.
+pub(super) fn passive_parsed(
+    flow: &Exchange,
+    request: &Message,
+    response: &Message,
+    body: Option<&str>,
+) -> Vec<Candidate> {
     let mut out = vec![];
     let budget =
         (64 * 1024 * 1024usize / (flow.request.len() + flow.response.len()).max(1)).clamp(1, 64);
-    let severity = |id: &str| {
-        definitions()
-            .into_iter()
-            .find(|d| d.id == id)
-            .map_or(Severity::Information, |d| d.severity)
-    };
+    let severity = |id: &str| super::issue_severity(id);
     let mut add = |id: &str, confidence: Confidence, point: &str, detail: &str| {
         let incoming = Candidate {
             affected: None,
@@ -135,9 +138,9 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "Wildcard CORS grants noncredentialed cross-origin access; verify intended public exposure.",
         );
     }
-    let body = text_body(&response, limit).unwrap_or_default();
-    if is_html(&response) {
-        let policies = csp_policies(&response, &body);
+    let body = body.unwrap_or_default();
+    if is_html(response) {
+        let policies = csp_policies(response, body);
         if policies.is_empty() {
             if response
                 .header("Content-Security-Policy-Report-Only")
@@ -205,7 +208,7 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                     "Every applicable style policy permits inline styles or arbitrary network styles.",
                 );
             }
-            if re(r"(?i)<form\b", &body)
+            if re(r"(?i)<form\b", body)
                 && policies
                     .iter()
                     .all(|p| sources(p, "form-action").is_none_or(|s| broad(&s)))
@@ -271,14 +274,17 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 );
             }
         }
-        if Regex::new(r"(?s)<!--(.*?)-->").is_ok_and(|comments| {
-            comments.captures_iter(&body).any(|c| {
+        let secret_comment = {
+            static COMMENTS: std::sync::LazyLock<Regex> =
+                std::sync::LazyLock::new(|| Regex::new(r"(?s)<!--(.*?)-->").unwrap());
+            COMMENTS.captures_iter(body).any(|c| {
                 re(
                     r#"(?i)\b(?:password|secret|api[_-]?key)\s*[:=]\s*["']?[A-Za-z0-9/+_=-]{8,}"#,
                     &c[1].chars().take(1024).collect::<String>(),
                 )
             })
-        }) {
+        };
+        if secret_comment {
             add(
                 "html-comment-secret",
                 Confidence::Tentative,
@@ -289,7 +295,7 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if re(
         r#"(?is)<cross-domain-policy\b.*<allow-access-from\b[^>]*\bdomain\s*=\s*["']\*["']"#,
-        &body,
+        body,
     ) {
         add(
             "flash-policy",
@@ -300,7 +306,7 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if re(
         r#"(?is)<access-policy\b.*<grant-to\b.*<domain\b[^>]*\buri\s*=\s*["']\*["']"#,
-        &body,
+        body,
     ) {
         add(
             "silverlight-policy",
@@ -311,7 +317,7 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if re(
         r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|mssql)://[^\s:/<>]+:[^\s@<>]+@[^\s<>]+",
-        &body,
+        body,
     ) {
         add(
             "database-connection",
@@ -322,7 +328,7 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if re(
         r"(?i)\b(?:SSN|social security number)\s*[:=#-]?\s*(?:00[1-9]|0[1-9][0-9]|[1-5][0-9]{2}|6[0-57-9][0-9]|[78][0-9]{2})-(?:0[1-9]|[1-9][0-9])-(?:[0-9]{3}[1-9]|[0-9]{2}[1-9][0-9]|[0-9][1-9][0-9]{2}|[1-9][0-9]{3})\b",
-        &body,
+        body,
     ) {
         add(
             "ssn-disclosure",
@@ -361,7 +367,7 @@ pub(super) fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             .ok()
             .is_some_and(|u| u.query_pairs().any(|(k, v)| k == "query" && !v.is_empty()));
     if graphql_request
-        && serde_json::from_str::<serde_json::Value>(&body)
+        && serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .is_some_and(|v| v.get("data").is_some() || v.get("errors").is_some())
     {
@@ -813,30 +819,34 @@ fn marker_in_response(flow: &Exchange, marker: &str) -> bool {
     })
 }
 
-pub(super) fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<Candidate> {
+pub(super) fn evaluate_cached(
+    probe: &Probe,
+    baseline: &CachedBaseline<'_>,
+    response: &Exchange,
+) -> Vec<Candidate> {
     let super::Matcher::Advanced(matcher) = &probe.matcher else {
         return vec![];
     };
     let Some((m, body)) = message(response) else {
         return vec![];
     };
-    let old = message(baseline).map_or(String::new(), |(_, b)| b);
+    let old = baseline.body.as_str();
     if response.error.is_some() {
         return vec![];
     }
     let (matched, confidence) = match matcher {
         Matcher::Error { pattern } => (
-            re(pattern, &body) && !re(pattern, &old),
+            re(pattern, &body) && !re(pattern, old),
             Confidence::Tentative,
         ),
         Matcher::Cors { origin } => {
-            let auth = Message::parse(&baseline.request)
+            let auth = Message::parse(&baseline.exchange.request)
                 .is_ok_and(|r| r.header("Cookie").is_some() || r.header("Authorization").is_some());
-            let same = Message::parse(&baseline.response).ok().is_some_and(|b| {
-                (200..300).contains(&b.status()) && !b.body.is_empty() && similar_content(&b, &m)
+            let same = baseline.message.as_ref().is_some_and(|b| {
+                (200..300).contains(&b.status()) && !b.body.is_empty() && similar_content(b, &m)
             });
             (
-                auth && baseline.destination.tls
+                auth && baseline.exchange.destination.tls
                     && same
                     && m.header("Access-Control-Allow-Origin") == Some(origin)
                     && m.header("Access-Control-Allow-Credentials")
@@ -881,7 +891,7 @@ pub(super) fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) 
         0,
         Evidence {
             label: "Baseline".into(),
-            exchange: baseline.clone(),
+            exchange: baseline.exchange.clone(),
         },
     );
     vec![c]

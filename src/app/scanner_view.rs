@@ -113,6 +113,7 @@ pub(super) struct State {
     hex: bool,
     response_cache: ResponseCache,
     seen: (u64, u64),
+    last_refresh: Option<std::time::Instant>,
     action: Option<(EntryAction, Exchange)>,
     export_open: bool,
     export_html: bool,
@@ -147,6 +148,7 @@ impl Default for State {
             hex: false,
             response_cache: ResponseCache::default(),
             seen: (u64::MAX, u64::MAX),
+            last_refresh: None,
             action: None,
             export_open: false,
             export_html: false,
@@ -242,6 +244,7 @@ impl State {
         self.selected_scan = Some(id);
         self.tab = Tab::Scans;
         self.seen = (u64::MAX, u64::MAX);
+        self.last_refresh = None;
     }
     pub fn take_action(&mut self) -> Option<(EntryAction, Exchange)> {
         self.action.take()
@@ -251,16 +254,28 @@ impl State {
             engine.scanner.activity.load(Ordering::SeqCst),
             engine.scanner.runner.activity.load(Ordering::SeqCst),
         );
-        if activity != self.seen {
-            let project = engine.project.lock().unwrap();
-            self.jobs = project.scan_jobs();
-            self.jobs.sort_by_key(|j| std::cmp::Reverse(j.id));
-            (self.findings, self.finding_members) = group_findings(project.findings());
-            self.finding_detail = None;
-            self.seen = activity;
-            if self.selected_scan.is_none() {
-                self.selected_scan = self.jobs.first().map(|j| j.id);
-            }
+        if activity == self.seen {
+            return;
+        }
+        // Deep-cloning every job and finding on each probe response is far more
+        // expensive than a redraw. Refresh at most five times per second; the
+        // final state is picked up on the next frame.
+        let now = std::time::Instant::now();
+        if self
+            .last_refresh
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(200))
+        {
+            return;
+        }
+        let project = engine.project.lock().unwrap();
+        self.jobs = project.scan_jobs();
+        self.jobs.sort_by_key(|j| std::cmp::Reverse(j.id));
+        (self.findings, self.finding_members) = group_findings(project.findings());
+        self.finding_detail = None;
+        self.seen = activity;
+        self.last_refresh = Some(now);
+        if self.selected_scan.is_none() {
+            self.selected_scan = self.jobs.first().map(|j| j.id);
         }
     }
     pub fn show(
@@ -343,6 +358,7 @@ impl State {
                 _ => scanner::runner::retry(engine.clone(), job.id)?,
             }
             self.seen = (u64::MAX, u64::MAX);
+            self.last_refresh = None;
         }
         let [mut table_ui, mut detail_ui] = split_panes(ui, "scanner-scans-split", true, 0.48);
         let table_height = table_ui.available_height().max(40.0);
@@ -815,6 +831,7 @@ impl State {
                         }
                         engine.scanner.activity.fetch_add(1, Ordering::SeqCst);
                         self.seen = (u64::MAX, u64::MAX);
+                        self.last_refresh = None;
                     }
                 }
             }

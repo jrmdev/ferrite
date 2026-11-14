@@ -8,7 +8,7 @@ The server exposes tools only. It contains no LLM integration, makes no decision
 
 1. Start Ferrite and open **MCP** in the sidebar.
 2. Select **Enable MCP server**. The status shows `Listening on 127.0.0.1:<port> (loopback only, token required)`.
-3. In your MCP client or agent harness, add a server using the **stdio** transport. Set the command to the full path to the Ferrite executable and the arguments to `mcp`. The MCP page shows a configuration with your executable path and a **Copy** button.
+3. Select **Connect an AI agent** and choose **This machine** or **Another machine**. The page shows copyable stdio configuration for your choice. On this machine, set the command to the full path to the Ferrite executable and the arguments to `mcp`.
 
    For clients that use an `mcpServers` JSON object, the configuration looks like this (see [examples/mcp.json](examples/mcp.json)):
 
@@ -21,7 +21,21 @@ The server exposes tools only. It contains no LLM integration, makes no decision
    ```
 
    Configuration formats and file locations differ between clients; consult your client's MCP setup instructions. On Windows, use the path to `ferrite.exe` and escape backslashes in JSON. The client launches `ferrite mcp` as a subprocess; do not configure the loopback bridge address as an MCP HTTP endpoint.
-4. Start or reconnect the client. Connected clients appear on Ferrite's MCP page.
+   For an agent on another machine, use SSH as the stdio command on the agent's machine. For example, when Ferrite's host uses a POSIX login shell:
+
+   ```json
+   {
+     "mcpServers": {
+       "ferrite": {
+         "command": "ssh",
+         "args": ["-T", "-o", "BatchMode=yes", "USER@FERRITE_HOST", "'/path/to/ferrite' mcp"]
+       }
+     }
+   }
+   ```
+
+   Replace the user and host with the SSH login for the Ferrite machine, and use the executable path shown on the MCP page. SSH must be installed on the agent's machine, enabled on the Ferrite machine, and configured for non-interactive authentication with the host key already trusted. Log in as the same user running Ferrite, with access to the same Ferrite configuration directory. For a Windows SSH host, quote the executable path for its configured login shell. SSH carries stdio; the loopback bridge remains private and is not an MCP HTTP endpoint.
+4. Start or reconnect the client. Connected agents appear on Ferrite's MCP page.
 5. Use the client's tool interface or ask its agent, for example:
    - "Using Ferrite, summarise the in-scope endpoints and which take parameters."
    - "Show me the last POST to /login in Ferrite and resend it with the username changed to bob."

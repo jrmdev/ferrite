@@ -102,6 +102,30 @@ fn persist(engine: &Engine, job: &mut ScanJob) -> Result<()> {
     notify(engine);
     Ok(())
 }
+/// Bound note writes and job snapshots. Progress is durable within a quarter
+/// second, while a large scan no longer serializes the complete job (including
+/// every selected request) once per probe response.
+fn persist_due(
+    engine: &Engine,
+    job: &mut ScanJob,
+    last: &mut Option<Instant>,
+    notes: &mut Vec<(String, u64, bool)>,
+    force: bool,
+) -> Result<()> {
+    let due = force
+        || notes.len() >= 4096
+        || last.is_none_or(|instant| instant.elapsed() >= Duration::from_millis(250));
+    if !due {
+        return Ok(());
+    }
+    if !notes.is_empty() {
+        let pending = std::mem::take(notes);
+        engine.project.lock().unwrap().put_scan_notes(&pending)?;
+    }
+    persist(engine, job)?;
+    *last = Some(Instant::now());
+    Ok(())
+}
 fn command_status(command: Command) -> ScanStatus {
     match command {
         Command::Run => ScanStatus::Running,
@@ -605,9 +629,10 @@ async fn execute_probe(
     item: usize,
     index: usize,
     probe: checks::Probe,
-    settings: ScanSettings,
+    mut settings: ScanSettings,
     mut control: watch::Receiver<Command>,
 ) -> Result<Outcome> {
+    settings.follow_redirects &= probe.follow_redirects();
     let mut exchanges = vec![];
     let association = format!("scan:{job_id};item:{item};probe:{index}");
     let attempts = if safe_to_retry(&probe) {
@@ -644,32 +669,46 @@ async fn execute_probe(
         exchanges,
     })
 }
+/// Completed probe indices plus the exchanges retained for combined checks.
+type SavedProbeState = (BTreeSet<usize>, Vec<(checks::Probe, Exchange)>);
+
+/// Saved probe state for one item. Completed indices are kept even when the
+/// matching exchange is dropped, so a resumed scan never needs to deserialize
+/// the full capture history. Exchanges are fetched only for checks that need a
+/// completed series.
 fn saved_pairs(
     engine: &Engine,
     job: u64,
     item: usize,
     probes: &[checks::Probe],
     retry_failed: bool,
-) -> Result<BTreeMap<usize, (checks::Probe, Exchange)>> {
+) -> Result<SavedProbeState> {
     let prefix = format!("scan:{job};item:{item};probe:");
-    let rows = engine.project.lock().unwrap().list()?;
-    let mut result = BTreeMap::new();
-    for flow in rows {
-        let Some(rest) = flow.note.strip_prefix(&prefix) else {
+    let rows = engine.project.lock().unwrap().scan_notes(&prefix)?;
+    let mut completed = BTreeSet::new();
+    let mut series = Vec::new();
+    for (note, id, ok) in rows {
+        let Some(rest) = note.strip_prefix(&prefix) else {
             continue;
         };
-        let Ok(index) = rest.split(';').next().unwrap_or("").parse::<usize>() else {
+        let Ok(index) = rest.parse::<usize>() else {
             continue;
         };
         if index >= probes.len() {
             continue;
         }
-        result.insert(index, (probes[index].clone(), flow));
+        if retry_failed && !ok {
+            continue;
+        }
+        completed.insert(index);
+        if ok && probes[index].needs_series() {
+            let flow = engine.project.lock().unwrap().get(id)?;
+            if let Some(flow) = flow {
+                series.push((probes[index].clone(), flow));
+            }
+        }
     }
-    if retry_failed {
-        result.retain(|_, (_, flow)| flow.error.is_none());
-    }
-    Ok(result)
+    Ok((completed, series))
 }
 async fn wait_running(
     engine: &Engine,
@@ -726,17 +765,23 @@ async fn run(
     job.status = ScanStatus::Running;
     job.message.clear();
     persist(&engine, &mut job)?;
-    let readbacks: Vec<_> = job
-        .items
-        .iter()
-        .filter(|item| matches!(item.source.method.as_str(), "GET" | "HEAD"))
-        .map(|item| {
-            let mut request = item.source.clone();
-            request.response.clear();
-            request
-        })
-        .collect();
+    let readbacks: Vec<_> = if job.settings.intrusive {
+        job.items
+            .iter()
+            .filter(|item| matches!(item.source.method.as_str(), "GET" | "HEAD"))
+            .map(|item| {
+                let mut request = item.source.clone();
+                request.response.clear();
+                request
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut consecutive_failures = 0usize;
+    let mut audited_tls = BTreeSet::new();
+    let mut pending_notes: Vec<(String, u64, bool)> = Vec::new();
+    let mut last_persist: Option<Instant> = None;
     'items: for item_index in 0..job.items.len() {
         if job.items[item_index].status == ScanStatus::Completed {
             continue;
@@ -752,12 +797,45 @@ async fn run(
             persist(&engine, &mut job)?;
             continue;
         }
+        let audited_this_item = source.destination.tls
+            && super::tls_checks::enabled(&job.settings)
+            && audited_tls.insert(source.destination.authority());
+        if audited_this_item {
+            let candidates = {
+                let audit = async {
+                    let _lease = acquire(&engine, false, &mut control.clone()).await?;
+                    Ok::<_, anyhow::Error>(
+                        super::tls_checks::audit(&engine, &job.settings, &source).await,
+                    )
+                };
+                tokio::pin!(audit);
+                let mut audit_control = control.clone();
+                loop {
+                    tokio::select! {
+                        findings = &mut audit => break findings?,
+                        change = audit_control.changed() => {
+                            if change.is_err() || matches!(*audit_control.borrow(), Command::Cancel | Command::Interrupt | Command::Failure) {
+                                break 'items;
+                            }
+                        }
+                    }
+                }
+            };
+            job.findings += engine.record_scan_candidates(
+                candidates,
+                ScanMode::Active,
+                Some(job.id),
+                &source,
+            )?;
+            persist(&engine, &mut job)?;
+        }
         let plan = (|| -> Result<(Vec<checks::Probe>, usize)> {
-            let mut probes = checks::active_plan(&source, &job.settings)?;
-            let mut skipped = 0;
+            let mut seed = source.clone();
+            seed.note = format!("scan:{};item:{item_index}", job.id);
+            let plan = checks::active_plan_with_stats(&seed, &job.settings)?;
+            let mut probes = plan.probes;
+            let mut skipped = plan.skipped;
             if job.settings.intrusive {
-                let mut seed = source.clone();
-                seed.note = format!("scan:{};item:{item_index}", job.id);
                 let stored = checks::stored_plan(&seed, &readbacks, &job.settings)?;
                 let mut bytes: usize = probes.iter().map(|probe| probe.request.len()).sum();
                 for group in stored.chunks(3) {
@@ -791,20 +869,27 @@ async fn run(
         };
         if probes.is_empty() {
             job.items[item_index].status = ScanStatus::Completed;
-            job.items[item_index].message = "No applicable enabled active checks".into();
+            job.items[item_index].message = if audited_this_item {
+                "TLS audit finished".into()
+            } else {
+                "No applicable enabled active checks".into()
+            };
             persist(&engine, &mut job)?;
             continue;
         }
         job.items[item_index].status = ScanStatus::Running;
         let baseline_note = format!("scan:{};item:{item_index};baseline", job.id);
-        let saved_baseline = engine
-            .project
-            .lock()
-            .unwrap()
-            .list()?
-            .into_iter()
-            .rfind(|v| v.note.starts_with(&baseline_note))
-            .filter(|v| v.error.is_none());
+        let saved_baseline = {
+            let project = engine.project.lock().unwrap();
+            project
+                .scan_notes(&baseline_note)?
+                .into_iter()
+                .find(|(note, _, ok)| note == &baseline_note && *ok)
+                .map(|(_, id, _)| project.get(id))
+                .transpose()?
+                .flatten()
+                .filter(|flow| flow.error.is_none())
+        };
         let baseline = if let Some(baseline) = saved_baseline {
             baseline
         } else {
@@ -859,7 +944,15 @@ async fn run(
             baseline
         };
         let baseline_denied = matches!(baseline.status, 401 | 403);
-        let mut completed = saved_pairs(&engine, job.id, item_index, &probes, retry_failed)?;
+        let evaluation = checks::CachedBaseline::new(&baseline);
+        pending_notes.push((baseline_note.clone(), baseline.id, true));
+        let (mut completed, mut series_results) =
+            saved_pairs(&engine, job.id, item_index, &probes, retry_failed)?;
+        let mut series_bytes: usize = series_results
+            .iter()
+            .map(|(_, flow)| flow.response.len())
+            .sum();
+        let mut series_dropped = false;
         let mut cursor = job.items[item_index].next_probe.min(probes.len());
         let mut tasks = JoinSet::new();
         let mut serial_pending = false;
@@ -885,7 +978,7 @@ async fn run(
                     }
                     let index = cursor;
                     cursor += 1;
-                    if completed.contains_key(&index) {
+                    if completed.contains(&index) {
                         continue;
                     }
                     if blocked_points.contains(&probes[index].insertion_point) || item_failed {
@@ -911,7 +1004,7 @@ async fn run(
                 break;
             }
             if tasks.is_empty() && command == Command::Pause {
-                persist(&engine, &mut job)?;
+                persist_due(&engine, &mut job, &mut last_persist, &mut pending_notes, true)?;
                 control.changed().await.context("Scanner control closed")?;
                 continue;
             }
@@ -930,7 +1023,7 @@ async fn run(
                     job.requests+=outcome.exchanges.len();
                     let mut candidates=vec![];
                     for response in &outcome.exchanges {
-                        if response.error.is_some(){job.failures+=1;job.items[item_index].failures+=1;consecutive_failures+=1;}else{consecutive_failures=0;candidates.extend(checks::evaluate(&outcome.probe,&baseline,response));}
+                        if response.error.is_some(){job.failures+=1;job.items[item_index].failures+=1;consecutive_failures+=1;}else{consecutive_failures=0;candidates.extend(checks::evaluate_cached(&evaluation,&outcome.probe,response));}
                     }
                     job.findings+=engine.record_scan_candidates(candidates,ScanMode::Active,Some(job.id),&source)?;
                     if let Some(response)=outcome.exchanges.last() {
@@ -940,20 +1033,44 @@ async fn run(
                             failed_points+=1;job.items[item_index].message=format!("Skipped insertion point {} after repeated transport failures",outcome.probe.insertion_point);
                             if job.settings.insertion_failure_limit>0&&failed_points>=job.settings.insertion_failure_limit{item_failed=true;}
                         }
-                        completed.insert(outcome.index,(outcome.probe,response.clone()));
+                        completed.insert(outcome.index);
+                        pending_notes.push((
+                            format!("scan:{};item:{item_index};probe:{}", job.id, outcome.index),
+                            response.id,
+                            response.error.is_none(),
+                        ));
+                        if outcome.probe.needs_series() && response.error.is_none() {
+                            series_bytes = series_bytes.saturating_add(response.response.len());
+                            if series_bytes <= 64 * 1024 * 1024 {
+                                series_results.push((outcome.probe.clone(), response.clone()));
+                            } else {
+                                series_dropped = true;
+                            }
+                        }
                     }
                     job.items[item_index].completed=completed.len();
-                    job.items[item_index].next_probe=(0..cursor).find(|index|!completed.contains_key(index)).unwrap_or(cursor);
+                    // Advance the resume cursor monotonically instead of
+                    // rescanning every prior index after each probe.
+                    let mut next = job.items[item_index].next_probe.min(cursor);
+                    while next < cursor && completed.contains(&next) {
+                        next += 1;
+                    }
+                    job.items[item_index].next_probe = next;
                     if job.settings.stop_after_failures>0&&consecutive_failures>=job.settings.stop_after_failures {
                         job.message=format!("{} consecutive transport failures",consecutive_failures);set_failure_action(&engine,job.id,job.settings.failure_action);consecutive_failures=0;
                     }
-                    persist(&engine,&mut job)?;
+                    persist_due(&engine,&mut job,&mut last_persist,&mut pending_notes,false)?;
                 }
             }
         }
-        let series: Vec<_> = completed.into_values().collect();
+        if series_dropped {
+            engine.log_error(format!(
+                "Scanner {} item {}: series evidence exceeded 64 MiB; some combined checks were not evaluated",
+                job.id, item_index
+            ));
+        }
         job.findings += engine.record_scan_candidates(
-            checks::evaluate_series(&baseline, &series),
+            checks::evaluate_series(&baseline, &series_results),
             ScanMode::Active,
             Some(job.id),
             &source,
@@ -978,7 +1095,13 @@ async fn run(
             job.message = "Failed audit item threshold reached".into();
             set_failure_action(&engine, job.id, job.settings.failure_action);
         }
-        persist(&engine, &mut job)?;
+        persist_due(
+            &engine,
+            &mut job,
+            &mut last_persist,
+            &mut pending_notes,
+            true,
+        )?;
     }
     let command = *control.borrow();
     if matches!(
@@ -996,17 +1119,9 @@ async fn run(
                 item.status = job.status;
             }
         }
-        // Cancellation drops in-flight futures; their recorder guards retain interrupted exchanges.
-        let prefix = format!("scan:{};", job.id);
-        let recorded = engine.project.lock().unwrap().list()?;
-        let rows: Vec<_> = recorded
-            .iter()
-            .filter(|v| v.note.starts_with(&prefix))
-            .collect();
-        job.requests = job.requests.max(rows.len());
-        job.failures = job
-            .failures
-            .max(rows.iter().filter(|v| v.error.is_some()).count());
+        // In-flight requests are aborted; their recorder guards may add a few
+        // exchanges that are not yet reflected in the counters. Counts remain a
+        // close lower bound without deserializing the complete capture history.
     } else {
         job.status = if job.items.iter().any(|v| v.status == ScanStatus::Failed) {
             ScanStatus::Failed
@@ -1018,7 +1133,13 @@ async fn run(
             job.requests, job.failures, job.skipped
         );
     }
-    persist(&engine, &mut job)
+    persist_due(&engine, &mut job, &mut last_persist, &mut pending_notes, true)?;
+    // Completed scans cannot resume. Failed and cancelled scans may be retried,
+    // so their note index is retained and pruned when the project is reopened.
+    if job.status == ScanStatus::Completed {
+        engine.project.lock().unwrap().clear_scan_notes(job.id)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

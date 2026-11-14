@@ -274,9 +274,7 @@ impl Workbench {
             } else {
                 "Open browser"
             })
-            .on_hover_text(
-                "Launch a dedicated Chromium window that routes through this listener and trusts Ferrite's CA",
-            )
+            .on_hover_text("Launch a dedicated browser window that routes through this listener")
             .clicked()
         {
             self.open_browser();
@@ -337,7 +335,7 @@ impl Workbench {
         ui.heading("Browser");
         ui.add(
             egui::Label::new(
-                RichText::new("A dedicated Chromium-family browser with an isolated profile. Its HTTP and HTTPS traffic, including loopback targets, passes through the Ferrite listener into History, Intercept and Target.")
+                RichText::new("A dedicated browser with an isolated profile. Its traffic is routed through Ferrite; Chromium browsers also trust Ferrite's CA automatically.")
                     .weak(),
             )
             .wrap(),
@@ -421,7 +419,9 @@ impl Workbench {
             .and_then(|process| process.devtools_url());
         let Some(devtools) = devtools else {
             ui.weak(if self.browser.process.is_some() {
-                if self.preferences.browser().devtools {
+                if self.browser.process.as_ref().is_some_and(|p| browser::is_firefox(p.executable())) {
+                    "Firefox is running through Ferrite. Import Ferrite's CA in Firefox to inspect HTTPS traffic without certificate errors. Tab controls are available for Chromium browsers."
+                } else if self.preferences.browser().devtools {
                     "Waiting for the browser's DevTools endpoint…"
                 } else {
                     "Enable DevTools controls in Browser settings to navigate from Ferrite. Use the browser window directly meanwhile."
@@ -542,6 +542,13 @@ impl Workbench {
             self.browser.extra_args = saved.extra_args.join("\n");
             saved.clone()
         });
+        let firefox_selected = if draft.executable.trim().is_empty() {
+            browser::candidates()
+                .first()
+                .is_some_and(|path| browser::is_firefox(path))
+        } else {
+            browser::is_firefox(std::path::Path::new(&draft.executable))
+        };
         egui::Grid::new("browser-settings")
             .num_columns(2)
             .spacing([12.0, 6.0])
@@ -564,7 +571,7 @@ impl Workbench {
                         .selected_text("Detected")
                         .show_ui(ui, |ui| {
                             if detected.is_empty() {
-                                ui.label("No Chromium-family browser found");
+                                ui.label("No supported browser found");
                             }
                             for path in detected.iter() {
                                 if ui
@@ -630,14 +637,18 @@ impl Workbench {
                 ui.end_row();
                 ui.label("");
                 ui.vertical(|ui| {
-                    ui.checkbox(
-                        &mut draft.devtools,
-                        "DevTools controls from Ferrite (random loopback port)",
-                    );
-                    ui.checkbox(
-                        &mut draft.quiet,
-                        "Suppress Chromium background traffic (sync, updates, telemetry)",
-                    );
+                    if !firefox_selected {
+                        ui.checkbox(
+                            &mut draft.devtools,
+                            "DevTools controls from Ferrite (random loopback port)",
+                        );
+                        ui.checkbox(
+                            &mut draft.quiet,
+                            "Suppress Chromium background traffic (sync, updates, telemetry)",
+                        );
+                    } else {
+                        ui.weak("Firefox proxy routing is configured in its isolated profile.");
+                    }
                 });
                 ui.end_row();
             });
@@ -695,12 +706,18 @@ impl Workbench {
             .authority
             .spki_sha256_base64()
             .unwrap_or_default();
-        ui.add(
-            egui::Label::new(RichText::new(format!(
-                "HTTPS trust: the browser accepts only certificates issued by Ferrite's current CA (public key pin {pin}), using Chromium's --ignore-certificate-errors-spki-list with the isolated profile. The operating system trust store is not changed and other browsers are unaffected."
-            )).weak())
-            .wrap(),
-        );
+        if firefox_selected {
+            ui.add(egui::Label::new(RichText::new(
+                "Firefox: import Ferrite's CA in Firefox Settings → Privacy & Security → Certificates → View Certificates → Authorities. This is required for HTTPS interception and affects this Firefox profile only."
+            ).weak()).wrap());
+        } else {
+            ui.add(
+                egui::Label::new(RichText::new(format!(
+                    "HTTPS trust: the browser accepts only certificates issued by Ferrite's current CA (public key pin {pin}), using Chromium's --ignore-certificate-errors-spki-list with the isolated profile. The operating system trust store is not changed and other browsers are unaffected."
+                )).weak())
+                .wrap(),
+            );
+        }
     }
 
     pub(super) fn complete_browser_pick(&mut self, path: PathBuf) {

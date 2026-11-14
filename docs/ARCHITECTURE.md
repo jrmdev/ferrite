@@ -47,7 +47,7 @@ The diagram describes Ferrite's implementation, not recovered Burp internals.
 | scanner | HTTP check registry, byte-preserving insertion points, passive analysis, active confirmation, shared resource scheduling, checkpoints, findings/evidence, and reports |
 | history | Serializable history filters, MIME/status classification, parameter and extension matching, compiled search |
 | history_export | Versioned selected-exchange JSON, streaming base64 messages, exchange metadata, private create-new files |
-| browser | Managed Chromium-family process: discovery, isolated temporary/persistent profiles, managed switches, CA public-key pin, bounded stderr capture, lifecycle and parent-death signal; `browser::cdp` is a loopback-only DevTools client |
+| browser | Managed Firefox and Chromium-family processes: discovery, isolated temporary/persistent profiles, proxy configuration, bounded stderr capture, lifecycle and parent-death signal. Chromium uses a CA public-key pin; Firefox uses profile proxy preferences and requires manual CA import. `browser::cdp` controls Chromium over a loopback-only DevTools client |
 | mcp | Model Context Protocol: `server` (rmcp over stdio, transport-independent `Backend`), `tools` (catalogue and execution), `host` (current engine, permissions, approvals, limits, clients, audit), `ipc` (authenticated loopback bridge and relay client), `redact` (credential headers) |
 | decoder | Pure byte transforms and chains for Decoder |
 | comparer | Line diffs with inline word/character changes and display wrapping for Comparer |

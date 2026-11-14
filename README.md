@@ -6,33 +6,7 @@ Built for speed, Ferrite uses a native UI and asynchronous networking.
 
 ## Screenshots
 
-**Settings**
-
-![Settings](screenshots/image1.png)
-
-**Proxy**
-
-![Proxy](screenshots/image2.png)
-
-**Target**
-
-![Target](screenshots/image3.png)
-
-**Intercept**
-
-![Intercept](screenshots/image4.png)
-
-**HTTP history**
-
-![HTTP history](screenshots/image5.png)
-
-**Scanner findings**
-
-![Scanner findings](screenshots/image6.png)
-
-**WebSocket history**
-
-![WebSocket history](screenshots/image7.png)
+![History](screenshots/ferrite1.png)
 
 ## Tools
 
@@ -78,7 +52,7 @@ Press Ctrl-C to stop the listener. Run `ferrite --help` for more options.
 ## MCP clients and agents
 
 1. Open **MCP** in Ferrite and select **Enable MCP server**.
-2. Add a stdio MCP server in your client or harness. Use the full path to the Ferrite executable as the command and `mcp` as its argument. The MCP page provides a copyable JSON example; configuration formats and locations vary by client.
+2. Select **Connect an AI agent** and choose this machine or another machine. The MCP page provides copyable stdio configuration, using SSH for an agent on another machine; configuration formats and locations vary by client.
 3. Start or reconnect your client, then use Ferrite's tools. For example, ask an agent: "Using Ferrite, list the in-scope endpoints that take parameters and resend the last login request as another user."
 
 Sending requests asks for your approval by default and is always limited to the target scope; active scans are disabled until you allow them. Credential headers are shown to the client as `[REDACTED]` and restored by Ferrite when requests are resent. Every call is recorded in the project's audit trail. Without the window, `ferrite mcp --headless --project assessment.ferrite` serves a project directly. See [MCP server](docs/MCP.md) for the tool reference and security model.

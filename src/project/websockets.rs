@@ -111,6 +111,41 @@ impl Project {
             Ok(self.ws_memory.get(&key).cloned())
         }
     }
+    pub fn delete_ws_session(&mut self, id: u64) -> Result<()> {
+        let session = self
+            .ws_sessions
+            .get(&id)
+            .context("WebSocket session does not exist")?;
+        ensure!(
+            session.state != SessionState::Open,
+            "Close the active WebSocket session before deleting it"
+        );
+        if let Some(db) = &self.db {
+            let tx = db.begin_write()?;
+            delete_tables(&tx, &[id])?;
+            tx.commit()?;
+        }
+        self.ws_sessions.remove(&id);
+        self.ws_summaries.retain(|(session, _), _| *session != id);
+        self.ws_memory.retain(|(session, _), _| *session != id);
+        Ok(())
+    }
+    pub fn export_ws_session(&self, id: u64) -> Result<Vec<u8>> {
+        let session = self
+            .ws_session(id)
+            .context("WebSocket session does not exist")?;
+        let messages: Vec<_> = self
+            .ws_summaries(id)
+            .iter()
+            .map(|summary| {
+                self.ws_message(id, summary.sequence)?
+                    .context("WebSocket message is missing")
+            })
+            .collect::<Result<_>>()?;
+        Ok(serde_json::to_vec_pretty(
+            &serde_json::json!({"session": session, "messages": messages}),
+        )?)
+    }
     pub fn put_ws_session(&mut self, session: Session) -> Result<()> {
         if let Some(db) = &self.db {
             let tx = db.begin_write()?;

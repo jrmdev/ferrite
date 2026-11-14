@@ -10,9 +10,16 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::sync::{Arc, atomic::Ordering};
 
+pub(super) enum Action {
+    Delete(u64),
+    Export(u64),
+}
+
 pub(super) struct State {
     pub show_history: bool,
     pub reveal_handshake: Option<u64>,
+    pub action: Option<Action>,
+    delete_open_dialog: bool,
     session: Option<u64>,
     selected: Option<u64>,
     seen: u64,
@@ -36,6 +43,8 @@ impl Default for State {
         Self {
             show_history: false,
             reveal_handshake: None,
+            action: None,
+            delete_open_dialog: false,
             session: None,
             selected: None,
             seen: u64::MAX,
@@ -57,6 +66,32 @@ impl Default for State {
 }
 
 impl State {
+    pub fn delete_session(&mut self, engine: &Engine, id: u64) -> anyhow::Result<()> {
+        let mut project = engine.project.lock().unwrap();
+        if project
+            .ws_session(id)
+            .is_some_and(|session| session.state == SessionState::Open)
+        {
+            self.delete_open_dialog = true;
+            return Ok(());
+        }
+        project.delete_ws_session(id)?;
+        engine.websockets.activity.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn dialogs(&mut self, ctx: &egui::Context) {
+        if self.delete_open_dialog {
+            egui::Modal::new(egui::Id::new("websocket-delete-open")).show(ctx, |ui| {
+                ui.heading("Cannot delete WebSocket session");
+                ui.label("This WebSocket session cannot be deleted while it is open. Close the session first.");
+                if ui.button("OK").clicked() {
+                    self.delete_open_dialog = false;
+                }
+            });
+        }
+    }
+
     fn refresh(&mut self, engine: &Engine) -> anyhow::Result<()> {
         let activity = engine.websockets.activity.load(Ordering::SeqCst);
         let project = engine.project.lock().unwrap();
@@ -312,6 +347,16 @@ impl State {
                                     ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
                             }
+                            row.response().context_menu(|ui| {
+                                if ui.button("Delete").clicked() {
+                                    self.action = Some(Action::Delete(session.id));
+                                    ui.close();
+                                }
+                                if ui.button("Export...").clicked() {
+                                    self.action = Some(Action::Export(session.id));
+                                    ui.close();
+                                }
+                            });
                             if row.response().clicked() {
                                 row.response()
                                     .ctx
@@ -728,6 +773,52 @@ mod tests {
         state.forwarded = true;
         state.render_payload();
         assert_eq!(&*state.detail, "[No forwarded payload: Dropped]");
+    }
+
+    #[test]
+    fn export_and_delete_session_preserve_payloads_and_reject_open_sessions() {
+        let mut project = Project::temporary();
+        project
+            .put_ws_session(Session {
+                id: 1,
+                url: "wss://example.test/".into(),
+                opened_ms: 1,
+                closed_ms: None,
+                state: SessionState::Open,
+                subprotocol: String::new(),
+                message_count: 1,
+                close_code: None,
+                close_reason: String::new(),
+                error: None,
+            })
+            .unwrap();
+        let mut captured = message(1);
+        captured.original = vec![0, 255];
+        captured.forwarded = Some(vec![1, 254]);
+        project.put_ws_message(captured).unwrap();
+        let export: serde_json::Value =
+            serde_json::from_slice(&project.export_ws_session(1).unwrap()).unwrap();
+        assert_eq!(
+            export["messages"][0]["original"],
+            serde_json::json!([0, 255])
+        );
+        assert_eq!(
+            export["messages"][0]["forwarded"],
+            serde_json::json!([1, 254])
+        );
+        assert!(project.delete_ws_session(1).is_err());
+        let engine = Engine::new(project).unwrap();
+        let mut state = State::default();
+        state.delete_session(&engine, 1).unwrap();
+        assert!(state.delete_open_dialog);
+        assert!(engine.project.lock().unwrap().ws_session(1).is_some());
+        let mut project = engine.project.lock().unwrap();
+        let mut session = project.ws_session(1).unwrap();
+        session.state = SessionState::Closed;
+        project.put_ws_session(session).unwrap();
+        project.delete_ws_session(1).unwrap();
+        assert!(project.ws_session(1).is_none());
+        assert!(project.ws_message(1, 1).unwrap().is_none());
     }
 
     #[test]

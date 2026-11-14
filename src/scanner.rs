@@ -3,9 +3,10 @@ pub mod checks;
 mod engine;
 pub mod report;
 pub mod runner;
+mod tls_checks;
 
 /// Bump whenever probe generation/order or confirmation semantics change.
-pub const CHECK_VERSION: u32 = 4;
+pub const CHECK_VERSION: u32 = 6;
 
 use crate::model::Exchange;
 use serde::{Deserialize, Serialize};

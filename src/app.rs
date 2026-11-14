@@ -68,6 +68,7 @@ enum FileAction {
     ExportCertificate,
     LoadPayloadSet(usize),
     BrowserExecutable,
+    ExportWebSocket(u64),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchAction {
@@ -861,8 +862,13 @@ impl Workbench {
                     .set_title(format!("Load payload set {}", index + 1))
                     .add_filter("Payload list", &["txt", "lst", "csv"])
                     .pick_file(),
+                FileAction::ExportWebSocket(id) => rfd::FileDialog::new()
+                    .set_title("Export WebSocket messages")
+                    .add_filter("JSON", &["json"])
+                    .set_file_name(format!("websocket-{id}.json"))
+                    .save_file(),
                 FileAction::BrowserExecutable => rfd::FileDialog::new()
-                    .set_title("Choose a Chromium-family browser executable")
+                    .set_title("Choose a browser executable")
                     .pick_file(),
             };
             let _ = tx.send(Event::FileDialog(action, path));
@@ -904,6 +910,21 @@ impl Workbench {
                     }
                 } else if matches!(self.switch_state, Some(SwitchState::Saving(_))) {
                     self.switch_state = None;
+                }
+            }
+            FileAction::ExportWebSocket(id) => {
+                let result = self
+                    .engine
+                    .project
+                    .lock()
+                    .unwrap()
+                    .export_ws_session(id)
+                    .and_then(|data| Ok(std::fs::write(&path, data)?));
+                if self.report(result).is_some() {
+                    self.notify(
+                        "WebSockets",
+                        format!("Messages exported to {}", path.display()),
+                    );
                 }
             }
             FileAction::BrowserExecutable => self.complete_browser_pick(path),
@@ -2251,8 +2272,11 @@ impl Workbench {
                     }
                 });
             }
+            let mut verify_changed = false;
             ui.horizontal(|ui| {
-                ui.checkbox(&mut s.verify_tls, "Verify upstream TLS certificates");
+                verify_changed = ui
+                    .checkbox(&mut s.verify_tls, "Verify upstream TLS certificates")
+                    .changed();
                 ui.label("Timeout seconds");
                 ui.add(egui::DragValue::new(&mut s.timeout_secs).range(1..=3600));
             });
@@ -2309,11 +2333,17 @@ impl Workbench {
                 });
             }
             self.settings_json = serde_json::to_string_pretty(&s).unwrap();
-            if s.rules != rules_before {
+            if s.rules != rules_before || verify_changed {
                 let mut configured = self.engine.settings();
-                configured.rules = s.rules;
+                configured.rules = s.rules.clone();
+                if verify_changed {
+                    configured.verify_tls = s.verify_tls;
+                }
                 let result = self.engine.configure(configured);
-                self.report(result);
+                if self.report(result).is_none() && verify_changed {
+                    s.verify_tls = self.engine.settings().verify_tls;
+                    self.settings_json = serde_json::to_string_pretty(&s).unwrap();
+                }
             }
         }
         egui::CollapsingHeader::new(
@@ -2497,6 +2527,15 @@ impl eframe::App for Workbench {
                         let result =
                             self.websocket_view
                                 .show(ui, &self.engine, self.preferences.timezone());
+                        if let Some(action) = self.websocket_view.action.take() {
+                            match action {
+                                websocket_view::Action::Delete(id) => {
+                                    let result = self.websocket_view.delete_session(&self.engine, id);
+                                    self.report(result);
+                                }
+                                websocket_view::Action::Export(id) => self.choose_file(ui.ctx(), FileAction::ExportWebSocket(id)),
+                            }
+                        }
                         if let Some(Some(id)) = self.report(result) {
                             self.websocket_view.show_history = false;
                             self.websocket_view.reveal_handshake = Some(id);
@@ -2542,6 +2581,7 @@ impl eframe::App for Workbench {
         self.browser_dialogs(ctx);
         self.mcp_dialogs(ctx);
         self.comment_dialog(ctx);
+        self.websocket_view.dialogs(ctx);
         if let Some(mut export) = self.history_export.take() {
             match export.show(ctx) {
                 ExportOutcome::Saved(message) => self.notify("History", message),

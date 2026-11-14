@@ -37,6 +37,31 @@ async fn connect_protocol(
     offer_h2: bool,
     force_tunnel: bool,
 ) -> Result<(Stream, bool)> {
+    let tcp = connect_tcp(dest, settings, force_tunnel).await?;
+    if !dest.tls {
+        return Ok((Box::new(tcp), false));
+    }
+    let alpn = if offer_h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
+    let tls = connect_tls(
+        tcp,
+        dest,
+        alpn,
+        (!settings.verify_tls).then(|| Arc::new(Unverified) as Arc<dyn ServerCertVerifier>),
+    )
+    .await?;
+    let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+    Ok((Box::new(tls), h2))
+}
+
+pub(crate) async fn connect_tcp(
+    dest: &Destination,
+    settings: &Settings,
+    force_tunnel: bool,
+) -> Result<TcpStream> {
     let upstream = &settings.upstream;
     let connect_host = settings
         .dns_overrides
@@ -155,33 +180,31 @@ async fn connect_protocol(
             tcp.read_exact(&mut discard).await?;
         }
     }
-    if !dest.tls {
-        return Ok((Box::new(tcp), false));
-    }
+    Ok(tcp)
+}
+
+pub(crate) async fn connect_tls(
+    tcp: TcpStream,
+    dest: &Destination,
+    alpn: Vec<Vec<u8>>,
+    verifier: Option<Arc<dyn ServerCertVerifier>>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = if offer_h2 {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-    } else {
-        vec![b"http/1.1".to_vec()]
-    };
-    if !settings.verify_tls {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(Unverified));
+    config.alpn_protocols = alpn;
+    if let Some(verifier) = verifier {
+        config.dangerous().set_certificate_verifier(verifier);
     }
     let server = ServerName::try_from(dest.host.clone())?;
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(server, tcp)
-        .await?;
-    let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-    Ok((Box::new(tls), h2))
+        .await?)
 }
 #[derive(Debug)]
-struct Unverified;
+pub(crate) struct Unverified;
 impl ServerCertVerifier for Unverified {
     fn verify_server_cert(
         &self,

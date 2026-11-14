@@ -3,6 +3,13 @@ use crate::scanner::{Finding, ScanJob, ScanStatus};
 
 const JOBS: TableDefinition<u64, &[u8]> = TableDefinition::new("scanner_jobs");
 const FINDINGS: TableDefinition<u64, &[u8]> = TableDefinition::new("scanner_findings");
+/// Maps a resumable scan note (`scan:{job};item:{item};probe:{n}` or
+/// `...;baseline`) to the exchange that satisfied it. This avoids deserializing
+/// the complete capture history for every scan item on resume.
+const NOTES: TableDefinition<&str, &[u8]> = TableDefinition::new("scanner_notes");
+/// Retained evidence per finding. Repeated passive observations must not grow a
+/// finding without bound.
+const EVIDENCE_LIMIT: usize = 8;
 
 impl Project {
     pub(super) fn load_scanner(&mut self) -> Result<()> {
@@ -12,6 +19,7 @@ impl Project {
         let tx = db.begin_write()?;
         tx.open_table(JOBS)?;
         tx.open_table(FINDINGS)?;
+        tx.open_table(NOTES)?;
         tx.commit()?;
         {
             let tx = db.begin_read()?;
@@ -46,6 +54,32 @@ impl Project {
             }
             self.put_scan_job(job)?;
         }
+        // A finished job cannot resume, so its note index is dead weight.
+        let finished: Vec<u64> = self
+            .scan_jobs
+            .values()
+            .filter(|job| !matches!(job.status, ScanStatus::Interrupted))
+            .map(|job| job.id)
+            .collect();
+        for id in finished {
+            self.clear_scan_notes(id)?;
+        }
+        if let Some(db) = &self.db {
+            let tx = db.begin_read()?;
+            for item in tx.open_table(NOTES)?.iter()? {
+                let (key, value) = item?;
+                let Ok(text) = std::str::from_utf8(value.value()) else {
+                    continue;
+                };
+                let Some((id, ok)) = text.split_once(':') else {
+                    continue;
+                };
+                if let Ok(id) = id.parse::<u64>() {
+                    self.scan_index
+                        .insert(key.value().to_owned(), (id, ok == "1"));
+                }
+            }
+        }
         Ok(())
     }
     pub fn allocate_scan_id(&self) -> u64 {
@@ -68,6 +102,62 @@ impl Project {
             tx.commit()?;
         }
         self.scan_jobs.insert(job.id, job);
+        Ok(())
+    }
+    /// Batch note writes into one transaction.
+    pub(crate) fn put_scan_notes(&mut self, notes: &[(String, u64, bool)]) -> Result<()> {
+        if notes.is_empty() {
+            return Ok(());
+        }
+        for (note, exchange, ok) in notes {
+            self.scan_index.insert(note.clone(), (*exchange, *ok));
+        }
+        if let Some(db) = &self.db {
+            let tx = db.begin_write()?;
+            {
+                let mut table = tx.open_table(NOTES)?;
+                for (note, exchange, ok) in notes {
+                    let value = format!("{exchange}:{}", u8::from(*ok));
+                    table.insert(note.as_str(), value.as_bytes())?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+    /// Note entries for one prefix, ordered by note. Reads the in-memory index
+    /// rather than the capture history.
+    pub(crate) fn scan_notes(&self, prefix: &str) -> Result<Vec<(String, u64, bool)>> {
+        Ok(self
+            .scan_index
+            .range(prefix.to_owned()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, (id, ok))| (key.clone(), *id, *ok))
+            .collect())
+    }
+    pub(crate) fn clear_scan_notes(&mut self, job: u64) -> Result<()> {
+        let prefix = format!("scan:{job};");
+        self.scan_index
+            .retain(|key, _| !key.starts_with(&prefix));
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        let tx = db.begin_write()?;
+        {
+            let mut table = tx.open_table(NOTES)?;
+            let keys: Vec<String> = table
+                .iter()?
+                .filter_map(|item| {
+                    let (key, _) = item.ok()?;
+                    let key = key.value();
+                    key.starts_with(&prefix).then(|| key.to_owned())
+                })
+                .collect();
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn findings(&self) -> Vec<Finding> {
@@ -93,7 +183,14 @@ impl Project {
         self.findings.insert(finding.id, finding);
         Ok(())
     }
-    pub fn upsert_finding(&mut self, mut incoming: Finding) -> Result<Finding> {
+    /// Merge a candidate into the finding set.
+    pub fn upsert_finding(&mut self, incoming: Finding) -> Result<Finding> {
+        Ok(self.upsert_finding_tracked(incoming)?.0)
+    }
+    /// Merge a candidate and report whether it was created or newly associated
+    /// with one of its scan ids, so callers do not need to rescan every finding
+    /// to compute a delta.
+    pub fn upsert_finding_tracked(&mut self, mut incoming: Finding) -> Result<(Finding, bool)> {
         fn location(f: &Finding) -> String {
             url::Url::parse(&f.url)
                 .map(|mut u| {
@@ -102,6 +199,27 @@ impl Project {
                     u.to_string()
                 })
                 .unwrap_or_else(|_| f.url.clone())
+        }
+        fn push_evidence(finding: &mut Finding, evidence: crate::scanner::Evidence) {
+            let duplicate = finding.evidence.iter().any(|existing| {
+                existing.label == evidence.label
+                    && existing.exchange.request == evidence.exchange.request
+                    && existing.exchange.response == evidence.exchange.response
+            });
+            if duplicate {
+                return;
+            }
+            finding.evidence.push(evidence);
+            if finding.evidence.len() > EVIDENCE_LIMIT {
+                // Keep the earliest context (usually the control/baseline) and
+                // the newest observations instead of letting the list grow.
+                let tail = EVIDENCE_LIMIT / 2;
+                let head = EVIDENCE_LIMIT - tail;
+                let split = finding.evidence.len() - tail;
+                let newest = finding.evidence.split_off(split);
+                finding.evidence.truncate(head);
+                finding.evidence.extend(newest);
+            }
         }
         let existing = self
             .findings
@@ -114,6 +232,10 @@ impl Project {
             })
             .cloned();
         if let Some(mut finding) = existing {
+            let attached = incoming
+                .scan_ids
+                .iter()
+                .any(|id| !finding.scan_ids.contains(id));
             finding.last_seen_ms = incoming.last_seen_ms;
             finding.occurrences = finding.occurrences.saturating_add(1);
             finding.confidence = finding.confidence.max(incoming.confidence);
@@ -128,17 +250,25 @@ impl Project {
                 }
             }
             for evidence in incoming.evidence {
-                finding.evidence.push(evidence);
+                push_evidence(&mut finding, evidence);
             }
             self.put_finding(finding.clone())?;
-            Ok(finding)
+            Ok((finding, attached))
         } else {
+            let attached = true;
             incoming.id = self
                 .findings
                 .last_key_value()
                 .map_or(1, |(id, _)| id.saturating_add(1));
+            if incoming.evidence.len() > EVIDENCE_LIMIT {
+                let tail = EVIDENCE_LIMIT / 2;
+                let split = incoming.evidence.len() - tail;
+                let newest = incoming.evidence.split_off(split);
+                incoming.evidence.truncate(EVIDENCE_LIMIT - tail);
+                incoming.evidence.extend(newest);
+            }
             self.put_finding(incoming.clone())?;
-            Ok(incoming)
+            Ok((incoming, attached))
         }
     }
     pub(super) fn copy_scanner(&self, dest: &mut Project) -> Result<()> {
@@ -148,6 +278,12 @@ impl Project {
         for finding in self.findings.values() {
             dest.put_finding(finding.clone())?;
         }
+        let notes: Vec<_> = self
+            .scan_index
+            .iter()
+            .map(|(note, (id, ok))| (note.clone(), *id, *ok))
+            .collect();
+        dest.put_scan_notes(&notes)?;
         Ok(())
     }
 }

@@ -12,9 +12,16 @@ use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use rand_core::OsRng;
 use regex::Regex;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use std::{collections::BTreeSet, io::Read};
+use std::{
+    collections::BTreeSet,
+    io::Read,
+    sync::LazyLock,
+};
 mod advanced;
+mod charset;
+mod reflection;
 mod stored;
+mod stylesheet;
 
 #[derive(Clone, Debug)]
 pub struct Probe {
@@ -36,6 +43,8 @@ enum Matcher {
         token: String,
         payload: String,
     },
+    ReflectedInput(String),
+    Stylesheet(stylesheet::ProbePart),
     Header(String),
     Redirect(String),
     Cors(String),
@@ -65,9 +74,15 @@ enum FileKind {
     AspTrace,
     PhpInfo,
     WebConfig,
+    Actuator,
+    Aws,
+    DsStore,
+    ServerStatus,
+    Elmah,
+    Svn,
 }
 
-pub fn definitions() -> Vec<IssueDefinition> {
+fn build_definitions() -> Vec<IssueDefinition> {
     use Severity::*;
     let rows = [
         (
@@ -121,19 +136,29 @@ pub fn definitions() -> Vec<IssueDefinition> {
             "Set a single unambiguous value for each cookie scope.",
         ),
         (
+            "cookie-invalid",
+            "Cookie violates browser prefix or SameSite requirements",
+            Low,
+            true,
+            false,
+            false,
+            "A cookie uses a __Host- or __Secure- prefix without the required attributes, or declares SameSite=None without Secure; browsers reject such cookies.",
+            "For __Host- set Secure, Path=/ and omit Domain; for SameSite=None always set Secure.",
+        ),
+        (
             "hsts",
             "Strict transport security not enforced",
             Low,
             true,
             false,
             false,
-            "An HTTPS HTML response lacks a positive HSTS policy.",
+            "An HTTPS response lacks a positive HSTS policy.",
             "Serve Strict-Transport-Security with an appropriate positive max-age.",
         ),
         (
             "clickjacking",
             "Frameable HTML response",
-            Low,
+            Information,
             true,
             false,
             false,
@@ -143,7 +168,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "csp-unsafe-script",
             "CSP permits unsafe script execution",
-            Low,
+            Information,
             true,
             false,
             false,
@@ -183,7 +208,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "password-url",
             "Password in URL query",
-            Medium,
+            Low,
             true,
             false,
             false,
@@ -203,7 +228,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "mixed-content",
             "Mixed active content",
-            Medium,
+            Information,
             true,
             false,
             false,
@@ -223,7 +248,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "private-key",
             "Private key disclosed",
-            High,
+            Information,
             true,
             false,
             false,
@@ -253,7 +278,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "credit-card",
             "Payment card number disclosed",
-            Medium,
+            Information,
             true,
             false,
             false,
@@ -283,7 +308,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "source-code",
             "Server source code disclosed",
-            Medium,
+            Low,
             true,
             false,
             false,
@@ -293,7 +318,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "directory-listing",
             "Directory listing",
-            Low,
+            Information,
             true,
             false,
             false,
@@ -401,9 +426,19 @@ pub fn definitions() -> Vec<IssueDefinition> {
             "Declare UTF-8 through Content-Type or a charset meta element.",
         ),
         (
+            "charset-unrecognized",
+            "HTML uses unrecognized charset",
+            Information,
+            true,
+            false,
+            false,
+            "The HTML declares a character encoding that browsers do not recognize and has no recognized fallback declaration.",
+            "Declare a recognized encoding such as UTF-8 and encode the document accordingly.",
+        ),
+        (
             "cache-sensitive",
             "Authenticated response explicitly public-cacheable",
-            Medium,
+            Information,
             true,
             false,
             false,
@@ -413,7 +448,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "static-dom",
             "Potential DOM injection in captured JavaScript",
-            Medium,
+            High,
             true,
             false,
             false,
@@ -423,7 +458,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "sql-request",
             "SQL statement in request parameter",
-            Information,
+            Medium,
             true,
             false,
             false,
@@ -473,7 +508,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "referer-leak",
             "Sensitive data leaked through cross-domain Referer",
-            Medium,
+            Information,
             true,
             false,
             false,
@@ -499,6 +534,36 @@ pub fn definitions() -> Vec<IssueDefinition> {
             false,
             "A captured HTML form submits data to another host.",
             "Review the trust boundary and protect sensitive form submissions.",
+        ),
+        (
+            "meta-refresh-external",
+            "Meta refresh navigates to another origin",
+            Low,
+            true,
+            false,
+            false,
+            "An HTML meta refresh directive sends the browser to a different origin.",
+            "Use server-side redirects to allowlisted destinations and avoid script-controlled refresh targets.",
+        ),
+        (
+            "target-blank-noopener",
+            "New-tab link without noopener",
+            Low,
+            true,
+            false,
+            false,
+            "A target=_blank link does not declare rel=noopener or rel=noreferrer, so the opened page can access window.opener.",
+            "Add rel=\"noopener noreferrer\" to links that open a new browsing context.",
+        ),
+        (
+            "javascript-uri",
+            "JavaScript URI in an HTML attribute",
+            Low,
+            true,
+            false,
+            false,
+            "An HTML attribute uses a javascript: URI, which executes script in the page origin.",
+            "Use event handlers with normal URLs or application routing instead of javascript: URIs.",
         ),
         (
             "asp-trace",
@@ -529,6 +594,56 @@ pub fn definitions() -> Vec<IssueDefinition> {
             false,
             "An exposed web.config includes application configuration sections.",
             "Prevent configuration files from being served as static content.",
+        ),
+        (
+            "aws-credentials",
+            "AWS credentials file disclosed",
+            High,
+            false,
+            true,
+            false,
+            "A response contains an AWS shared-credentials file with an access key.",
+            "Deny web access to credential files and rotate the disclosed keys.",
+        ),
+        (
+            "ds-store",
+            "macOS metadata file exposed",
+            Information,
+            false,
+            true,
+            false,
+            "A .DS_Store response contains the Finder metadata signature.",
+            "Remove hidden desktop metadata from deployed directories.",
+        ),
+        (
+            "server-status",
+            "Server status page exposed",
+            Medium,
+            false,
+            true,
+            false,
+            "A mod_status page lists recent requests and server performance data.",
+            "Restrict status handlers to trusted management networks.",
+        ),
+        (
+            "elmah",
+            "Error log handler exposed",
+            Medium,
+            false,
+            true,
+            false,
+            "An ELMAH error log interface exposes recorded exception details.",
+            "Restrict the error log handler and remove it from production endpoints.",
+        ),
+        (
+            "svn-metadata",
+            "Subversion metadata exposed",
+            Medium,
+            false,
+            true,
+            false,
+            "A Subversion administrative directory lists repository entries.",
+            "Remove version-control metadata from the web root.",
         ),
         (
             "sqli-error",
@@ -569,6 +684,36 @@ pub fn definitions() -> Vec<IssueDefinition> {
             false,
             "A unique executable HTML marker is returned unescaped in an HTML response.",
             "Apply context-aware output encoding and avoid unsafe HTML construction.",
+        ),
+        (
+            "input-reflected",
+            "Input returned in response (reflected)",
+            Information,
+            false,
+            true,
+            false,
+            "A unique request marker was returned in the immediate response.",
+            "Review the context where input is returned and apply context-appropriate encoding.",
+        ),
+        (
+            "input-transformed",
+            "Suspicious input transformation (reflected)",
+            Information,
+            false,
+            true,
+            false,
+            "Percent escapes, JavaScript escapes, or numeric character references in input are returned decoded in the immediate response.",
+            "Apply validation after canonicalization and apply output encoding for the destination context.",
+        ),
+        (
+            "path-relative-stylesheet",
+            "Path-relative style sheet import",
+            Information,
+            false,
+            true,
+            false,
+            "An added path segment changes a relative stylesheet URL to an HTML response that contains controlled input.",
+            "Use root-relative stylesheet URLs and serve stylesheets as text/css with X-Content-Type-Options: nosniff.",
         ),
         (
             "header-injection",
@@ -661,9 +806,19 @@ pub fn definitions() -> Vec<IssueDefinition> {
             "Disable DTDs and external entity resolution.",
         ),
         (
+            "xinclude",
+            "XML XInclude file disclosure",
+            High,
+            false,
+            true,
+            false,
+            "An XInclude element resolves a local file into the application response.",
+            "Disable XInclude processing for untrusted documents.",
+        ),
+        (
             "graphql-introspection",
             "GraphQL introspection enabled",
-            Information,
+            Low,
             false,
             true,
             false,
@@ -673,7 +828,7 @@ pub fn definitions() -> Vec<IssueDefinition> {
         (
             "trace",
             "HTTP TRACE enabled",
-            Low,
+            Information,
             false,
             true,
             false,
@@ -799,7 +954,22 @@ pub fn definitions() -> Vec<IssueDefinition> {
         )
         .chain(advanced::definitions())
         .chain(stored::definitions())
+        .chain(super::tls_checks::definitions())
         .collect()
+}
+
+fn catalog() -> &'static [IssueDefinition] {
+    static CATALOG: std::sync::OnceLock<Vec<IssueDefinition>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(build_definitions)
+}
+
+pub fn definitions() -> Vec<IssueDefinition> {
+    catalog().to_vec()
+}
+
+/// Cached definition lookup for hot paths such as finding ingestion.
+pub fn definition(id: &str) -> Option<&'static IssueDefinition> {
+    catalog().iter().find(|definition| definition.id == id)
 }
 
 fn candidate(
@@ -822,18 +992,7 @@ fn candidate(
     }
 }
 fn issue_severity(id: &str) -> Severity {
-    static SEVERITIES: std::sync::OnceLock<std::collections::BTreeMap<String, Severity>> =
-        std::sync::OnceLock::new();
-    SEVERITIES
-        .get_or_init(|| {
-            definitions()
-                .into_iter()
-                .map(|d| (d.id, d.severity))
-                .collect()
-        })
-        .get(id)
-        .copied()
-        .unwrap_or(Severity::Information)
+    definition(id).map_or(Severity::Information, |definition| definition.severity)
 }
 fn re(pattern: &str, value: &str) -> bool {
     static REGEXES: std::sync::OnceLock<
@@ -861,6 +1020,16 @@ fn is_json(message: &Message) -> bool {
         .header("Content-Type")
         .is_some_and(|v| v.to_ascii_lowercase().contains("json"))
 }
+/// All values for a repeated header. Security headers are frequently sent more
+/// than once, and only reading the first occurrence manufactures findings when
+/// a later, stricter header is present.
+fn header_values<'a>(message: &'a Message, name: &'a str) -> impl Iterator<Item = &'a str> {
+    message
+        .headers
+        .iter()
+        .filter(move |(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
 /// Return the source list for the first matching CSP directive. Directive names
 /// are case-insensitive and the first occurrence wins, matching browser policy
 /// parsing.
@@ -877,23 +1046,21 @@ fn csp_sources(policy: &str, directives: &[&str]) -> Option<Vec<String>> {
     None
 }
 fn csp_policies(response: &Message, body: &str) -> Vec<String> {
+    static META_TAG: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<meta\b[^>]*>").unwrap());
+    static META_ATTR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)([a-zA-Z-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap()
+    });
     let mut policies: Vec<String> = response
         .headers
         .iter()
         .filter(|(key, _)| key.eq_ignore_ascii_case("Content-Security-Policy"))
         .flat_map(|(_, value)| value.split(',').map(str::trim).map(str::to_owned))
         .collect();
-    let Ok(meta) = Regex::new(r"(?is)<meta\b[^>]*>") else {
-        return policies;
-    };
-    let Ok(attrs) = Regex::new(r#"(?is)([a-zA-Z-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
-    else {
-        return policies;
-    };
-    for tag in meta.find_iter(body) {
+    for tag in META_TAG.find_iter(body) {
         let mut is_csp = false;
         let mut content = None;
-        for captures in attrs.captures_iter(tag.as_str()) {
+        for captures in META_ATTR.captures_iter(tag.as_str()) {
             let name = &captures[1];
             let value = captures
                 .get(2)
@@ -993,6 +1160,7 @@ fn bounded_body(message: &Message, limit: usize) -> Option<Vec<u8>> {
     }
     Some(body)
 }
+
 fn text_body(message: &Message, limit: usize) -> Option<String> {
     let body = bounded_body(message, limit)?;
     let media_type = message
@@ -1119,6 +1287,38 @@ fn openapi(body: &str) -> bool {
     re(r#"(?im)^\s*(?:openapi|swagger)\s*:\s*["']?[0-9]"#, body) && re(r"(?im)^\s*paths\s*:", body)
 }
 
+static PRIVATE_IP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:10(?:\.[0-9]{1,3}){3}|192\.168(?:\.[0-9]{1,3}){2}|172\.(?:1[6-9]|2[0-9]|3[01])(?:\.[0-9]{1,3}){2})\b",
+    )
+    .unwrap()
+});
+static EMAIL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,24}\b").unwrap());
+static CARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[3-6][0-9](?:[ -]?[0-9]){11,17}\b").unwrap());
+static PASSWORD_INPUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password\b[^>]*>"#).unwrap()
+});
+static FORM_ACTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<form\b[^>]*\baction\s*=\s*["']((?:https?:)?//[^"']+)["']"#).unwrap()
+});
+static SCRIPT_SRC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<script\b[^>]*\bsrc\s*=\s*["']((?:https?:)?//[^"']+)["']"#).unwrap()
+});
+static META_REFRESH_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)"#,
+    )
+    .unwrap()
+});
+static ANCHOR_BLANK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<a\b[^>]*\btarget\s*=\s*["']?_blank\b[^>]*>"#).unwrap()
+});
+static JAVASCRIPT_URI: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\b(?:href|src|action)\s*=\s*["']\s*javascript:"#).unwrap()
+});
+
 pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     let Ok(response) = Message::parse(&flow.response) else {
         return vec![];
@@ -1126,7 +1326,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     let Ok(request) = Message::parse(&flow.request) else {
         return vec![];
     };
-    let mut findings = advanced::passive(flow, limit);
+    let body_opt = text_body(&response, limit);
+    let mut findings = advanced::passive_parsed(flow, &request, &response, body_opt.as_deref());
     let candidate_limit = (64 * 1024 * 1024
         / (flow
             .request
@@ -1135,6 +1336,9 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             .max(1)))
     .clamp(1, 64);
     findings.truncate(candidate_limit);
+    // Preserve observed key material even when a response floods the finding
+    // budget with cookie policy issues. Display severity still follows the catalog.
+    let priority = |id: &str| (id == "private-key", issue_severity(id));
     let mut add = |id: &str, confidence: Confidence, point: &str, detail: String| {
         let incoming = Candidate {
             affected: None,
@@ -1149,8 +1353,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         } else if let Some((index, lowest)) = findings
             .iter()
             .enumerate()
-            .min_by_key(|(_, c)| issue_severity(&c.issue_id))
-            && issue_severity(id) > issue_severity(&lowest.issue_id)
+            .min_by_key(|(_, c)| priority(&c.issue_id))
+            && priority(id) > priority(&lowest.issue_id)
         {
             findings[index] = incoming;
         }
@@ -1221,7 +1425,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Cookie domain {domain} includes hosts besides {host}."),
             );
         }
-        if !scopes.insert((name.to_owned(), domain, scope("path"))) {
+        if !scopes.insert((name.to_owned(), domain.clone(), scope("path"))) {
             add(
                 "duplicate-cookies",
                 Confidence::Certain,
@@ -1229,21 +1433,52 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Repeated Set-Cookie for {name} with the same domain/path."),
             );
         }
+        let lower_name = name.to_ascii_lowercase();
+        let secure = has("secure");
+        let path_scope = scope("path");
+        if lower_name.starts_with("__host-")
+            && (!secure || !domain.is_empty() || path_scope != "/")
+        {
+            add(
+                "cookie-invalid",
+                Confidence::Certain,
+                name,
+                format!(
+                    "Cookie {name} uses the __Host- prefix but does not set Secure, Path=/ and an empty Domain."
+                ),
+            );
+        } else if lower_name.starts_with("__secure-") && !secure {
+            add(
+                "cookie-invalid",
+                Confidence::Certain,
+                name,
+                format!("Cookie {name} uses the __Secure- prefix without Secure."),
+            );
+        }
+        if scope("samesite").eq_ignore_ascii_case("none") && !secure {
+            add(
+                "cookie-invalid",
+                Confidence::Certain,
+                name,
+                format!("Cookie {name} declares SameSite=None without Secure."),
+            );
+        }
     }
-    if html
-        && flow.destination.tls
-        && !response
-            .header("Strict-Transport-Security")
-            .is_some_and(|v| re(r"(?i)(?:^|;)\s*max-age\s*=\s*[1-9][0-9]*\s*(?:;|$)", v))
+    if flow.destination.tls
+        && !header_values(&response, "Strict-Transport-Security").any(|v| {
+            re(
+                r"(?i)(?:^|;)\s*max-age\s*=\s*[1-9][0-9]*\s*(?:;|$)",
+                v,
+            )
+        })
     {
         add(
             "hsts",
             Confidence::Certain,
             "Strict-Transport-Security",
-            "The HTML response lacks a positive HSTS max-age.".into(),
+            "The HTTPS response lacks a positive HSTS max-age.".into(),
         );
     }
-    let body_opt = text_body(&response, limit);
     let header_csp = response
         .headers
         .iter()
@@ -1252,9 +1487,11 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         .collect::<Vec<_>>();
     let csp = csp_policies(&response, body_opt.as_deref().unwrap_or(""));
     if html {
-        let xfo = response
-            .header("X-Frame-Options")
-            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "deny" | "sameorigin"));
+        let xfo = header_values(&response, "X-Frame-Options").any(|v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|v| matches!(v.to_ascii_lowercase().as_str(), "deny" | "sameorigin"))
+        });
         let frame = header_csp.iter().any(|v| {
             csp_sources(v, &["frame-ancestors"])
                 .is_some_and(|src| !src.is_empty() && !src.iter().any(|s| s == "*"))
@@ -1271,9 +1508,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         || response
             .header("Content-Type")
             .is_some_and(|v| v.contains("javascript")))
-        && !response
-            .header("X-Content-Type-Options")
-            .is_some_and(|v| v.eq_ignore_ascii_case("nosniff"))
+        && !header_values(&response, "X-Content-Type-Options")
+            .any(|v| v.split(',').any(|v| v.trim().eq_ignore_ascii_case("nosniff")))
     {
         add(
             "nosniff",
@@ -1282,7 +1518,9 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "Missing nosniff on an HTML or JavaScript response.".into(),
         );
     }
-    if response.header("X-XSS-Protection") == Some("0") {
+    if header_values(&response, "X-XSS-Protection")
+        .any(|v| v.split(';').next().is_some_and(|v| v.trim() == "0"))
+    {
         add(
             "xss-filter-disabled",
             Confidence::Certain,
@@ -1353,11 +1591,12 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                     .is_some_and(|(k, _)| session_name(k.trim()))
             })
         }))
-        && response.header("Cache-Control").is_some_and(|v| {
+        && header_values(&response, "Cache-Control").any(|v| {
+            v.split(',').any(|d| d.trim().eq_ignore_ascii_case("public"))
+        })
+        && !header_values(&response, "Cache-Control").any(|v| {
             let value = v.to_ascii_lowercase();
-            value.split(',').any(|d| d.trim() == "public")
-                && !value.contains("no-store")
-                && !value.contains("private")
+            value.contains("no-store") || value.contains("private")
         })
     {
         add("cache-sensitive",Confidence::Tentative,"Cache-Control","An authenticated request received an explicitly public-cacheable response; verify whether its content is personalized.".into());
@@ -1384,7 +1623,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     if is_json(&request)
         && let Ok(body) = std::str::from_utf8(&request.body)
     {
-        parameters.extend(json_spans(body).into_iter().map(|(k, _, _, v)| (k, v)));
+        parameters.extend(json_spans(body, 4096).into_iter().map(|(k, _, _, v)| (k, v)));
     }
     for (name, value) in &parameters {
         if re(
@@ -1416,7 +1655,10 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if request.body.starts_with(&[0xac, 0xed, 0, 5])
         || response.body.starts_with(&[0xac, 0xed, 0, 5])
-        || String::from_utf8_lossy(&request.body).contains("rO0AB")
+        || request
+            .body
+            .windows(5)
+            .any(|window| window == b"rO0AB")
     {
         add(
             "serialized-object",
@@ -1429,18 +1671,22 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         .header("Content-Type")
         .unwrap_or("")
         .to_ascii_lowercase();
-    if bounded_body(&response, limit).is_some_and(|bytes| {
-        (bytes.starts_with(b"\x89PNG\r\n\x1a\n") && !ct.contains("png"))
+    if let Some(bytes) = bounded_body(&response, limit) {
+        if (bytes.starts_with(b"\x89PNG\r\n\x1a\n") && !ct.contains("png"))
             || (bytes.starts_with(b"\xff\xd8\xff") && !ct.contains("jpeg") && !ct.contains("jpg"))
             || ((bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
                 && !ct.contains("gif"))
-    }) {
-        add(
-            "wrong-content-type",
-            Confidence::Firm,
-            "Content-Type",
-            format!("Binary response signature conflicts with declared type {ct:?}."),
-        );
+        {
+            add(
+                "wrong-content-type",
+                Confidence::Firm,
+                "Content-Type",
+                format!("Binary response signature conflicts with declared type {ct:?}."),
+            );
+        }
+        if let Some((id, point, detail)) = charset::finding(&response, &bytes) {
+            add(id, Confidence::Certain, point, detail);
+        }
     }
     let Some(body) = body_opt else {
         return findings;
@@ -1574,9 +1820,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             );
         }
     }
-    if let Ok(r) = Regex::new(
-        r"\b(?:10(?:\.[0-9]{1,3}){3}|192\.168(?:\.[0-9]{1,3}){2}|172\.(?:1[6-9]|2[0-9]|3[01])(?:\.[0-9]{1,3}){2})\b",
-    ) && let Some(ip) = r
+    if let Some(ip) = PRIVATE_IP
         .find_iter(&body)
         .map(|m| m.as_str())
         .find(|v| v.parse::<std::net::Ipv4Addr>().is_ok())
@@ -1588,9 +1832,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             format!("Internal IPv4 address {ip} is exposed."),
         );
     }
-    if let Ok(r) = Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,24}\b")
-        && let Some(email) = r.find(&body)
-    {
+    if let Some(email) = EMAIL.find(&body) {
         add(
             "email",
             Confidence::Certain,
@@ -1598,10 +1840,9 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             format!("Email address {} is present.", email.as_str()),
         );
     }
-    if let Ok(r) = Regex::new(r"\b[3-6][0-9](?:[ -]?[0-9]){11,17}\b")
-        && let Some(card) = r
-            .find_iter(&body)
-            .find(|m| luhn(m.as_str()) && plausible_card(m.as_str()))
+    if let Some(card) = CARD
+        .find_iter(&body)
+        .find(|m| luhn(m.as_str()) && plausible_card(m.as_str()))
     {
         let digits: String = card.as_str().chars().filter(char::is_ascii_digit).collect();
         add(
@@ -1624,14 +1865,12 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "The page contains an HTML file upload input.".into(),
             );
         }
-        if let Ok(r) = Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password\b[^>]*>"#)
-            && r.find_iter(&body).any(|tag| {
-                !re(
-                    r#"(?i)\bautocomplete\s*=\s*["']?(?:off|new-password)"#,
-                    tag.as_str(),
-                )
-            })
-        {
+        if PASSWORD_INPUT.find_iter(&body).any(|tag| {
+            !re(
+                r#"(?i)\bautocomplete\s*=\s*["']?(?:off|new-password)"#,
+                tag.as_str(),
+            )
+        }) {
             add(
                 "password-autocomplete",
                 Confidence::Firm,
@@ -1639,27 +1878,23 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "A password input does not declare autocomplete=off or new-password.".into(),
             );
         }
-        if let Ok(r) =
-            Regex::new(r#"(?i)<form\b[^>]*\baction\s*=\s*["']((?:https?:)?//[^"']+)["']"#)
-        {
-            for c in r.captures_iter(&body) {
-                let action = if c[1].starts_with("//") {
-                    format!("https:{}", &c[1])
-                } else {
-                    c[1].into()
-                };
-                if url::Url::parse(&action)
-                    .ok()
-                    .is_some_and(|u| u.host_str() != url.as_ref().and_then(|v| v.host_str()))
-                {
-                    add(
-                        "crossdomain-post",
-                        Confidence::Certain,
-                        "form action",
-                        format!("The form submits to another host: {action}."),
-                    );
-                    break;
-                }
+        for c in FORM_ACTION.captures_iter(&body) {
+            let action = if c[1].starts_with("//") {
+                format!("https:{}", &c[1])
+            } else {
+                c[1].into()
+            };
+            if url::Url::parse(&action)
+                .ok()
+                .is_some_and(|u| u.host_str() != url.as_ref().and_then(|v| v.host_str()))
+            {
+                add(
+                    "crossdomain-post",
+                    Confidence::Certain,
+                    "form action",
+                    format!("The form submits to another host: {action}."),
+                );
+                break;
             }
         }
         if flow.destination.tls
@@ -1675,42 +1910,23 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "HTTPS HTML references an active resource using http://.".into(),
             );
         }
-        if let Ok(r) = Regex::new(r#"(?i)<script\b[^>]*\bsrc\s*=\s*["']((?:https?:)?//[^"']+)["']"#)
-        {
-            for caps in r.captures_iter(&body) {
-                let value = if caps[1].starts_with("//") {
-                    format!("https:{}", &caps[1])
-                } else {
-                    caps[1].into()
-                };
-                if url::Url::parse(&value).ok().is_some_and(|u| {
-                    Some(u.host_str().unwrap_or("")) != url.as_ref().and_then(|u| u.host_str())
-                }) {
-                    add(
-                        "crossdomain-script",
-                        Confidence::Certain,
-                        "script src",
-                        format!("Page includes external script {value}."),
-                    );
-                    break;
-                }
+        for caps in SCRIPT_SRC.captures_iter(&body) {
+            let value = if caps[1].starts_with("//") {
+                format!("https:{}", &caps[1])
+            } else {
+                caps[1].into()
+            };
+            if url::Url::parse(&value).ok().is_some_and(|u| {
+                Some(u.host_str().unwrap_or("")) != url.as_ref().and_then(|u| u.host_str())
+            }) {
+                add(
+                    "crossdomain-script",
+                    Confidence::Certain,
+                    "script src",
+                    format!("Page includes external script {value}."),
+                );
+                break;
             }
-        }
-        if !body.is_ascii()
-            && !response
-                .header("Content-Type")
-                .is_some_and(|v| v.to_ascii_lowercase().contains("charset="))
-            && !re(
-                r#"(?i)<meta\b[^>]*(?:charset\s*=|http-equiv\s*=\s*["']content-type)"#,
-                &body,
-            )
-        {
-            add(
-                "charset",
-                Confidence::Certain,
-                "HTML encoding",
-                "Non-ASCII HTML has no HTTP or meta charset declaration.".into(),
-            );
         }
         if re(r#"(?i)<input\b[^>]*type\s*=\s*["']?password\b"#, &body)
             && (!flow.destination.tls || re(r#"(?i)<form\b[^>]*action\s*=\s*["']http://"#, &body))
@@ -1720,6 +1936,41 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 Confidence::Firm,
                 "password form",
                 "A password form is served over HTTP or posts to a plaintext URL.".into(),
+            );
+        }
+        if let Some(target) = META_REFRESH_URL
+            .captures(&body)
+            .and_then(|caps| caps.get(1))
+            .map(|capture| capture.as_str())
+            && url::Url::parse(target).ok().is_some_and(|destination| {
+                Some(destination.host_str().unwrap_or(""))
+                    != url.as_ref().and_then(|u| u.host_str())
+            })
+        {
+            add(
+                "meta-refresh-external",
+                Confidence::Firm,
+                "meta refresh",
+                format!("The page redirects to another origin through meta refresh: {target}."),
+            );
+        }
+        if ANCHOR_BLANK.find_iter(&body).any(|tag| {
+            let tag = tag.as_str().to_ascii_lowercase();
+            !(tag.contains("noopener") || tag.contains("noreferrer"))
+        }) {
+            add(
+                "target-blank-noopener",
+                Confidence::Firm,
+                "anchor target",
+                "A target=_blank link omits rel=noopener/noreferrer.".into(),
+            );
+        }
+        if JAVASCRIPT_URI.is_match(&body) {
+            add(
+                "javascript-uri",
+                Confidence::Tentative,
+                "HTML attribute",
+                "An HTML attribute contains a javascript: URI.".into(),
             );
         }
     }
@@ -1808,6 +2059,7 @@ fn plausible_card(value: &str) -> bool {
     let digits: String = value.chars().filter(char::is_ascii_digit).collect();
     let len = digits.len();
     let prefix2 = digits.get(..2).and_then(|v| v.parse::<u16>().ok());
+    let prefix3 = digits.get(..3).and_then(|v| v.parse::<u16>().ok());
     let prefix4 = digits.get(..4).and_then(|v| v.parse::<u16>().ok());
     let prefix6 = digits.get(..6).and_then(|v| v.parse::<u32>().ok());
     let starts = |value: u16| prefix2 == Some(value);
@@ -1820,13 +2072,10 @@ fn plausible_card(value: &str) -> bool {
         || (matches!(len, 16..=19)
             && (prefix4 == Some(6011)
                 || starts(65)
-                || prefix4.is_some_and(|p| (644..=649).contains(&p))
+                || prefix3.is_some_and(|p| (644..=649).contains(&p))
                 || prefix6.is_some_and(|p| (622126..=622925).contains(&p))))
         || (matches!(len, 16..=19) && prefix4.is_some_and(|p| (3528..=3589).contains(&p)))
-        || (len == 14
-            && (prefix2.is_some_and(|p| (30..=38).contains(&p))
-                || prefix2 == Some(36)
-                || prefix2 == Some(38)))
+        || (len == 14 && prefix2.is_some_and(|p| (30..=38).contains(&p)))
         || (matches!(len, 16..=19) && starts(62))
         || (matches!(len, 12..=19)
             && matches!(
@@ -1834,24 +2083,69 @@ fn plausible_card(value: &str) -> bool {
                 Some(5018 | 5020 | 5038 | 6304 | 6759 | 6761 | 6762 | 6763)
             ))
 }
+/// A JWT-shaped string whose header decodes to JSON with an `alg` member.
+/// Custom headers and bodies are included, not only Authorization and Cookie.
+fn looks_like_jwt(token: &str) -> bool {
+    let parts: Vec<_> = token.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|header| header.get("alg").is_some_and(|alg| alg.is_string()))
+}
+
 fn jwt_tokens(request: &Message) -> Vec<String> {
+    static JWT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*").unwrap()
+    });
     let mut values = Vec::new();
-    if let Some(v) = request.header("Authorization")
-        && let Some((scheme, value)) = v.split_once(' ')
-        && scheme.eq_ignore_ascii_case("bearer")
-    {
-        values.push(value.into());
+    for (_, value) in &request.headers {
+        if let Some((scheme, token)) = value.split_once(' ')
+            && scheme.eq_ignore_ascii_case("bearer")
+            && looks_like_jwt(token)
+        {
+            values.push(token.to_owned());
+        }
+        for found in JWT.find_iter(value) {
+            if looks_like_jwt(found.as_str()) {
+                values.push(found.as_str().to_owned());
+            }
+        }
     }
-    if let Some(v) = request.header("Cookie") {
-        values.extend(
-            v.split(';')
-                .filter_map(|c| c.trim().split_once('=').map(|(_, v)| v.to_owned())),
-        );
+    if let Ok(body) = std::str::from_utf8(&request.body) {
+        for found in JWT.find_iter(body) {
+            if looks_like_jwt(found.as_str()) {
+                values.push(found.as_str().to_owned());
+            }
+        }
     }
+    values.sort();
+    values.dedup();
     values
-        .into_iter()
-        .filter(|v| v.split('.').count() == 3)
-        .collect()
+}
+
+/// Replace a token wherever it occurs in the request, including the body.
+fn replace_token(request: &Message, token: &str, replacement: &str) -> Message {
+    let mut altered = request.clone();
+    let mut body_changed = false;
+    for (_, value) in &mut altered.headers {
+        if value.contains(token) {
+            *value = value.replace(token, replacement);
+        }
+    }
+    if let Ok(body) = std::str::from_utf8(&altered.body)
+        && body.contains(token)
+    {
+        altered.body = body.replace(token, replacement).into_bytes();
+        body_changed = true;
+    }
+    if body_changed {
+        altered.normalize_length();
+    }
+    altered
 }
 fn hmac_digest<D: Digest>(key: &[u8], data: &[u8], block_size: usize) -> Vec<u8> {
     let mut block = vec![0u8; block_size];
@@ -1948,26 +2242,131 @@ fn weak_jwt(token: &str) -> Option<&'static str> {
     .into_iter()
     .find(|key| verify(key.as_bytes()))
 }
+/// Blank comments, string literals and regex literals, then match sinks that
+/// consume URL-controlled data. The tokenizer is heuristic but bounded and
+/// operates in place on a single byte buffer.
 fn static_dom(body: &str, html: bool) -> bool {
-    let scripts = if html {
-        Regex::new(r"(?is)<script\b[^>]*>(.*?)</script\s*>")
-            .unwrap()
-            .captures_iter(body)
-            .map(|c| c[1].to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        vec![body.into()]
-    };
-    scripts.iter().any(|script|{
-        let b=script.as_bytes();let mut code=vec![b' ';b.len()];let mut i=0;let mut quote=None;let mut line=false;let mut block=false;
-        while i<b.len(){
-            if line {if b[i]==b'\n'{line=false;code[i]=b[i];}i+=1;continue;}
-            if block {if b[i..].starts_with(b"*/"){block=false;i+=2;}else{i+=1;}continue;}
-            if let Some(q)=quote {if b[i]==b'\\'{i=(i+2).min(b.len());}else{if b[i]==q{quote=None;}i+=1;}continue;}
-            if b[i..].starts_with(b"//"){line=true;i+=2;}else if b[i..].starts_with(b"/*"){block=true;i+=2;}else if matches!(b[i],b'\''|b'"'|b'`'){quote=Some(b[i]);i+=1;}else{code[i]=b[i];i+=1;}
+    static SCRIPT_BODY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<script\b[^>]*>(.*?)</script\s*>").unwrap());
+    static SINKS: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+        regex::bytes::Regex::new(
+            r"(?s)(?:document\.(?:write|writeln)|eval|execScript|setTimeout|setInterval|Function)\s*\(\s*(?:window\.)?(?:document\.)?(?:location\.(?:hash|search|href|pathname)|document\.(?:URL|documentURI|referrer))|\.(?:innerHTML|outerHTML)\s*=\s*(?:window\.)?(?:document\.)?(?:location\.(?:hash|search|href|pathname)|document\.(?:URL|documentURI|referrer))|\.insertAdjacentHTML\s*\(\s*[^)]{0,160}(?:location\.(?:hash|search|href|pathname)|document\.(?:URL|documentURI|referrer))|\$\([^)]{0,160}(?:location\.(?:hash|search|href|pathname)|document\.(?:URL|documentURI|referrer))",
+        )
+        .unwrap()
+    });
+    let scan = |script: &str| {
+        let bytes = script.as_bytes();
+        let mut code = vec![b' '; bytes.len()];
+        let mut i = 0;
+        let mut quote: Option<u8> = None;
+        let mut line = false;
+        let mut block = false;
+        let mut regex = false;
+        let mut regex_class = false;
+        let mut regex_ok = true;
+        while i < bytes.len() {
+            if line {
+                if bytes[i] == b'\n' {
+                    line = false;
+                }
+                i += 1;
+                continue;
+            }
+            if block {
+                if bytes[i..].starts_with(b"*/") {
+                    block = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(delimiter) = quote {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else {
+                    if bytes[i] == delimiter {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if regex {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else {
+                    if regex_class {
+                        if bytes[i] == b']' {
+                            regex_class = false;
+                        }
+                    } else if bytes[i] == b'[' {
+                        regex_class = true;
+                    } else if bytes[i] == b'/' {
+                        regex = false;
+                        regex_ok = false;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            let byte = bytes[i];
+            if byte == b'/' && bytes[i..].starts_with(b"//") {
+                line = true;
+                i += 2;
+                continue;
+            }
+            if byte == b'/' && bytes[i..].starts_with(b"/*") {
+                block = true;
+                i += 2;
+                continue;
+            }
+            if byte == b'/' && regex_ok {
+                regex = true;
+                regex_class = false;
+                i += 1;
+                continue;
+            }
+            if matches!(byte, b'\'' | b'"' | b'`') {
+                quote = Some(byte);
+                i += 1;
+                continue;
+            }
+            code[i] = byte;
+            regex_ok = byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'(' | b','
+                        | b'='
+                        | b':'
+                        | b'['
+                        | b'!'
+                        | b'&'
+                        | b'|'
+                        | b'?'
+                        | b'{'
+                        | b'}'
+                        | b';'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'%'
+                        | b'<'
+                        | b'>'
+                        | b'~'
+                        | b'^'
+                );
+            i += 1;
         }
-        re(r"(?s)(?:document\.write|eval|setTimeout|setInterval)\s*\(\s*(?:window\.)?(?:document\.)?location\.(?:hash|search)|\.innerHTML\s*=\s*(?:window\.)?(?:document\.)?location\.(?:hash|search)",&String::from_utf8_lossy(&code))
-    })
+        SINKS.is_match(&code)
+    };
+    if html {
+        SCRIPT_BODY
+            .captures_iter(body)
+            .any(|capture| scan(&capture[1]))
+    } else {
+        scan(body)
+    }
 }
 fn diagnostic_pages(body: &str) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
@@ -2003,6 +2402,14 @@ fn diagnostic_pages(body: &str) -> Vec<(&'static str, &'static str)> {
 }
 
 impl Probe {
+    pub(super) fn follow_redirects(&self) -> bool {
+        !matches!(self.matcher, Matcher::Stylesheet(_))
+            && !matches!(
+                self.issue_id.as_str(),
+                "input-stored" | "input-transformed-stored"
+            )
+    }
+
     /// Timing and state-changing probes must not overlap other scanner requests:
     /// target load can manufacture a timing differential or invalidate ordering.
     pub fn serial(&self) -> bool {
@@ -2013,6 +2420,17 @@ impl Probe {
                 Matcher::Stored(m) => m.serial(),
                 _ => false,
             }
+    }
+
+    /// True when the check can only be decided after several probes have
+    /// completed. The runner keeps those exchanges and discards single-shot
+    /// responses so memory stays bounded on large scans.
+    pub fn needs_series(&self) -> bool {
+        match &self.matcher {
+            Matcher::Series { .. } | Matcher::Stored(_) | Matcher::Stylesheet(_) => true,
+            Matcher::Advanced(matcher) => matcher.series_result(),
+            _ => false,
+        }
     }
 }
 
@@ -2121,17 +2539,19 @@ fn replace_target(message: &mut Message, target: &str) {
         .to_owned();
     message.start = format!("{method} {target} {version}");
 }
-fn json_spans(body: &str) -> Vec<(String, usize, usize, String)> {
+fn json_spans(body: &str, limit: usize) -> Vec<(String, usize, usize, String)> {
     // Token coordinates retain untouched JSON bytes, duplicate keys, and number
     // spelling. A complete serde parse rejects malformed inputs before mutation.
-    if serde_json::from_str::<serde_json::Value>(body).is_err() {
+    // Parsing stops at `limit` so a very large document cannot expand into an
+    // unbounded insertion-point list.
+    if limit == 0 || serde_json::from_str::<serde_json::Value>(body).is_err() {
         return vec![];
     }
     let b = body.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     let mut last_key = String::new();
-    while i < b.len() {
+    while i < b.len() && out.len() < limit {
         if b[i] == b'"' {
             let start = i;
             i += 1;
@@ -2190,17 +2610,36 @@ fn points(
     dest: &Destination,
     settings: &ScanSettings,
 ) -> anyhow::Result<Vec<Point>> {
-    let mut out = Vec::new();
+    // Buckets keep one large family (for example a long query string) from
+    // consuming the insertion-point budget of every other family. The final
+    // round-robin merge preserves at least one point per enabled family.
+    const QUERY_VALUE: usize = 0;
+    const QUERY_NAME: usize = 1;
+    const BODY_VALUE: usize = 2;
+    const BODY_NAME: usize = 3;
+    const COOKIE: usize = 4;
+    const HEADER: usize = 5;
+    const PATH: usize = 6;
+    const NESTED: usize = 7;
+    let mut buckets: [Vec<Point>; 8] = Default::default();
+    // Bound construction itself, not only the final merge. A request with a
+    // very large parameter list must not allocate one Point per parameter.
+    let source_cap = settings.max_insertion_points.saturating_mul(4).max(32);
     let target = origin_target(request, dest)?;
     if let Some((_, query)) = target.split_once('?') {
         for (index, part) in query.split('&').enumerate() {
+            if (!settings.scan_query_values || buckets[QUERY_VALUE].len() >= source_cap)
+                && (!settings.scan_parameter_names || buckets[QUERY_NAME].len() >= source_cap)
+            {
+                break;
+            }
             let (name, value) = part.split_once('=').unwrap_or((part, ""));
             let name = decoded(name);
             if !allowed_parameter(&name, settings) {
                 continue;
             }
-            if settings.scan_query_values {
-                out.push(Point {
+            if settings.scan_query_values && buckets[QUERY_VALUE].len() < source_cap {
+                buckets[QUERY_VALUE].push(Point {
                     name: name.clone(),
                     label: format!("URL parameter {name} [{index}]"),
                     original: decoded(value),
@@ -2208,8 +2647,8 @@ fn points(
                     wraps: vec![],
                 });
             }
-            if settings.scan_parameter_names {
-                out.push(Point {
+            if settings.scan_parameter_names && buckets[QUERY_NAME].len() < source_cap {
+                buckets[QUERY_NAME].push(Point {
                     name: name.clone(),
                     label: format!("URL parameter name {name} [{index}]"),
                     original: name,
@@ -2225,12 +2664,17 @@ fn points(
         if ct.starts_with("application/x-www-form-urlencoded") {
             let mut offset = 0;
             for (index, part) in body.split('&').enumerate() {
+                if (!settings.scan_form_values || buckets[BODY_VALUE].len() >= source_cap)
+                    && (!settings.scan_parameter_names || buckets[BODY_NAME].len() >= source_cap)
+                {
+                    break;
+                }
                 let (raw_name, value) = part.split_once('=').unwrap_or((part, ""));
                 let name = decoded(raw_name);
                 if allowed_parameter(&name, settings) {
                     let start = offset + raw_name.len() + usize::from(part.contains('='));
-                    if settings.scan_form_values {
-                        out.push(Point {
+                    if settings.scan_form_values && buckets[BODY_VALUE].len() < source_cap {
+                        buckets[BODY_VALUE].push(Point {
                             name: name.clone(),
                             label: format!("Body parameter {name} [{index}]"),
                             original: decoded(value),
@@ -2243,8 +2687,8 @@ fn points(
                             wraps: vec![],
                         });
                     }
-                    if settings.scan_parameter_names {
-                        out.push(Point {
+                    if settings.scan_parameter_names && buckets[BODY_NAME].len() < source_cap {
+                        buckets[BODY_NAME].push(Point {
                             name: name.clone(),
                             label: format!("Body parameter name {name} [{index}]"),
                             original: name,
@@ -2261,9 +2705,15 @@ fn points(
                 offset += part.len() + 1;
             }
         } else if ct.contains("json") {
-            for (index, (name, start, end, value)) in json_spans(body).into_iter().enumerate() {
+            for (index, (name, start, end, value)) in json_spans(
+                body,
+                settings.max_insertion_points.saturating_mul(4).max(16),
+            )
+            .into_iter()
+            .enumerate()
+            {
                 if settings.scan_json_values && allowed_parameter(&name, settings) {
-                    out.push(Point {
+                    buckets[BODY_VALUE].push(Point {
                         name: name.clone(),
                         label: format!("JSON value {name} [{index}]"),
                         original: value,
@@ -2278,7 +2728,7 @@ fn points(
                 }
             }
             if settings.scan_json_body && serde_json::from_str::<serde_json::Value>(body).is_ok() {
-                out.push(Point {
+                buckets[BODY_VALUE].push(Point {
                     name: "$body".into(),
                     label: "Entire JSON body".into(),
                     original: body.into(),
@@ -2296,10 +2746,13 @@ fn points(
                 r"<([A-Za-z_][A-Za-z0-9_.:-]*)\b[^>]*>([^<>]*)</[A-Za-z_][A-Za-z0-9_.:-]*\s*>",
             )?;
             for (index, caps) in r.captures_iter(body).enumerate() {
+                if buckets[BODY_VALUE].len() >= source_cap {
+                    break;
+                }
                 let name = &caps[1];
                 if settings.scan_xml_elements && allowed_parameter(name, settings) {
                     let v = caps.get(2).unwrap();
-                    out.push(Point {
+                    buckets[BODY_VALUE].push(Point {
                         name: name.into(),
                         label: format!("XML element {name} [{index}]"),
                         original: v.as_str().into(),
@@ -2317,6 +2770,9 @@ fn points(
             let attrs = Regex::new(r#"([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)?;
             for (tag_index, tag) in tags.find_iter(body).enumerate() {
                 for (attr_index, caps) in attrs.captures_iter(tag.as_str()).enumerate() {
+                    if buckets[BODY_VALUE].len() >= source_cap {
+                        break;
+                    }
                     let name = &caps[1];
                     if !settings.scan_xml_attributes
                         || name.starts_with("xmlns")
@@ -2325,7 +2781,7 @@ fn points(
                         continue;
                     }
                     let v = caps.get(2).or_else(|| caps.get(3)).unwrap();
-                    out.push(Point {
+                    buckets[BODY_VALUE].push(Point {
                         name: name.into(),
                         label: format!("XML attribute {name} [{tag_index}:{attr_index}]"),
                         original: v.as_str().into(),
@@ -2352,6 +2808,9 @@ fn points(
             let names = Regex::new(r#"(?i)\bname="([^"]+)""#)?;
             let filenames = Regex::new(r#"(?i)\bfilename="([^"]*)""#)?;
             for (part_index, part) in body.split(&delim).enumerate() {
+                if buckets[BODY_VALUE].len() >= source_cap {
+                    break;
+                }
                 if let Some((headers, content)) = part.split_once("\r\n\r\n")
                     && let Some(name) = names
                         .captures(headers)
@@ -2360,7 +2819,7 @@ fn points(
                 {
                     if let Some(filename) = filenames.captures(headers).and_then(|c| c.get(1)) {
                         if settings.scan_multipart_filenames {
-                            out.push(Point {
+                            buckets[BODY_VALUE].push(Point {
                                 name: name.clone(),
                                 label: format!("Multipart filename {name} [{part_index}]"),
                                 original: filename.as_str().into(),
@@ -2376,7 +2835,7 @@ fn points(
                     } else if settings.scan_multipart_values {
                         let start = offset + headers.len() + 4;
                         let len = content.strip_suffix("\r\n").unwrap_or(content).len();
-                        out.push(Point {
+                        buckets[BODY_VALUE].push(Point {
                             name: name.clone(),
                             label: format!("Multipart parameter {name} [{part_index}]"),
                             original: content[..len].into(),
@@ -2398,10 +2857,13 @@ fn points(
         && let Some(cookie) = request.header("Cookie")
     {
         for (index, part) in cookie.split(';').enumerate() {
+            if buckets[COOKIE].len() >= source_cap {
+                break;
+            }
             if let Some((name, value)) = part.trim().split_once('=')
                 && allowed_parameter(name, settings)
             {
-                out.push(Point {
+                buckets[COOKIE].push(Point {
                     name: name.into(),
                     label: format!("Cookie {name} [{index}]"),
                     original: value.into(),
@@ -2413,6 +2875,9 @@ fn points(
     }
     if settings.scan_headers {
         for (index, (name, value)) in request.headers.iter().enumerate() {
+            if buckets[HEADER].len() >= source_cap {
+                break;
+            }
             if (name.eq_ignore_ascii_case("Referer")
                 || name.eq_ignore_ascii_case("User-Agent")
                 || name.eq_ignore_ascii_case("Accept")
@@ -2422,7 +2887,7 @@ fn points(
                 || name.to_ascii_lowercase().starts_with("x-"))
                 && allowed_parameter(name, settings)
             {
-                out.push(Point {
+                buckets[HEADER].push(Point {
                     name: name.clone(),
                     label: format!("Header {name} [{index}]"),
                     original: value.clone(),
@@ -2436,8 +2901,11 @@ fn points(
         let path = target.split('?').next().unwrap_or("/");
         let mut offset = 0;
         for (index, part) in path.split('/').enumerate() {
+            if buckets[PATH].len() >= source_cap {
+                break;
+            }
             if !part.is_empty() {
-                out.push(Point {
+                buckets[PATH].push(Point {
                     name: part.into(),
                     label: format!("URL path segment {part} [{index}]"),
                     original: decoded(part),
@@ -2452,22 +2920,49 @@ fn points(
         }
     }
     if settings.nested {
-        let outer = out.clone();
-        for point in outer {
+        let snapshot: Vec<Point> = buckets.iter().flatten().cloned().collect();
+        let cap = settings.max_insertion_points.saturating_mul(4).max(1);
+        for point in &snapshot {
             if !settings.scan_json_values && point.label == "Entire JSON body" {
                 continue;
             }
-            nested_points(&point, &mut out, settings, 0);
-            if out.len() > settings.max_insertion_points.saturating_mul(4) {
+            nested_points(point, &mut buckets[NESTED], settings, 0, cap);
+            if buckets[NESTED].len() >= cap {
                 break;
             }
         }
     }
-    out.truncate(settings.max_insertion_points);
+    let limit = settings.max_insertion_points.max(1);
+    let mut iterators: Vec<std::vec::IntoIter<Point>> = buckets
+        .into_iter()
+        .map(|bucket| bucket.into_iter())
+        .collect();
+    let mut out = Vec::with_capacity(limit);
+    loop {
+        let mut progressed = false;
+        for iterator in &mut iterators {
+            if let Some(point) = iterator.next() {
+                out.push(point);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
     Ok(out)
 }
-fn nested_points(point: &Point, out: &mut Vec<Point>, settings: &ScanSettings, depth: usize) {
-    if depth >= 3 || point.original.len() > 256 * 1024 {
+fn nested_points(
+    point: &Point,
+    out: &mut Vec<Point>,
+    settings: &ScanSettings,
+    depth: usize,
+    cap: usize,
+) {
+    if depth >= 3 || point.original.len() > 256 * 1024 || out.len() >= cap {
         return;
     }
     let mut containers = vec![(point.original.clone(), vec![])];
@@ -2491,7 +2986,9 @@ fn nested_points(point: &Point, out: &mut Vec<Point>, settings: &ScanSettings, d
         }
     }
     for (container, encoding) in containers {
-        for (name, start, end, value) in json_spans(&container) {
+        for (name, start, end, value) in
+            json_spans(&container, cap.saturating_sub(out.len()).max(1))
+        {
             if !allowed_parameter(&name, settings) {
                 continue;
             }
@@ -2509,7 +3006,10 @@ fn nested_points(point: &Point, out: &mut Vec<Point>, settings: &ScanSettings, d
                 wraps,
             };
             out.push(child.clone());
-            nested_points(&child, out, settings, depth + 1);
+            if out.len() >= cap {
+                return;
+            }
+            nested_points(&child, out, settings, depth + 1, cap);
         }
     }
 }
@@ -2611,9 +3111,9 @@ fn enabled(settings: &ScanSettings, id: &str) -> bool {
     static CHECKS: std::sync::OnceLock<std::collections::BTreeMap<String, bool>> =
         std::sync::OnceLock::new();
     let checks = CHECKS.get_or_init(|| {
-        definitions()
-            .into_iter()
-            .map(|d| (d.id, d.intrusive))
+        catalog()
+            .iter()
+            .map(|d| (d.id.clone(), d.intrusive))
             .collect()
     });
     settings.check_enabled(id)
@@ -2698,49 +3198,93 @@ fn sql_contexts(original: &str) -> Vec<SqlContext> {
     contexts
 }
 
+/// A generated plan plus the number of enabled probes that did not fit inside
+/// the configured probe or byte budget. The caller surfaces the count so a scan
+/// never silently omits a whole check family.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    pub probes: Vec<Probe>,
+    pub skipped: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit(
+    settings: &ScanSettings,
+    base: &Exchange,
+    probes: &mut Vec<Probe>,
+    single_requests: &mut BTreeSet<(String, [u8; 32])>,
+    plan_bytes: &mut usize,
+    skipped: &mut usize,
+    cap: usize,
+    id: &str,
+    point: &str,
+    request: Vec<u8>,
+    matcher: Matcher,
+) {
+    if !enabled(settings, id) {
+        return;
+    }
+    let single_key = (!matches!(&matcher, Matcher::Series { .. }))
+        .then(|| (id.to_owned(), <[u8; 32]>::from(Sha256::digest(&request))));
+    if single_key
+        .as_ref()
+        .is_some_and(|key| single_requests.contains(key))
+    {
+        return;
+    }
+    if probes.len() >= cap
+        || request.len() > 64usize.saturating_mul(1024 * 1024).saturating_sub(*plan_bytes)
+    {
+        *skipped += 1;
+        return;
+    }
+    if let Some(key) = single_key {
+        single_requests.insert(key);
+    }
+    *plan_bytes += request.len();
+    probes.push(Probe {
+        issue_id: id.into(),
+        insertion_point: point.into(),
+        request,
+        destination: base.destination.clone(),
+        raw: false,
+        matcher,
+    });
+}
+
 pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<Vec<Probe>> {
+    Ok(active_plan_with_stats(base, settings)?.probes)
+}
+
+pub fn active_plan_with_stats(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<Plan> {
     settings.validate()?;
     let request = Message::parse(&base.request)?;
     let marker = marker(base);
+    // Request-level probes are admitted before per-insertion-point probes so a
+    // parameter-heavy request can never starve CORS, TRACE, resource exposure,
+    // GraphQL or JWT checks. Point probes are capped separately and merged
+    // afterwards against whatever budget remains.
     let mut probes: Vec<Probe> = Vec::new();
+    let mut point_probes: Vec<Probe> = Vec::new();
     let mut single_requests = BTreeSet::new();
     let mut plan_bytes = 0usize;
-    let mut add = |id: &str, point: &str, request: Vec<u8>, matcher: Matcher| {
-        let single_key = (!matches!(&matcher, Matcher::Series { .. }))
-            .then(|| (id.to_owned(), <[u8; 32]>::from(Sha256::digest(&request))));
-        if enabled(settings, id)
-            && single_key
-                .as_ref()
-                .is_none_or(|key| !single_requests.contains(key))
-            && probes.len() < settings.max_probes_per_request
-            && request.len()
-                <= 64usize
-                    .saturating_mul(1024 * 1024)
-                    .saturating_sub(plan_bytes)
-        {
-            if let Some(key) = single_key {
-                single_requests.insert(key);
-            }
-            plan_bytes += request.len();
-            probes.push(Probe {
-                issue_id: id.into(),
-                insertion_point: point.into(),
-                request,
-                destination: base.destination.clone(),
-                raw: false,
-                matcher,
-            });
-        }
-    };
+    let mut point_bytes = 0usize;
+    let mut skipped = 0usize;
+    let mut point_skipped = 0usize;
+    let point_cap = settings.max_probes_per_request.saturating_mul(2).max(1);
     for point in points(&request, &base.destination, settings)? {
         if !allowed_parameter(&point.name, settings) {
             continue;
         }
         let mut at = |id: &str, payload: &str, matcher: Matcher| -> anyhow::Result<()> {
-            if !enabled(settings, id) {
-                return Ok(());
-            }
-            add(
+            admit(
+                settings,
+                base,
+                &mut point_probes,
+                &mut single_requests,
+                &mut point_bytes,
+                &mut point_skipped,
+                point_cap,
                 id,
                 &point.label,
                 point_request(&request, &base.destination, &point, payload)?,
@@ -2760,6 +3304,24 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
                     payload: payload.clone(),
                 },
             )?;
+        }
+        if enabled(settings, "input-reflected") && reflection::supports_point(&point) {
+            let token = reflection::canary(base, &point, "input-reflected");
+            at(
+                "input-reflected",
+                &token,
+                Matcher::ReflectedInput(token.clone()),
+            )?;
+        }
+        if enabled(settings, "input-transformed") && reflection::supports_point(&point) {
+            let token = reflection::canary(base, &point, "input-transformed");
+            for (marker, payload) in reflection::transformed_payloads(&token) {
+                at(
+                    "input-transformed",
+                    &payload,
+                    Matcher::ReflectedInput(marker),
+                )?;
+            }
         }
         for (id,payload,matcher) in [
             ("header-injection",format!("\r\nX-Ferrite-{marker}: {marker}"),Matcher::Header(marker.clone())),
@@ -2815,7 +3377,7 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
             ("code-ruby-time", "';sleep {seconds};#'"),
             ("code-perl-time", "';sleep {seconds};#'"),
         ] {
-            for pair in 0..3 {
+            for pair in 0..2 {
                 for positive in [false, true] {
                     let seconds = if positive { 2 } else { 0 };
                     let payload = template.replace("{seconds}", &seconds.to_string());
@@ -2874,7 +3436,7 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
                 if dialect == "mssql" && context.terminated_prefix(&point.original).is_none() {
                     continue;
                 }
-                for pair in 0..3 {
+                for pair in 0..2 {
                     for positive in [false, true] {
                         let seconds = if positive { 2 } else { 0 };
                         let payload = if dialect == "mssql" {
@@ -2920,7 +3482,7 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
                 "& timeout /T {count} >nul &",
             ),
         ] {
-            for pair in 0..3 {
+            for pair in 0..2 {
                 for positive in [false, true] {
                     let seconds = if positive { 2 } else { 0 };
                     let payload = template
@@ -2940,6 +3502,21 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
             }
         }
     }
+    let mut add = |id: &str, point: &str, request: Vec<u8>, matcher: Matcher| {
+        admit(
+            settings,
+            base,
+            &mut probes,
+            &mut single_requests,
+            &mut plan_bytes,
+            &mut skipped,
+            settings.max_probes_per_request,
+            id,
+            point,
+            request,
+            matcher,
+        );
+    };
     let mut cors = request.clone();
     let origin = format!("https://{marker}.invalid");
     cors.set("Origin", origin.clone());
@@ -2989,6 +3566,22 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
         ("openapi", "/swagger.yaml".into(), FileKind::Openapi),
         ("openapi", "/api-docs".into(), FileKind::Openapi),
         ("openapi", "/v3/api-docs".into(), FileKind::Openapi),
+        (
+            "openapi",
+            "/.well-known/openapi.json".into(),
+            FileKind::Openapi,
+        ),
+        (
+            "openapi",
+            "/swagger/v1/swagger.json".into(),
+            FileKind::Openapi,
+        ),
+        ("env-file", "/actuator/env".into(), FileKind::Actuator),
+        ("aws-credentials", "/.aws/credentials".into(), FileKind::Aws),
+        ("ds-store", "/.DS_Store".into(), FileKind::DsStore),
+        ("server-status", "/server-status".into(), FileKind::ServerStatus),
+        ("elmah", "/elmah.axd".into(), FileKind::Elmah),
+        ("svn-metadata", "/.svn/entries".into(), FileKind::Svn),
         ("jwks", "/.well-known/jwks.json".into(), FileKind::Jwks),
         ("jwks", "/.well-known/jwks".into(), FileKind::Jwks),
         ("backup-file", format!("{path}.bak"), FileKind::Backup),
@@ -3124,6 +3717,34 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
                     add(id, "XML document", xml.encode(), matcher);
                 }
             }
+            // XInclude resolves an element's href at parse time. A file target
+            // that returns recognizable file content is direct evidence.
+            if let Some(index) = body.rfind(&format!("</{root}>")) {
+                for (target, value) in [
+                    ("file:///etc/passwd", "file:passwd"),
+                    ("file:///etc/hosts", "file:hosts"),
+                ] {
+                    let mut xml = request.clone();
+                    let mut changed = body.to_owned();
+                    changed.insert_str(
+                        index,
+                        &format!(
+                            "<xi:include xmlns:xi=\"http://www.w3.org/2001/XInclude\" href=\"{target}\" parse=\"text\"/>"
+                        ),
+                    );
+                    xml.body = changed.into_bytes();
+                    xml.normalize_length();
+                    add(
+                        "xinclude",
+                        "XML document",
+                        xml.encode(),
+                        Matcher::Contains {
+                            value: value.into(),
+                            absent: String::new(),
+                        },
+                    );
+                }
+            }
         }
     }
     for token in jwt_tokens(&request) {
@@ -3146,17 +3767,10 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
             URL_SAFE_NO_PAD.encode(format!("invalid{marker}"))
         );
         for (positive, replacement) in [(false, invalid), (true, unsigned)] {
-            let mut altered = request.clone();
-            for (name, value) in &mut altered.headers {
-                if name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case("Cookie")
-                {
-                    *value = value.replace(&token, &replacement);
-                }
-            }
             add(
                 "jwt-none",
                 "JWT signature",
-                altered.encode(),
+                replace_token(&request, &token, &replacement).encode(),
                 Matcher::Series {
                     family: "jwt-none".into(),
                     pair: 0,
@@ -3177,17 +3791,10 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
                 ),
             ),
         ] {
-            let mut altered = request.clone();
-            for (name, value) in &mut altered.headers {
-                if name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case("Cookie")
-                {
-                    *value = value.replace(&token, &replacement);
-                }
-            }
             add(
                 "jwt-signature",
                 "JWT signature",
-                altered.encode(),
+                replace_token(&request, &token, &replacement).encode(),
                 Matcher::Series {
                     family: "jwt-signature".into(),
                     pair: 0,
@@ -3219,17 +3826,10 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
             URL_SAFE_NO_PAD.encode(corrupted.as_slice())
         );
         for (positive, replacement) in [(false, invalid), (true, valid)] {
-            let mut altered = request.clone();
-            for (name, value) in &mut altered.headers {
-                if name.eq_ignore_ascii_case("Authorization") || name.eq_ignore_ascii_case("Cookie")
-                {
-                    *value = value.replace(&token, &replacement);
-                }
-            }
             add(
                 "jwt-jwk",
                 "JWT signature",
-                altered.encode(),
+                replace_token(&request, &token, &replacement).encode(),
                 Matcher::Series {
                     family: "jwt-jwk".into(),
                     pair: 0,
@@ -3239,30 +3839,100 @@ pub fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::Result<V
             );
         }
     }
-    for probe in advanced::active_plan(base, settings)? {
-        if probe.request.len()
-            > 64usize
-                .saturating_mul(1024 * 1024)
-                .saturating_sub(plan_bytes)
+    for group in stylesheet::plan(base, &request, settings).chunks_exact(3) {
+        let group_bytes: usize = group.iter().map(|probe| probe.request.len()).sum();
+        if probes.len() + group.len() > settings.max_probes_per_request
+            || group_bytes > (64 * 1024 * 1024usize).saturating_sub(plan_bytes)
         {
+            skipped += group.len();
+            continue;
+        }
+        plan_bytes += group_bytes;
+        probes.extend_from_slice(group);
+    }
+    for probe in advanced::active_plan(base, settings)? {
+        if probes.len() >= settings.max_probes_per_request
+            || probe.request.len()
+                > 64usize
+                    .saturating_mul(1024 * 1024)
+                    .saturating_sub(plan_bytes)
+        {
+            skipped += 1;
             continue;
         }
         plan_bytes += probe.request.len();
         probes.push(probe);
     }
-    probes.truncate(settings.max_probes_per_request);
-    Ok(probes)
+    for probe in point_probes.drain(..) {
+        if probes.len() >= settings.max_probes_per_request
+            || probe.request.len()
+                > 64usize
+                    .saturating_mul(1024 * 1024)
+                    .saturating_sub(plan_bytes)
+        {
+            skipped += 1;
+            continue;
+        }
+        plan_bytes += probe.request.len();
+        probes.push(probe);
+    }
+    skipped += point_skipped;
+    // Cheap, request-level probes run first. Serial timing and state-changing
+    // probes run last so progress stays useful and cancellation stays cheap.
+    probes.sort_by_key(|probe| probe.serial());
+    Ok(Plan { probes, skipped })
+}
+
+/// Baseline state shared by every probe evaluated against one request. The
+/// decoded body and parsed message are produced once instead of once per probe,
+/// which keeps both latency and transient allocation bounded on large scans.
+pub struct CachedBaseline<'a> {
+    pub(crate) exchange: &'a Exchange,
+    pub(crate) message: Option<Message>,
+    pub(crate) body: String,
+}
+
+impl<'a> CachedBaseline<'a> {
+    pub fn new(exchange: &'a Exchange) -> Self {
+        let message = if exchange.error.is_none() {
+            Message::parse(&exchange.response)
+                .ok()
+                .filter(|message| message.status() == exchange.status)
+        } else {
+            None
+        };
+        let body = message
+            .as_ref()
+            .and_then(|message| text_body(message, 4 * 1024 * 1024))
+            .unwrap_or_default();
+        Self {
+            exchange,
+            message,
+            body,
+        }
+    }
 }
 
 pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<Candidate> {
-    if baseline.error.is_some() || Message::parse(&baseline.response).is_err() {
-        return vec![];
+    evaluate_cached(&CachedBaseline::new(baseline), probe, response)
+}
+
+pub fn evaluate_cached(
+    baseline: &CachedBaseline<'_>,
+    probe: &Probe,
+    response: &Exchange,
+) -> Vec<Candidate> {
+    if let Matcher::ReflectedInput(token) = &probe.matcher {
+        return reflection::evaluate_cached(probe, baseline, response, token);
     }
+    let Some(before) = baseline.message.as_ref() else {
+        return vec![];
+    };
     if matches!(&probe.matcher, Matcher::Stored(_)) {
         return vec![];
     }
     if matches!(&probe.matcher, Matcher::Advanced(_)) {
-        return advanced::evaluate(probe, baseline, response);
+        return advanced::evaluate_cached(probe, baseline, response);
     }
     if response.error.is_some() || response.response.is_empty() {
         return vec![];
@@ -3270,13 +3940,10 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
     let Ok(message) = Message::parse(&response.response) else {
         return vec![];
     };
-    let Ok(before) = Message::parse(&baseline.response) else {
-        return vec![];
-    };
     let body = text_body(&message, 4 * 1024 * 1024).unwrap_or_default();
-    let old = text_body(&before, 4 * 1024 * 1024).unwrap_or_default();
+    let old = baseline.body.as_str();
     let detected = match &probe.matcher {
-        Matcher::SqlError => sql_error(&body) && !sql_error(&old),
+        Matcher::SqlError => sql_error(&body) && !sql_error(old),
         Matcher::Entity(marker) => {
             body.contains(marker)
                 && !old.contains(marker)
@@ -3286,9 +3953,9 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
         }
         Matcher::Xss { token, payload } => {
             xss_html_response(&message)
-                && body.contains(payload)
-                && html_execution_context(&body, xss_markup(payload))
+                && body.contains(token)
                 && !old.contains(token)
+                && xss_execution_context(&body, payload)
         }
         Matcher::Header(marker) => message
             .headers
@@ -3298,7 +3965,7 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
             (200..400).contains(&message.status())
                 && redirect_target(&message, &body, &response.url)
                     .is_some_and(|u| u.host_str() == Some(host))
-                && redirect_target(&before, &old, &baseline.url)
+                && redirect_target(before, old, &baseline.exchange.url)
                     .is_none_or(|u| u.host_str() != Some(host))
         }
         Matcher::Cors(origin) => {
@@ -3306,12 +3973,11 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
                 && message
                     .header("Access-Control-Allow-Credentials")
                     .is_some_and(|v| v.eq_ignore_ascii_case("true"))
-                && baseline.destination.tls
-                && baseline.status >= 200
-                && baseline.status < 300
-                && similar_content(&before, &message)
+                && baseline.exchange.destination.tls
+                && (200..300).contains(&baseline.exchange.status)
+                && similar_content(before, &message)
                 && !old.is_empty()
-                && (Message::parse(&baseline.request).is_ok_and(|r| {
+                && (Message::parse(&baseline.exchange.request).is_ok_and(|r| {
                     r.header("Authorization").is_some() || r.header("Cookie").is_some()
                 }))
         }
@@ -3329,12 +3995,12 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
             let signature = value.starts_with("file:")
                 || matches!(value.as_str(), "metadata:credentials" | "cloud:token");
             present(&body)
-                && !present(&old)
+                && !present(old)
                 && (signature || absent.is_empty() || !body.contains(absent))
         }
         Matcher::File(kind) => {
             message.status() == 200
-                && body != old
+                && message.body != before.body
                 && match kind {
                     FileKind::Env => {
                         re(
@@ -3353,7 +4019,7 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
                                 r"(?ims)<configuration[\s>]|^\s*\[(?:core|database|mysqli|server)\]",
                                 &body,
                             ))
-                            && !source_code(&old)
+                            && !source_code(old)
                     }
                     FileKind::Robots => re(r"(?im)^\s*User-agent\s*:", &body),
                     FileKind::Openapi => openapi(&body),
@@ -3367,6 +4033,35 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
                     FileKind::WebConfig => diagnostic_pages(&body)
                         .iter()
                         .any(|(id, _)| *id == "web-config"),
+                    FileKind::Actuator => {
+                        serde_json::from_str::<serde_json::Value>(&body).ok().is_some_and(|v| {
+                            v.get("propertySources").is_some() || v.get("activeProfiles").is_some()
+                        }) && !body.to_ascii_lowercase().contains("<html")
+                    }
+                    FileKind::Aws => {
+                        re(r"(?im)^\s*\[[^\]]+\]\s*$", &body)
+                            && re(
+                                r"(?im)^\s*aws_(?:access_key_id|secret_access_key|session_token)\s*=",
+                                &body,
+                            )
+                    }
+                    FileKind::DsStore => {
+                        message.body.starts_with(&[0, 0, 0, 1])
+                            && message.body.windows(4).any(|window| window == b"Bud1")
+                    }
+                    FileKind::ServerStatus => {
+                        re(r"(?i)<title>\s*Apache (?:Server )?Status", &body)
+                            || (body.contains("Server Version:")
+                                && body.contains("Apache Server Status"))
+                    }
+                    FileKind::Elmah => {
+                        re(r"(?i)<title>[^<]*Error Log for", &body)
+                            || body.contains("Powered by <a href=\"http://code.google.com/p/elmah/")
+                    }
+                    FileKind::Svn => {
+                        re(r"(?m)^\d+\s*$", &body)
+                            && re(r"(?m)^(?:dir|file)\s*$", &body)
+                    }
                 }
         }
         Matcher::Graphql => serde_json::from_str::<serde_json::Value>(&body)
@@ -3384,7 +4079,11 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
                 && body.contains(&format!("X-Ferrite-Probe: {marker}"))
                 && body.starts_with("TRACE ")
         }
-        Matcher::Series { .. } | Matcher::Advanced(_) | Matcher::Stored(_) => false,
+        Matcher::Series { .. }
+        | Matcher::Advanced(_)
+        | Matcher::Stored(_)
+        | Matcher::ReflectedInput(_)
+        | Matcher::Stylesheet(_) => false,
     };
     if !detected {
         return vec![];
@@ -3406,12 +4105,26 @@ pub fn evaluate(probe: &Probe, baseline: &Exchange, response: &Exchange) -> Vec<
         0,
         Evidence {
             label: "Selected baseline".into(),
-            exchange: baseline.clone(),
+            exchange: baseline.exchange.clone(),
         },
     );
     vec![finding]
 }
 fn redirect_target(message: &Message, body: &str, base: &str) -> Option<url::Url> {
+    static META_REFRESH: [LazyLock<Regex>; 2] = [
+        LazyLock::new(|| {
+            Regex::new(
+                r#"(?is)<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)"#,
+            )
+            .unwrap()
+        }),
+        LazyLock::new(|| {
+            Regex::new(
+                r#"(?is)<meta[^>]*content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)[^>]*http-equiv\s*=\s*["']?refresh["']?"#,
+            )
+            .unwrap()
+        }),
+    ];
     let base = url::Url::parse(base).ok()?;
     if let Some(location) = message.header("Location")
         && let Some(url) = url::Url::parse(location)
@@ -3428,15 +4141,10 @@ fn redirect_target(message: &Message, body: &str, base: &str) -> Option<url::Url
     {
         return Some(url);
     }
-    let patterns = [
-        r#"(?is)<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)"#,
-        r#"(?is)<meta[^>]*content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)[^>]*http-equiv\s*=\s*["']?refresh["']?"#,
-    ];
-    for pattern in patterns {
-        if let Ok(re) = Regex::new(pattern)
-            && let Some(value) = re
-                .captures(body)
-                .and_then(|captures| captures.get(1).map(|m| m.as_str()))
+    for pattern in &META_REFRESH {
+        if let Some(value) = pattern
+            .captures(body)
+            .and_then(|captures| captures.get(1).map(|m| m.as_str()))
             && let Some(url) = base.join(value).ok()
         {
             return Some(url);
@@ -3477,13 +4185,14 @@ fn similar_content(a: &Message, b: &Message) -> bool {
         return false;
     }
     let normalize = |bytes: &[u8]| {
+        static VOLATILE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{16,}\b|\b\d{10,}\b",
+            )
+            .unwrap()
+        });
         let text = String::from_utf8_lossy(bytes);
-        let Ok(re) = Regex::new(
-            r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{16,}\b|\b\d{10,}\b",
-        ) else {
-            return text.into_owned();
-        };
-        re.replace_all(&text, "#").into_owned()
+        VOLATILE.replace_all(&text, "#").into_owned()
     };
     normalize(&left) == normalize(&right)
 }
@@ -3594,12 +4303,38 @@ fn html_tag_end(bytes: &[u8], mut cursor: usize, limit: usize) -> Option<usize> 
 /// than text inside an attribute, comment, raw-text element, or inert subtree.
 /// This is a bounded lexical check, not browser execution or a full DOM parser.
 /// Tokenizer contexts follow https://html.spec.whatwg.org/multipage/parsing.html.
+/// Determine whether the injected markup occurs at least once as an executable
+/// HTML token. Every occurrence is considered: pages that echo input into
+/// `<title>` and then into the body must still report the body occurrence.
 fn html_execution_context(body: &str, marker: &str) -> bool {
-    let Some(limit) = body.find(marker) else {
+    if marker.is_empty() {
         return false;
-    };
+    }
     let lower = body.to_ascii_lowercase();
     let bytes = lower.as_bytes();
+    let mut searched = 0usize;
+    let mut checked = 0usize;
+    while let Some(offset) = body[searched..].find(marker) {
+        let limit = searched + offset;
+        if executable_prefix(&lower, bytes, limit) {
+            return true;
+        }
+        checked += 1;
+        if checked >= 8 {
+            break;
+        }
+        searched = limit + marker.len();
+        if searched >= body.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Bounded lexical check for the tokenizer state at `limit`. This is not
+/// browser execution or a full DOM parser. Tokenizer contexts follow
+/// https://html.spec.whatwg.org/multipage/parsing.html.
+fn executable_prefix(lower: &str, bytes: &[u8], limit: usize) -> bool {
     let mut cursor = 0;
     let mut raw: Option<&str> = None;
     let mut script_escaped = false;
@@ -3719,6 +4454,77 @@ fn html_execution_context(body: &str, marker: &str) -> bool {
     raw.is_none() && templates == 0 && !select && math == 0 && !frameset
 }
 
+/// True when the injected markup appears in an executable token context, either
+/// verbatim or with quote character references inside the tag (for example
+/// `onload=alert(&#39;x&#39;)`). Only quotes are compared leniently: decoding
+/// `<` would resurrect escaped markup.
+fn xss_execution_context(body: &str, payload: &str) -> bool {
+    let markup = xss_markup(payload);
+    if html_execution_context(body, markup) {
+        return true;
+    }
+    let tag = ["<svg", "<img", "<details"]
+        .iter()
+        .find_map(|name| markup.find(name).map(|index| &markup[index..]))
+        .unwrap_or(markup);
+    let Some(tag_start) = tag.get(..4) else {
+        return false;
+    };
+    let lower = body.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut searched = 0usize;
+    let mut checked = 0usize;
+    while let Some(offset) = body[searched..].find(tag_start) {
+        let index = searched + offset;
+        if executable_prefix(&lower, bytes, index) && markup_matches(&body[index..], tag) {
+            return true;
+        }
+        checked += 1;
+        if checked >= 16 {
+            break;
+        }
+        searched = index + tag_start.len();
+        if searched >= body.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Compare injected markup against reflected text, allowing quote character
+/// references where the payload used a literal quote.
+fn markup_matches(body: &str, markup: &str) -> bool {
+    let mut rest = body;
+    let mut wanted = markup;
+    while let Some(character) = wanted.chars().next() {
+        if character == '\'' || character == '"' {
+            if let Some(tail) = quote_entity(rest, character) {
+                rest = tail;
+            } else if rest.starts_with(character) {
+                rest = &rest[character.len_utf8()..];
+            } else {
+                return false;
+            }
+        } else {
+            if !rest.starts_with(character) {
+                return false;
+            }
+            rest = &rest[character.len_utf8()..];
+        }
+        wanted = &wanted[character.len_utf8()..];
+    }
+    true
+}
+
+fn quote_entity(value: &str, quote: char) -> Option<&str> {
+    const SINGLE: [&str; 5] = ["&#39;", "&#039;", "&#x27;", "&#X27;", "&apos;"];
+    const DOUBLE: [&str; 5] = ["&#34;", "&#034;", "&#x22;", "&#X22;", "&quot;"];
+    let entities = if quote == '\'' { &SINGLE } else { &DOUBLE };
+    entities
+        .iter()
+        .find_map(|entity| value.get(..entity.len()).filter(|head| head.eq_ignore_ascii_case(entity)).map(|_| &value[entity.len()..]))
+}
+
 pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Vec<Candidate> {
     if baseline.error.is_some() || Message::parse(&baseline.response).is_err() {
         return vec![];
@@ -3737,9 +4543,7 @@ pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Ve
     }
     let mut findings = Vec::new();
     for ((family, point), entries) in groups {
-        let expected = if family.ends_with("time") {
-            3
-        } else if family.starts_with("sql-bool") {
+        let expected = if family.ends_with("time") || family.starts_with("sql-bool") {
             2
         } else {
             1
@@ -3762,11 +4566,18 @@ pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Ve
                 .iter()
                 .map(|((_, a), (_, b))| b.duration_ms.saturating_sub(a.duration_ms))
                 .collect();
-            let stable = controls.iter().max().unwrap() - controls.iter().min().unwrap() < 400;
+            // The required delay scales with the control's own latency and
+            // jitter so a slow but healthy target is not a false negative.
+            let control_span =
+                controls.iter().max().unwrap() - controls.iter().min().unwrap();
+            let required = (controls.iter().copied().max().unwrap_or_default() / 3)
+                .max(control_span.saturating_mul(4))
+                .max(1200);
+            let stable = control_span < required;
             stable
-                && deltas.iter().max().unwrap() - deltas.iter().min().unwrap() < 800
+                && deltas.iter().max().unwrap() - deltas.iter().min().unwrap() < required
                 && pairs.iter().all(|((_, a), (_, b))| {
-                    b.duration_ms >= a.duration_ms.saturating_add(1500)
+                    b.duration_ms >= a.duration_ms.saturating_add(required)
                         && a.status == baseline.status
                         && b.status == baseline.status
                         && Message::parse(&a.response)
@@ -3863,6 +4674,7 @@ pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Ve
     }
     findings.extend(advanced::evaluate_series(baseline, results));
     findings.extend(stored::evaluate_series(baseline, results));
+    findings.extend(stylesheet::evaluate_series(baseline, results));
     findings
 }
 
