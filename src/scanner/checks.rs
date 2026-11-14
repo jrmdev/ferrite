@@ -3837,7 +3837,7 @@ pub fn active_plan_with_stats(base: &Exchange, settings: &ScanSettings) -> anyho
             );
         }
     }
-    for group in stylesheet::plan(base, &request, settings).chunks_exact(3) {
+    for group in stylesheet::plan(base, &request, settings).as_chunks::<3>().0 {
         let group_bytes: usize = group.iter().map(|probe| probe.request.len()).sum();
         if probes.len() + group.len() > settings.max_probes_per_request
             || group_bytes > (64 * 1024 * 1024usize).saturating_sub(plan_bytes)
