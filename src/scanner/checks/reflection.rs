@@ -17,16 +17,16 @@ pub(super) fn canary(base: &Exchange, point: &Point, family: &str) -> String {
 
 const ENCODERS: [fn(&str) -> String; 6] = [
     |token| token.bytes().map(|byte| format!("%{byte:02X}")).collect(),
-    |token| {
-        token
-            .bytes()
-            .map(|byte| format!("%25{byte:02X}"))
-            .collect()
-    },
+    |token| token.bytes().map(|byte| format!("%25{byte:02X}")).collect(),
     |token| token.bytes().map(|byte| format!("\\u{byte:04x}")).collect(),
     |token| token.bytes().map(|byte| format!("\\x{byte:02x}")).collect(),
     |token| token.bytes().map(|byte| format!("&#{byte};")).collect(),
-    |token| token.bytes().map(|byte| format!("&#x{byte:02x};")).collect(),
+    |token| {
+        token
+            .bytes()
+            .map(|byte| format!("&#x{byte:02x};"))
+            .collect()
+    },
 ];
 
 pub(super) fn transformed_payloads(token: &str) -> impl Iterator<Item = (String, String)> + '_ {
@@ -61,11 +61,7 @@ pub(super) fn marker_location(message: &Message, token: &str) -> Option<String> 
 
 /// Use an already decoded body so callers that cache the baseline text do not
 /// decompress and decode the same response once per probe.
-pub(super) fn marker_location_body(
-    message: &Message,
-    body: &str,
-    token: &str,
-) -> Option<String> {
+pub(super) fn marker_location_body(message: &Message, body: &str, token: &str) -> Option<String> {
     let media_type = message
         .header("Content-Type")
         .unwrap_or("")

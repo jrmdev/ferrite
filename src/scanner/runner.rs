@@ -1004,7 +1004,13 @@ async fn run(
                 break;
             }
             if tasks.is_empty() && command == Command::Pause {
-                persist_due(&engine, &mut job, &mut last_persist, &mut pending_notes, true)?;
+                persist_due(
+                    &engine,
+                    &mut job,
+                    &mut last_persist,
+                    &mut pending_notes,
+                    true,
+                )?;
                 control.changed().await.context("Scanner control closed")?;
                 continue;
             }
@@ -1133,7 +1139,13 @@ async fn run(
             job.requests, job.failures, job.skipped
         );
     }
-    persist_due(&engine, &mut job, &mut last_persist, &mut pending_notes, true)?;
+    persist_due(
+        &engine,
+        &mut job,
+        &mut last_persist,
+        &mut pending_notes,
+        true,
+    )?;
     // Completed scans cannot resume. Failed and cancelled scans may be retried,
     // so their note index is retained and pruned when the project is reopened.
     if job.status == ScanStatus::Completed {

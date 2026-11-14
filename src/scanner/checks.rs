@@ -12,11 +12,7 @@ use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use rand_core::OsRng;
 use regex::Regex;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use std::{
-    collections::BTreeSet,
-    io::Read,
-    sync::LazyLock,
-};
+use std::{collections::BTreeSet, io::Read, sync::LazyLock};
 mod advanced;
 mod charset;
 mod reflection;
@@ -1046,8 +1042,7 @@ fn csp_sources(policy: &str, directives: &[&str]) -> Option<Vec<String>> {
     None
 }
 fn csp_policies(response: &Message, body: &str) -> Vec<String> {
-    static META_TAG: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<meta\b[^>]*>").unwrap());
+    static META_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<meta\b[^>]*>").unwrap());
     static META_ATTR: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?is)([a-zA-Z-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#).unwrap()
     });
@@ -1297,9 +1292,8 @@ static EMAIL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,24}\b").unwrap());
 static CARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[3-6][0-9](?:[ -]?[0-9]){11,17}\b").unwrap());
-static PASSWORD_INPUT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password\b[^>]*>"#).unwrap()
-});
+static PASSWORD_INPUT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password\b[^>]*>"#).unwrap());
 static FORM_ACTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)<form\b[^>]*\baction\s*=\s*["']((?:https?:)?//[^"']+)["']"#).unwrap()
 });
@@ -1312,12 +1306,10 @@ static META_REFRESH_URL: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static ANCHOR_BLANK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<a\b[^>]*\btarget\s*=\s*["']?_blank\b[^>]*>"#).unwrap()
-});
-static JAVASCRIPT_URI: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)\b(?:href|src|action)\s*=\s*["']\s*javascript:"#).unwrap()
-});
+static ANCHOR_BLANK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<a\b[^>]*\btarget\s*=\s*["']?_blank\b[^>]*>"#).unwrap());
+static JAVASCRIPT_URI: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)\b(?:href|src|action)\s*=\s*["']\s*javascript:"#).unwrap());
 
 pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     let Ok(response) = Message::parse(&flow.response) else {
@@ -1436,8 +1428,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         let lower_name = name.to_ascii_lowercase();
         let secure = has("secure");
         let path_scope = scope("path");
-        if lower_name.starts_with("__host-")
-            && (!secure || !domain.is_empty() || path_scope != "/")
+        if lower_name.starts_with("__host-") && (!secure || !domain.is_empty() || path_scope != "/")
         {
             add(
                 "cookie-invalid",
@@ -1465,12 +1456,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         }
     }
     if flow.destination.tls
-        && !header_values(&response, "Strict-Transport-Security").any(|v| {
-            re(
-                r"(?i)(?:^|;)\s*max-age\s*=\s*[1-9][0-9]*\s*(?:;|$)",
-                v,
-            )
-        })
+        && !header_values(&response, "Strict-Transport-Security")
+            .any(|v| re(r"(?i)(?:^|;)\s*max-age\s*=\s*[1-9][0-9]*\s*(?:;|$)", v))
     {
         add(
             "hsts",
@@ -1508,8 +1495,10 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         || response
             .header("Content-Type")
             .is_some_and(|v| v.contains("javascript")))
-        && !header_values(&response, "X-Content-Type-Options")
-            .any(|v| v.split(',').any(|v| v.trim().eq_ignore_ascii_case("nosniff")))
+        && !header_values(&response, "X-Content-Type-Options").any(|v| {
+            v.split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case("nosniff"))
+        })
     {
         add(
             "nosniff",
@@ -1592,7 +1581,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             })
         }))
         && header_values(&response, "Cache-Control").any(|v| {
-            v.split(',').any(|d| d.trim().eq_ignore_ascii_case("public"))
+            v.split(',')
+                .any(|d| d.trim().eq_ignore_ascii_case("public"))
         })
         && !header_values(&response, "Cache-Control").any(|v| {
             let value = v.to_ascii_lowercase();
@@ -1623,7 +1613,11 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     if is_json(&request)
         && let Ok(body) = std::str::from_utf8(&request.body)
     {
-        parameters.extend(json_spans(body, 4096).into_iter().map(|(k, _, _, v)| (k, v)));
+        parameters.extend(
+            json_spans(body, 4096)
+                .into_iter()
+                .map(|(k, _, _, v)| (k, v)),
+        );
     }
     for (name, value) in &parameters {
         if re(
@@ -1655,10 +1649,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if request.body.starts_with(&[0xac, 0xed, 0, 5])
         || response.body.starts_with(&[0xac, 0xed, 0, 5])
-        || request
-            .body
-            .windows(5)
-            .any(|window| window == b"rO0AB")
+        || request.body.windows(5).any(|window| window == b"rO0AB")
     {
         add(
             "serialized-object",
@@ -3233,7 +3224,10 @@ fn admit(
         return;
     }
     if probes.len() >= cap
-        || request.len() > 64usize.saturating_mul(1024 * 1024).saturating_sub(*plan_bytes)
+        || request.len()
+            > 64usize
+                .saturating_mul(1024 * 1024)
+                .saturating_sub(*plan_bytes)
     {
         *skipped += 1;
         return;
@@ -3579,7 +3573,11 @@ pub fn active_plan_with_stats(base: &Exchange, settings: &ScanSettings) -> anyho
         ("env-file", "/actuator/env".into(), FileKind::Actuator),
         ("aws-credentials", "/.aws/credentials".into(), FileKind::Aws),
         ("ds-store", "/.DS_Store".into(), FileKind::DsStore),
-        ("server-status", "/server-status".into(), FileKind::ServerStatus),
+        (
+            "server-status",
+            "/server-status".into(),
+            FileKind::ServerStatus,
+        ),
         ("elmah", "/elmah.axd".into(), FileKind::Elmah),
         ("svn-metadata", "/.svn/entries".into(), FileKind::Svn),
         ("jwks", "/.well-known/jwks.json".into(), FileKind::Jwks),
@@ -4034,9 +4032,13 @@ pub fn evaluate_cached(
                         .iter()
                         .any(|(id, _)| *id == "web-config"),
                     FileKind::Actuator => {
-                        serde_json::from_str::<serde_json::Value>(&body).ok().is_some_and(|v| {
-                            v.get("propertySources").is_some() || v.get("activeProfiles").is_some()
-                        }) && !body.to_ascii_lowercase().contains("<html")
+                        serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .is_some_and(|v| {
+                                v.get("propertySources").is_some()
+                                    || v.get("activeProfiles").is_some()
+                            })
+                            && !body.to_ascii_lowercase().contains("<html")
                     }
                     FileKind::Aws => {
                         re(r"(?im)^\s*\[[^\]]+\]\s*$", &body)
@@ -4059,8 +4061,7 @@ pub fn evaluate_cached(
                             || body.contains("Powered by <a href=\"http://code.google.com/p/elmah/")
                     }
                     FileKind::Svn => {
-                        re(r"(?m)^\d+\s*$", &body)
-                            && re(r"(?m)^(?:dir|file)\s*$", &body)
+                        re(r"(?m)^\d+\s*$", &body) && re(r"(?m)^(?:dir|file)\s*$", &body)
                     }
                 }
         }
@@ -4520,9 +4521,12 @@ fn quote_entity(value: &str, quote: char) -> Option<&str> {
     const SINGLE: [&str; 5] = ["&#39;", "&#039;", "&#x27;", "&#X27;", "&apos;"];
     const DOUBLE: [&str; 5] = ["&#34;", "&#034;", "&#x22;", "&#X22;", "&quot;"];
     let entities = if quote == '\'' { &SINGLE } else { &DOUBLE };
-    entities
-        .iter()
-        .find_map(|entity| value.get(..entity.len()).filter(|head| head.eq_ignore_ascii_case(entity)).map(|_| &value[entity.len()..]))
+    entities.iter().find_map(|entity| {
+        value
+            .get(..entity.len())
+            .filter(|head| head.eq_ignore_ascii_case(entity))
+            .map(|_| &value[entity.len()..])
+    })
 }
 
 pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Vec<Candidate> {
@@ -4568,8 +4572,7 @@ pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Ve
                 .collect();
             // The required delay scales with the control's own latency and
             // jitter so a slow but healthy target is not a false negative.
-            let control_span =
-                controls.iter().max().unwrap() - controls.iter().min().unwrap();
+            let control_span = controls.iter().max().unwrap() - controls.iter().min().unwrap();
             let required = (controls.iter().copied().max().unwrap_or_default() / 3)
                 .max(control_span.saturating_mul(4))
                 .max(1200);

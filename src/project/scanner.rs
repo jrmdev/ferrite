@@ -137,8 +137,7 @@ impl Project {
     }
     pub(crate) fn clear_scan_notes(&mut self, job: u64) -> Result<()> {
         let prefix = format!("scan:{job};");
-        self.scan_index
-            .retain(|key, _| !key.starts_with(&prefix));
+        self.scan_index.retain(|key, _| !key.starts_with(&prefix));
         let Some(db) = &self.db else {
             return Ok(());
         };
