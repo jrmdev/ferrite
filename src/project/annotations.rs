@@ -20,10 +20,10 @@ impl Project {
         tx.open_table(ANNOTATIONS)?;
         tx.commit()?;
         let tx = db.begin_read()?;
+        let annotations = Arc::make_mut(&mut self.annotations);
         for item in tx.open_table(ANNOTATIONS)?.iter()? {
             let (key, value) = item?;
-            self.annotations
-                .insert(key.value(), serde_json::from_slice(value.value())?);
+            annotations.insert(key.value(), serde_json::from_slice(value.value())?);
         }
         Ok(())
     }
@@ -33,8 +33,15 @@ impl Project {
     pub fn annotations(&self) -> &BTreeMap<u64, Annotation> {
         &self.annotations
     }
+    #[cfg(feature = "gui")]
+    pub(crate) fn annotation_snapshot(&self) -> Arc<BTreeMap<u64, Annotation>> {
+        self.annotations.clone()
+    }
     /// Set or clear (when empty) the annotations of several exchanges at once.
     pub fn set_annotations(&mut self, changes: &[(u64, Annotation)]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
         if let Some(db) = &self.db {
             let tx = db.begin_write()?;
             {
@@ -49,11 +56,12 @@ impl Project {
             }
             tx.commit()?;
         }
+        let annotations = Arc::make_mut(&mut self.annotations);
         for (id, annotation) in changes {
             if annotation.is_empty() {
-                self.annotations.remove(id);
+                annotations.remove(id);
             } else {
-                self.annotations.insert(*id, annotation.clone());
+                annotations.insert(*id, annotation.clone());
             }
         }
         Ok(())

@@ -5,8 +5,7 @@ use crate::history::{Annotation, short_content_type};
 use crate::model::Exchange;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::{borrow::Borrow, cmp::Ordering, collections::BTreeMap};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SortColumn {
@@ -100,6 +99,65 @@ impl HistorySort {
     }
 }
 
+#[derive(Default)]
+pub(super) struct TableRows {
+    indices: Vec<usize>,
+    ids: Vec<u64>,
+    visibility_changed: bool,
+}
+
+impl TableRows {
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn rebuild(
+        &mut self,
+        exchanges: &[impl Borrow<Exchange>],
+        sort: HistorySort,
+        annotations: &BTreeMap<u64, Annotation>,
+        mut matches: impl FnMut(&Exchange) -> bool,
+    ) {
+        self.indices.clear();
+        self.indices.extend(
+            exchanges
+                .iter()
+                .enumerate()
+                .filter_map(|(index, flow)| matches(flow.borrow()).then_some(index)),
+        );
+        self.sort(exchanges, sort, annotations);
+        self.visibility_changed = true;
+    }
+
+    fn sort(
+        &mut self,
+        exchanges: &[impl Borrow<Exchange>],
+        sort: HistorySort,
+        annotations: &BTreeMap<u64, Annotation>,
+    ) {
+        let flow = |index: usize| exchanges[index].borrow();
+        if sort.column == SortColumn::Type {
+            self.indices.sort_by_cached_key(|&index| {
+                let flow = flow(index);
+                (short_content_type(&flow.response), flow.id)
+            });
+            if sort.descending {
+                self.indices.reverse();
+            }
+        } else {
+            self.indices
+                .sort_unstable_by(|&a, &b| sort.compare_with(flow(a), flow(b), annotations));
+        }
+        self.ids.clear();
+        self.ids
+            .extend(self.indices.iter().map(|&index| flow(index).id));
+    }
+}
+
 /// How the table is presented: which history it shows and with what notes.
 pub(super) struct TableView<'a> {
     pub intruder: bool,
@@ -109,7 +167,8 @@ pub(super) struct TableView<'a> {
 
 pub(super) fn show(
     ui: &mut egui::Ui,
-    rows: &mut [&Exchange],
+    exchanges: &[impl Borrow<Exchange>],
+    rows: &mut TableRows,
     selection: &mut HistorySelection,
     sort: &mut HistorySort,
     viewport: &mut HistoryViewport,
@@ -122,30 +181,31 @@ pub(super) fn show(
     } = view;
     let mut action = None;
     let original_sort = *sort;
-    rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
-    let mut initial_ids: Vec<_> = rows.iter().map(|flow| flow.id).collect();
-    let offset = viewport.offset_for(&initial_ids, *sort);
-    let invert_stripes = viewport.invert_stripes_for(&initial_ids, *sort);
+    let (offset, invert_stripes) = viewport.restore(&rows.ids, *sort);
     let height = ui.available_height();
     let entry_id = ui.id().with(("history-entry", intruder));
     let focus_id = ui.id().with(("history-keyboard", intruder));
-    selection.retain_visible(&initial_ids);
+    if std::mem::take(&mut rows.visibility_changed) {
+        selection.retain_visible(&rows.ids);
+    }
     let target = super::table_arrow_navigation(
         ui,
         focus_id,
-        selection
-            .focused
-            .and_then(|id| initial_ids.iter().position(|row| *row == id)),
-        initial_ids.len(),
+        || {
+            selection
+                .focused
+                .and_then(|id| rows.ids.iter().position(|row| *row == id))
+        },
+        rows.len(),
         ((height - 26.0).max(0.0) / 22.0) as usize,
     );
     if ui.memory(|memory| memory.has_focus(focus_id))
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
     {
-        selection.select_all(&initial_ids);
+        selection.select_all(&rows.ids);
     }
     if let Some(index) = target {
-        selection.click(initial_ids[index], &initial_ids, false, false, false);
+        selection.click(rows.ids[index], &rows.ids, false, false, false);
     }
     egui::ScrollArea::horizontal()
         .id_salt(("history-horizontal", intruder))
@@ -195,11 +255,9 @@ pub(super) fn show(
             }).body(|mut body| {
                 // Sort after rendering headers so a click updates rows in the same frame.
                 if *sort != original_sort {
-                    rows.sort_unstable_by(|a, b| sort.compare_with(a, b, annotations));
-                    initial_ids.clear();
-                    initial_ids.extend(rows.iter().map(|flow| flow.id));
+                    rows.sort(exchanges, *sort, annotations);
                 }
-                let visible = &initial_ids;
+                let visible = &rows.ids;
                 // Insert the stripes behind the cells so selection/hover fills still take precedence.
                 let painter = body.ui_mut().painter().clone();
                 let background = painter.add(egui::Shape::Noop);
@@ -213,8 +271,9 @@ pub(super) fn show(
                 let mut stripes = Vec::new();
                 body.rows(20.0, rows.len(), |mut row| {
                     let striped = row.index().is_multiple_of(2) != invert_stripes;
-                    let flow = rows[row.index()];
+                    let flow = exchanges[rows.indices[row.index()]].borrow();
                     let row_id = entry_id.with(flow.id);
+                    let annotation = annotations.get(&flow.id);
                     let selected = selection.ids.contains(&flow.id);
                     row.set_selected(selected);
                     row.set_hovered(false);
@@ -223,7 +282,7 @@ pub(super) fn show(
                         short_content_type(&flow.response),
                         flow.response_length().map_or_else(|| "—".into(), |len| len.to_string()), flow.duration_ms.to_string(),
                         flow.tool.clone(), flow.method.clone(),
-                        annotations.get(&flow.id).map(|a| a.comment.lines().next().unwrap_or("").to_string()).unwrap_or_default(),
+                        annotation.map(|a| a.comment.lines().next().unwrap_or("").to_string()).unwrap_or_default(),
                         flow.url.clone()];
                     let mut rect = egui::Rect::NOTHING;
                     let mut response = None;
@@ -253,7 +312,7 @@ pub(super) fn show(
                         });
                     }
                     let response = response.unwrap();
-                    let highlight = annotations.get(&flow.id).and_then(|a| a.highlight).map(|h| {
+                    let highlight = annotation.and_then(|a| a.highlight).map(|h| {
                         let [r, g, b] = h.rgb();
                         egui::Color32::from_rgba_unmultiplied(r, g, b, if dark { 70 } else { 90 })
                     });
@@ -277,7 +336,7 @@ pub(super) fn show(
                             else { visible.iter().filter(|id| selection.ids.contains(id)).copied().collect() };
                         action = Some((ids, value));
                     }
-                    let comment = annotations.get(&flow.id).map(|a| a.comment.as_str()).filter(|c| !c.is_empty());
+                    let comment = annotation.map(|a| a.comment.as_str()).filter(|c| !c.is_empty());
                     match (&flow.error, comment) {
                         (Some(error), Some(comment)) => { response.on_hover_text(format!("{comment}\n{error}")); }
                         (Some(error), None) => { response.on_hover_text(error); }
@@ -287,7 +346,7 @@ pub(super) fn show(
                 });
                 painter.set(background, egui::Shape::Vec(stripes));
             });
-            viewport.record(&initial_ids, output.state.offset.y, original_sort, invert_stripes);
+            viewport.record(&rows.ids, output.state.offset.y, original_sort, invert_stripes);
         });
     action
 }
@@ -302,11 +361,10 @@ fn url_text(ui: &egui::Ui, url: &str) -> egui::text::LayoutJob {
         egui::TextFormat::simple(font_id.clone(), ui.visuals().text_color()),
     );
     if query_start < url.len() {
-        let grey = if ui.visuals().dark_mode { 160 } else { 104 };
         job.append(
             &url[query_start..],
             0.0,
-            egui::TextFormat::simple(font_id, egui::Color32::from_gray(grey)),
+            egui::TextFormat::simple(font_id, super::theme::muted_detail_color(ui.visuals())),
         );
     }
     job
@@ -377,9 +435,11 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        let mut rows: Vec<_> = flows.iter().collect();
+                        let mut rows = TableRows::default();
+                        rows.rebuild(&flows, sort, &BTreeMap::new(), |_| true);
                         show(
                             ui,
+                            &flows,
                             &mut rows,
                             &mut selection,
                             &mut sort,
@@ -451,7 +511,7 @@ mod tests {
         assert!(selection.focused.is_some_and(|id| id < 22 && id > 1));
         assert_eq!(selection.ids.len(), 30);
         let ids: Vec<_> = (1..=30).rev().collect();
-        assert!(viewport.offset_for(&ids, sort) > 0.0);
+        assert!(viewport.restore(&ids, sort).0 > 0.0);
     }
 
     #[test]
@@ -481,9 +541,11 @@ mod tests {
                     },
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            let mut rows: Vec<_> = flows.iter().collect();
+                            let mut rows = TableRows::default();
+                            rows.rebuild(flows, sort, &BTreeMap::new(), |_| true);
                             show(
                                 ui,
+                                flows,
                                 &mut rows,
                                 &mut selection,
                                 &mut sort,
@@ -580,20 +642,15 @@ mod tests {
             flow
         })
         .collect();
-        let mut rows: Vec<_> = flows.iter().collect();
+        let mut rows = TableRows::default();
+        let annotations = BTreeMap::new();
         let mut sort = HistorySort::default();
         sort.select(SortColumn::Type);
-        rows.sort_unstable_by(|a, b| sort.compare(a, b));
-        assert_eq!(
-            rows.iter().map(|flow| flow.id).collect::<Vec<_>>(),
-            [1, 3, 4, 2]
-        );
+        rows.rebuild(&flows, sort, &annotations, |_| true);
+        assert_eq!(rows.ids, [1, 3, 4, 2]);
         sort.select(SortColumn::Type);
-        rows.sort_unstable_by(|a, b| sort.compare(a, b));
-        assert_eq!(
-            rows.iter().map(|flow| flow.id).collect::<Vec<_>>(),
-            [2, 4, 3, 1]
-        );
+        rows.sort(&flows, sort, &annotations);
+        assert_eq!(rows.ids, [2, 4, 3, 1]);
     }
 
     #[test]

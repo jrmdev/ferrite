@@ -53,7 +53,6 @@ impl Message {
                         .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)),
                 "Invalid header name"
             );
-            ensure!(!v.contains(['\r', '\n', '\0']), "Invalid header value");
             headers.push((k.into(), v.trim().into()));
         }
         Ok(Self {
@@ -473,12 +472,23 @@ async fn read_body<R: AsyncRead + Unpin>(
 }
 /// Editors accept LF; normalize only the header section, preserving body bytes.
 pub fn from_editor(text: &str) -> Result<Message> {
-    if text.contains("\r\n\r\n") {
-        return Message::parse(text.as_bytes());
-    }
-    let (headers, body) = text
-        .split_once("\n\n")
-        .ok_or_else(|| anyhow::anyhow!("Add a blank line after the headers"))?;
+    let bytes = text.as_bytes();
+    let split = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .or_else(|| bytes.windows(3).position(|w| w == b"\r\n\n"))
+        .or_else(|| bytes.windows(3).position(|w| w == b"\n\r\n"))
+        .or_else(|| bytes.windows(2).position(|w| w == b"\n\n"));
+    let split = split.ok_or_else(|| anyhow::anyhow!("Add a blank line after the headers"))?;
+    let delimiter_len = if bytes[split..].starts_with(b"\r\n\r\n") {
+        4
+    } else if bytes[split..].starts_with(b"\r\n\n") || bytes[split..].starts_with(b"\n\r\n") {
+        3
+    } else {
+        2
+    };
+    let headers = &text[..split];
+    let body = &text[split + delimiter_len..];
     let mut bytes = headers
         .replace("\r\n", "\n")
         .replace('\n', "\r\n")
@@ -490,7 +500,11 @@ pub fn from_editor(text: &str) -> Result<Message> {
 
 /// True when bytes display faithfully as editable text.
 pub fn is_display_text(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
+    display_text(bytes).is_some()
+}
+
+fn display_text(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes).ok().filter(|text| {
         text.chars()
             .all(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\t'))
     })
@@ -498,16 +512,21 @@ pub fn is_display_text(bytes: &[u8]) -> bool {
 
 /// Lowercase hex in rows of 24 bytes, as used by the message editors.
 pub fn hex_dump(bytes: &[u8]) -> String {
-    bytes
-        .chunks(24)
-        .map(|row| {
-            row.iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
+    for (row, bytes) in bytes.chunks(24).enumerate() {
+        if row != 0 {
+            output.push('\n');
+        }
+        for (column, &byte) in bytes.iter().enumerate() {
+            if column != 0 {
+                output.push(' ');
+            }
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    output
 }
 
 /// Parse editor hex, ignoring whitespace.
@@ -525,9 +544,9 @@ pub fn parse_hex(text: &str) -> Result<Vec<u8>> {
 
 /// Editor representation of message bytes: text when faithful, else hex.
 pub fn editor_text(bytes: &[u8]) -> (String, bool) {
-    match std::str::from_utf8(bytes) {
-        Ok(text) if is_display_text(bytes) => (text.into(), false),
-        _ => (hex_dump(bytes), true),
+    match display_text(bytes) {
+        Some(text) => (text.into(), false),
+        None => (hex_dump(bytes), true),
     }
 }
 

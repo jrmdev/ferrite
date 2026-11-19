@@ -34,10 +34,11 @@ use history_export::{ExportOutcome, HistoryExport};
 use history_selection::HistorySelection;
 use history_table::HistorySort;
 use history_viewport::HistoryViewport;
-use http_editor::{http_editor, message_view};
+use http_editor::{Find, http_editor, message_view};
 use response_content::ResponseCache;
 use std::{
     collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, atomic::Ordering, mpsc},
     time::Duration,
@@ -95,6 +96,7 @@ enum Event {
     AttackDone(Result<usize>),
     Browser(browser_view::BrowserEvent),
     Mcp(Result<crate::mcp::ipc::IpcServer>),
+    McpNetworkStopped,
 }
 pub struct Workbench {
     engine: Arc<Engine>,
@@ -116,6 +118,7 @@ pub struct Workbench {
     scope_exclude: String,
     rows: Vec<Arc<Exchange>>,
     history_revision: Option<u64>,
+    history_matches: history_filters::HistoryMatches,
     history_sort: [HistorySort; 2],
     history_selection: [HistorySelection; 2],
     history_viewport: [HistoryViewport; 2],
@@ -126,6 +129,7 @@ pub struct Workbench {
     search_regex: bool,
     case_sensitive: bool,
     scope_only: bool,
+    history_request_hex: bool,
     response_hex: bool,
     response_cache: ResponseCache,
     message: String,
@@ -187,7 +191,7 @@ fn hex_headers(
     ui.label("HTTP headers · raw message below in hex");
     let height = (ui.available_height() * 0.3).min(110.0);
     let output = ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
-        http_editor(ui, &mut head.as_ref(), document)
+        http_editor(ui, &mut head.as_ref(), document, None)
     });
     ui.separator();
     Some(output.inner.inner.response)
@@ -217,7 +221,7 @@ fn compact_rows(ui: &mut egui::Ui) {
 fn table_arrow_navigation(
     ui: &mut egui::Ui,
     id: egui::Id,
-    selected: Option<usize>,
+    selected: impl FnOnce() -> Option<usize>,
     len: usize,
     page_rows: usize,
 ) -> Option<usize> {
@@ -242,7 +246,10 @@ fn table_arrow_navigation(
             0
         }
     });
-    let current = selected.filter(|index| *index < len)?;
+    if direction == 0 {
+        return None;
+    }
+    let current = selected().filter(|index| *index < len)?;
     match direction {
         -1 if current > 0 => Some(current - 1),
         1 if current + 1 < len => Some(current + 1),
@@ -250,10 +257,6 @@ fn table_arrow_navigation(
         2 if current + 1 < len => Some(current.saturating_add(page_rows.max(1)).min(len - 1)),
         _ => None,
     }
-}
-
-fn focus_table(ui: &egui::Ui, id: egui::Id) {
-    ui.memory_mut(|memory| memory.request_focus(id));
 }
 
 fn split_panes(ui: &mut egui::Ui, id: &str, vertical: bool, initial: f32) -> [egui::Ui; 2] {
@@ -577,6 +580,7 @@ impl Workbench {
             scope_exclude: s.scope.exclude.join("\n"),
             rows: vec![],
             history_revision: None,
+            history_matches: Default::default(),
             history_sort: [HistorySort::default(); 2],
             history_selection: Default::default(),
             history_viewport: Default::default(),
@@ -587,6 +591,7 @@ impl Workbench {
             search_regex: false,
             case_sensitive: false,
             scope_only: false,
+            history_request_hex: false,
             response_hex: false,
             response_cache: ResponseCache::default(),
             message: String::new(),
@@ -626,7 +631,7 @@ impl Workbench {
         match result {
             Ok(v) => Some(v),
             Err(e) => {
-                let message = format!("{e:#}");
+                let message = crate::error::friendly(&e);
                 self.alerts
                     .push(Level::Error, "Application", message.clone());
                 self.message = message;
@@ -667,6 +672,7 @@ impl Workbench {
                 }
                 Event::Browser(event) => self.browser_event(event),
                 Event::Mcp(result) => self.mcp_started(result),
+                Event::McpNetworkStopped => self.mcp_network_stopped(),
                 Event::Repeater(tab, result) => self.repeater_sent(tab, result),
                 Event::AttackDone(result) => {
                     self.attack_running = false;
@@ -783,6 +789,7 @@ impl Workbench {
             self.project_path = path;
             self.rows.clear();
             self.history_revision = None;
+            self.history_matches = Default::default();
             self.seen = u64::MAX;
             self.websocket_view = websocket_view::State::default();
             self.scanner_view = scanner_view::State::default();
@@ -1306,79 +1313,66 @@ impl Workbench {
                 }
             });
         }
-        let mut filter = self
-            .engine
-            .project
-            .lock()
-            .unwrap()
-            .workspace
-            .history_filter
-            .clone();
-        if intruder_only {
+        let table = usize::from(intruder_only);
+        let mut uncached_rows = history_table::TableRows::default();
+        let annotations = self.engine.project.lock().unwrap().annotation_snapshot();
+        let rows = if intruder_only {
             self.search_bar(ui);
+            let pattern = match self.search_pattern() {
+                Ok(pattern) => Some(pattern),
+                Err(error) => {
+                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                    None
+                }
+            };
+            let scope = self.engine.settings().scope;
+            let in_scope = scope_matcher(&scope, self.scope_only);
+            uncached_rows.rebuild(&self.rows, self.history_sort[table], &annotations, |flow| {
+                flow.tool.starts_with("Intruder")
+                    && self.filtered(flow, pattern.as_ref(), &in_scope)
+            });
+            &mut uncached_rows
         } else {
+            let mut filter = self
+                .engine
+                .project
+                .lock()
+                .unwrap()
+                .workspace
+                .history_filter
+                .clone();
             history_filters::show(ui, &mut filter);
             let mut project = self.engine.project.lock().unwrap();
-            if project.workspace.history_filter != filter {
+            let result = if project.workspace.history_filter != filter {
                 project.workspace.history_filter = filter.clone();
-                let result = project.save_workspace();
-                drop(project);
+                Some(project.save_workspace())
+            } else {
+                None
+            };
+            drop(project);
+            if let Some(result) = result {
                 self.report(result);
             }
-        }
-        let pattern = match if intruder_only {
-            self.search_pattern().map(Some)
-        } else {
-            Ok(None)
-        } {
-            Ok(r) => r,
-            Err(e) => {
-                ui.colored_label(ui.visuals().error_fg_color, e.to_string());
-                None
+            let key = history_filters::FilterKey {
+                revision: self.history_revision,
+                scope: filter.in_scope_only.then(|| self.engine.settings().scope),
+                filter,
+                reveal: self.websocket_view.reveal_handshake,
+                annotations: annotations.clone(),
+            };
+            let (rows, error) =
+                self.history_matches
+                    .update(&self.rows, key, self.history_sort[table]);
+            if let Some(error) = error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
             }
+            rows
         };
-        let compiled = match filter.compile() {
-            Ok(r) => Some(r),
-            Err(e) => {
-                if !intruder_only {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Invalid search pattern: {e}"),
-                    );
-                }
-                None
-            }
-        };
-        let scope = self.engine.settings().scope;
-        let in_scope = scope_matcher(
-            &scope,
-            if intruder_only {
-                self.scope_only
-            } else {
-                filter.in_scope_only
-            },
-        );
-        let annotations = self.engine.project.lock().unwrap().annotations().clone();
-        let mut rows: Vec<_> = self
-            .rows
-            .iter()
-            .map(Arc::as_ref)
-            .filter(|r| {
-                if intruder_only {
-                    r.tool.starts_with("Intruder") && self.filtered(r, pattern.as_ref(), &in_scope)
-                } else {
-                    self.websocket_view.reveal_handshake == Some(r.id)
-                        || compiled.as_ref().is_some_and(|filter| {
-                            filter.matches_using(r, annotations.get(&r.id), &in_scope)
-                        })
-                }
-            })
-            .collect();
         ui.label(format!(
             "{} matching / {} stored exchanges · {} selected",
             rows.len(),
             self.rows.len(),
-            self.history_selection[usize::from(intruder_only)].ids.len()
+            self.history_selection[table].ids.len()
         )).on_hover_text("Ctrl/Cmd-click to toggle rows; Shift-click to select a range. Right-click to export the selection.");
         let [mut list, mut detail] = split_panes(ui, "history-detail", true, 0.38);
         if rows.is_empty() {
@@ -1390,10 +1384,11 @@ impl Workbench {
         }
         let action = history_table::show(
             &mut list,
-            &mut rows,
-            &mut self.history_selection[usize::from(intruder_only)],
-            &mut self.history_sort[usize::from(intruder_only)],
-            &mut self.history_viewport[usize::from(intruder_only)],
+            &self.rows,
+            rows,
+            &mut self.history_selection[table],
+            &mut self.history_sort[table],
+            &mut self.history_viewport[table],
             history_table::TableView {
                 intruder: intruder_only,
                 timezone: self.preferences.timezone(),
@@ -1403,12 +1398,12 @@ impl Workbench {
         if let Some((ids, action)) = action {
             self.entry_action(ui.ctx(), &ids, action);
         }
-        if let Some(flow) = self.history_selection[usize::from(intruder_only)]
+        if let Some(flow) = self.history_selection[table]
             .focused
-            .and_then(|id| self.rows.iter().find(|r| r.id == id))
+            .and_then(|id| self.history_exchange(id))
             .cloned()
         {
-            self.flow_view(&mut detail, &flow);
+            self.flow_view(&mut detail, &flow, !intruder_only);
         } else {
             detail.label("Select an exchange to inspect its request and response.");
         }
@@ -1419,6 +1414,7 @@ impl Workbench {
             if self.report(result).is_some() {
                 let ids: std::collections::HashSet<_> = ids.iter().copied().collect();
                 self.rows.retain(|flow| !ids.contains(&flow.id));
+                self.history_matches.invalidate();
                 if self.selected.is_some_and(|id| ids.contains(&id)) {
                     self.selected = None;
                 }
@@ -1433,12 +1429,17 @@ impl Workbench {
             }
             return;
         }
-        let by_id: BTreeMap<_, _> = self.rows.iter().map(|flow| (flow.id, flow)).collect();
-        let flows = ids
-            .iter()
-            .filter_map(|id| by_id.get(id).map(|flow| (***flow).clone()))
-            .collect();
-        self.exchange_action(ctx, flows, action);
+        let flows = ids.iter().filter_map(|&id| self.history_exchange(id));
+        if matches!(action, EntryAction::Export) {
+            self.history_export = Some(HistoryExport::new(flows.cloned().collect()));
+        } else {
+            let flows = flows.map(|flow| (**flow).clone()).collect();
+            self.exchange_action(ctx, flows, action);
+        }
+    }
+    fn history_exchange(&self, id: u64) -> Option<&Arc<Exchange>> {
+        let index = self.rows.binary_search_by_key(&id, |flow| flow.id).ok()?;
+        Some(&self.rows[index])
     }
     fn exchange_action(&mut self, ctx: &egui::Context, flows: Vec<Exchange>, action: EntryAction) {
         match action {
@@ -1482,7 +1483,7 @@ impl Workbench {
                     } else {
                         &flow.request
                     };
-                    self.send_to_comparer(slot, label, &bytes.clone());
+                    self.send_to_comparer(slot, label, bytes);
                 }
             }
             EntryAction::Decoder(response) => {
@@ -1534,7 +1535,11 @@ impl Workbench {
                 }
             }
             EntryAction::Scanner => self.send_to_scanner(flows),
-            EntryAction::Export => self.history_export = Some(HistoryExport::new(flows)),
+            EntryAction::Export => {
+                self.history_export = Some(HistoryExport::new(
+                    flows.into_iter().map(Arc::new).collect(),
+                ));
+            }
             EntryAction::Delete => self.entry_action(
                 ctx,
                 &flows.iter().map(|flow| flow.id).collect::<Vec<_>>(),
@@ -1645,11 +1650,17 @@ impl Workbench {
             self.exchange_action(ctx, vec![flow], action);
         }
     }
-    fn flow_view(&mut self, ui: &mut egui::Ui, flow: &Exchange) {
+    fn flow_view(&mut self, ui: &mut egui::Ui, flow: &Exchange, separate_hex: bool) {
         if let Some(e) = &flow.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        let request = message_view(&flow.request, self.response_hex);
+        let request_hex = if separate_hex {
+            self.history_request_hex
+        } else {
+            ui.checkbox(&mut self.response_hex, "Hex");
+            self.response_hex
+        };
+        let request = message_view(&flow.request, request_hex);
         let response = self.response_cache.get(
             flow.id,
             &flow.response,
@@ -1658,30 +1669,28 @@ impl Workbench {
             self.response_hex,
             self.engine.settings().max_message_bytes,
         );
-        egui::TopBottomPanel::bottom(ui.id().with("flow-find"))
-            .resizable(false)
-            .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| {
-                highlight::find_bar(
-                    ui,
-                    &[("request", &request), ("response", &response)],
-                    |ui| {
-                        ui.checkbox(&mut self.response_hex, "Hex");
-                    },
-                );
-            });
         let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
         subsection_heading(&mut request_ui, "Request");
         subsection_heading(&mut response_ui, "Response");
         let request_output = http_editor(
             &mut request_ui,
-            &mut request.as_str(),
-            ("request-view", flow.id, self.response_hex),
+            &mut request.as_ref(),
+            ("request-view", flow.id, request_hex),
+            Some(if separate_hex {
+                Find::WithHex(Stage::Request, &mut self.history_request_hex)
+            } else {
+                Find::Text(Stage::Request)
+            }),
         );
         let response_output = http_editor(
             &mut response_ui,
             &mut response.as_ref(),
             ("response-view", flow.id, self.response_hex),
+            Some(if separate_hex {
+                Find::WithHex(Stage::Response, &mut self.response_hex)
+            } else {
+                Find::Text(Stage::Response)
+            }),
         );
         let action = entry_menu(&request_output.inner.response, true)
             .or_else(|| entry_menu(&response_output.inner.response, true));
@@ -1828,7 +1837,11 @@ impl Workbench {
                 self.load_intercept(item);
             }
         }
-        if let Some(id) = self.intercept_id {
+        if let Some(item) = pending
+            .iter()
+            .find(|item| Some(item.id) == self.intercept_id)
+        {
+            let id = item.id;
             ui.horizontal(|ui| {
                 if ui.button("Forward").clicked() {
                     let message = pending
@@ -1900,6 +1913,7 @@ impl Workbench {
                                 ui,
                                 &mut self.intercept_edit,
                                 ("intercept-editor", id, self.intercept_hex),
+                                Some(Find::Text(item.stage)),
                             )
                         },
                     )
@@ -1912,6 +1926,7 @@ impl Workbench {
                     ui,
                     &mut self.intercept_edit,
                     ("intercept-editor", id, self.intercept_hex),
+                    Some(Find::Text(item.stage)),
                 )
             };
             let action = item_menu(&output.inner.response, false, Some("Drop")).or_else(|| {
@@ -2055,7 +2070,7 @@ impl Workbench {
             .and_then(|id| self.rows.iter().find(|r| r.id == id))
             .cloned()
         {
-            self.flow_view(&mut detail, &flow);
+            self.flow_view(&mut detail, &flow, false);
         } else {
             detail.label("Select an exchange to inspect its request and response.");
         }
@@ -2094,7 +2109,12 @@ impl Workbench {
             });
             ui.label("Place paired § markers around payload positions, for example ?q=§test§.");
             ui.allocate_ui(egui::vec2(ui.available_width(), 120.0), |ui| {
-                http_editor(ui, &mut attack.template, "attack-template");
+                http_editor(
+                    ui,
+                    &mut attack.template,
+                    "attack-template",
+                    Some(Find::Text(Stage::Request)),
+                );
             });
             ui.horizontal(|ui| {
                 subsection_heading(ui, "Payload sets");
@@ -2224,11 +2244,8 @@ impl Workbench {
         let parsed = serde_json::from_str::<crate::model::Settings>(&self.settings_json);
         if let Ok(mut s) = parsed {
             let rules_before = s.rules.clone();
-            ui.horizontal(|ui| {
-                ui.label("Listen");
-                ui.text_edit_singleline(&mut s.listen);
-                ui.checkbox(&mut s.transparent, "Invisible / transparent HTTP + TLS");
-            });
+            proxy_listener_fields(ui, &mut s.listen);
+            ui.checkbox(&mut s.transparent, "Invisible / transparent HTTP + TLS");
             if s.transparent {
                 ui.horizontal(|ui| {
                     ui.label("Fallback target");
@@ -2355,6 +2372,56 @@ impl Workbench {
         ui.label("Invisible mode accepts origin-form HTTP and direct TLS with SNI. DNS overrides route redirected hosts back to the real server. When invisible mode is enabled, a fallback target can handle clients without Host/SNI.");
     }
 }
+fn proxy_listener_fields(ui: &mut egui::Ui, listen: &mut String) {
+    let Ok(mut address) = listen.parse::<SocketAddr>() else {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            "Enter a valid listen address and port in Advanced JSON.",
+        );
+        return;
+    };
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let previous_ip = (address.ip() != loopback).then_some(address.ip());
+    let mut ip = previous_ip;
+    let mut port = address.port();
+    ui.horizontal(|ui| {
+        ui.label("Listen address");
+        listen_interface_combo(ui, "proxy-listen-address", &mut ip);
+        ui.label("Port");
+        ui.add(egui::DragValue::new(&mut port).range(0..=u16::MAX));
+    });
+    if ip != previous_ip {
+        address = SocketAddr::new(ip.unwrap_or(loopback), port);
+    } else if port != address.port() {
+        address.set_port(port);
+    } else {
+        return;
+    }
+    *listen = address.to_string();
+}
+
+fn listen_interface_combo(ui: &mut egui::Ui, id: &str, ip: &mut Option<IpAddr>) {
+    const LOOPBACK: &str = "Loopback only (127.0.0.1)";
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(ip.map_or_else(|| LOOPBACK.into(), |ip| ip.to_string()))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(ip, None, LOOPBACK);
+            match crate::mcp::network::interface_addresses() {
+                Ok(addresses) if addresses.is_empty() => {
+                    ui.weak("No network addresses available");
+                }
+                Ok(addresses) => {
+                    for (name, address) in addresses {
+                        ui.selectable_value(ip, Some(address), format!("{name} ({address})"));
+                    }
+                }
+                Err(error) => {
+                    ui.weak(format!("Could not list interfaces: {error}"));
+                }
+            }
+        });
+}
+
 fn scope_matcher(scope: &crate::model::Scope, enabled: bool) -> impl Fn(&str) -> bool + use<> {
     let compile = |patterns: &[String]| {
         patterns
@@ -2539,6 +2606,7 @@ impl eframe::App for Workbench {
                         if let Some(Some(id)) = self.report(result) {
                             self.websocket_view.show_history = false;
                             self.websocket_view.reveal_handshake = Some(id);
+                            self.history_matches.invalidate();
                             self.history_selection[0].focused = Some(id);
                             self.history_selection[0].ids.clear();
                             self.history_selection[0].ids.insert(id);
@@ -2604,6 +2672,7 @@ impl eframe::App for Workbench {
         }
         self.shutdown_browser();
         self.mcp.deny_all();
+        self.mcp_view.network_server.take();
         // Dropping the bridge disconnects clients and removes the endpoint file.
         self.mcp_view.server.take();
         self.stop();

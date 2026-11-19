@@ -60,7 +60,7 @@ pub struct Upstream {
     pub password: String,
     pub remote_dns: bool,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub include: Vec<String>,
     pub exclude: Vec<String>,

@@ -7,6 +7,8 @@ const FINDINGS: TableDefinition<u64, &[u8]> = TableDefinition::new("scanner_find
 /// `...;baseline`) to the exchange that satisfied it. This avoids deserializing
 /// the complete capture history for every scan item on resume.
 const NOTES: TableDefinition<&str, &[u8]> = TableDefinition::new("scanner_notes");
+// Retained findings and exchanges still refer to deleted scans by id.
+const LAST_DELETED_SCAN_ID: &str = "last-deleted-scan-id";
 /// Retained evidence per finding. Repeated passive observations must not grow a
 /// finding without bound.
 const EVIDENCE_LIMIT: usize = 8;
@@ -23,6 +25,9 @@ impl Project {
         tx.commit()?;
         {
             let tx = db.begin_read()?;
+            if let Some(id) = tx.open_table(META)?.get(LAST_DELETED_SCAN_ID)? {
+                self.last_deleted_scan_id = serde_json::from_slice(id.value())?;
+            }
             for item in tx.open_table(JOBS)?.iter()? {
                 let (key, value) = item?;
                 let job: ScanJob = serde_json::from_slice(value.value())?;
@@ -85,13 +90,18 @@ impl Project {
     pub fn allocate_scan_id(&self) -> u64 {
         self.scan_jobs
             .last_key_value()
-            .map_or(1, |(id, _)| id.saturating_add(1))
+            .map_or(0, |(id, _)| *id)
+            .max(self.last_deleted_scan_id)
+            .saturating_add(1)
     }
     pub fn scan_jobs(&self) -> Vec<ScanJob> {
         self.scan_jobs.values().rev().cloned().collect()
     }
     pub fn scan_job(&self, id: u64) -> Option<ScanJob> {
         self.scan_jobs.get(&id).cloned()
+    }
+    pub(crate) fn contains_scan_job(&self, id: u64) -> bool {
+        self.scan_jobs.contains_key(&id)
     }
     pub fn put_scan_job(&mut self, job: ScanJob) -> Result<()> {
         job.settings.validate()?;
@@ -137,26 +147,28 @@ impl Project {
     }
     pub(crate) fn clear_scan_notes(&mut self, job: u64) -> Result<()> {
         let prefix = format!("scan:{job};");
-        self.scan_index.retain(|key, _| !key.starts_with(&prefix));
-        let Some(db) = &self.db else {
-            return Ok(());
-        };
-        let tx = db.begin_write()?;
-        {
-            let mut table = tx.open_table(NOTES)?;
-            let keys: Vec<String> = table
-                .iter()?
-                .filter_map(|item| {
-                    let (key, _) = item.ok()?;
-                    let key = key.value();
-                    key.starts_with(&prefix).then(|| key.to_owned())
-                })
-                .collect();
-            for key in keys {
-                table.remove(key.as_str())?;
-            }
+        if let Some(db) = &self.db {
+            let tx = db.begin_write()?;
+            remove_scan_notes(&tx, &prefix)?;
+            tx.commit()?;
         }
-        tx.commit()?;
+        self.scan_index.retain(|key, _| !key.starts_with(&prefix));
+        Ok(())
+    }
+    pub(crate) fn delete_scan_job(&mut self, id: u64) -> Result<()> {
+        ensure!(self.contains_scan_job(id), "Scan does not exist");
+        let last_deleted = self.last_deleted_scan_id.max(id);
+        let prefix = format!("scan:{id};");
+        if let Some(db) = &self.db {
+            let tx = db.begin_write()?;
+            tx.open_table(JOBS)?.remove(id)?;
+            remove_scan_notes(&tx, &prefix)?;
+            write_last_deleted_scan_id(&tx, last_deleted)?;
+            tx.commit()?;
+        }
+        self.scan_index.retain(|key, _| !key.starts_with(&prefix));
+        self.scan_jobs.remove(&id);
+        self.last_deleted_scan_id = last_deleted;
         Ok(())
     }
     pub fn findings(&self) -> Vec<Finding> {
@@ -271,6 +283,14 @@ impl Project {
         }
     }
     pub(super) fn copy_scanner(&self, dest: &mut Project) -> Result<()> {
+        if self.last_deleted_scan_id > dest.last_deleted_scan_id {
+            if let Some(db) = &dest.db {
+                let tx = db.begin_write()?;
+                write_last_deleted_scan_id(&tx, self.last_deleted_scan_id)?;
+                tx.commit()?;
+            }
+            dest.last_deleted_scan_id = self.last_deleted_scan_id;
+        }
         for job in self.scan_jobs.values() {
             dest.put_scan_job(job.clone())?;
         }
@@ -285,4 +305,27 @@ impl Project {
         dest.put_scan_notes(&notes)?;
         Ok(())
     }
+}
+
+fn remove_scan_notes(tx: &redb::WriteTransaction, prefix: &str) -> Result<()> {
+    let mut table = tx.open_table(NOTES)?;
+    let mut keys = Vec::new();
+    for entry in table.range(prefix..)? {
+        let (key, _) = entry?;
+        if !key.value().starts_with(prefix) {
+            break;
+        }
+        keys.push(key.value().to_owned());
+    }
+    for key in keys {
+        table.remove(key.as_str())?;
+    }
+    Ok(())
+}
+
+fn write_last_deleted_scan_id(tx: &redb::WriteTransaction, id: u64) -> Result<()> {
+    let bytes = serde_json::to_vec(&id)?;
+    tx.open_table(META)?
+        .insert(LAST_DELETED_SCAN_ID, bytes.as_slice())?;
+    Ok(())
 }

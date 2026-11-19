@@ -6,7 +6,7 @@ pub mod runner;
 mod tls_checks;
 
 /// Bump whenever probe generation/order or confirmation semantics change.
-pub const CHECK_VERSION: u32 = 6;
+pub const CHECK_VERSION: u32 = 7;
 
 use crate::model::Exchange;
 use serde::{Deserialize, Serialize};
@@ -175,15 +175,15 @@ impl Default for ScanSettings {
             scan_query_values: true,
             scan_form_values: true,
             scan_json_values: true,
-            scan_json_body: true,
+            scan_json_body: false,
             scan_xml_elements: true,
             scan_xml_attributes: true,
             scan_multipart_values: true,
             scan_multipart_filenames: true,
-            scan_headers: true,
-            scan_cookies: true,
-            scan_path: true,
-            scan_parameter_names: true,
+            scan_headers: false,
+            scan_cookies: false,
+            scan_path: false,
+            scan_parameter_names: false,
             nested: true,
             excluded_parameters: vec![
                 "PHPSESSID".into(),

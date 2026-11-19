@@ -5,6 +5,7 @@ pub mod comparer;
 pub mod decoder;
 pub mod display_timezone;
 pub mod engine;
+pub mod error;
 pub mod history;
 pub mod history_export;
 pub mod http;

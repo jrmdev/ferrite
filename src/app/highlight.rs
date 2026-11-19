@@ -5,7 +5,6 @@ use std::{collections::VecDeque, hash::Hasher, sync::Arc};
 
 /// Text beyond this many bytes is drawn without syntax colours.
 const HIGHLIGHT_LIMIT: usize = 512 * 1024;
-const FIND_ID: &str = "ferrite-editor-find";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Kind {
@@ -57,71 +56,24 @@ impl Palette {
     }
 }
 
-/// The find term shared by the visible message editors.
-pub(super) fn find_term(ctx: &egui::Context) -> String {
-    ctx.data(|d| d.get_temp::<String>(egui::Id::new(FIND_ID)))
-        .unwrap_or_default()
-}
-pub(super) fn set_find_term(ctx: &egui::Context, term: &str) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(FIND_ID), term.to_owned()));
-}
-
-/// A find field that highlights matches in the visible message editors.
-pub(super) fn find_bar(
-    ui: &mut egui::Ui,
-    parts: &[(&str, &str)],
-    controls: impl FnOnce(&mut egui::Ui),
-) {
-    let mut term = find_term(ui.ctx());
-    ui.horizontal(|ui| {
-        ui.label("Find");
-        let search_width = (ui.available_width() * 0.3).clamp(70.0, 240.0);
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut term)
-                    .hint_text("Highlight text in both messages")
-                    .desired_width(search_width),
-            )
-            .changed()
-        {
-            set_find_term(ui.ctx(), &term);
-        }
-        controls(ui);
-        if !term.is_empty() {
-            let counts: Vec<String> = parts
-                .iter()
-                .map(|(label, text)| format!("{} in {label}", matches(text, &term).len()))
-                .collect();
-            if ui.small_button("Clear").clicked() {
-                set_find_term(ui.ctx(), "");
-            }
-            ui.add(egui::Label::new(egui::RichText::new(counts.join(" · ")).weak()).truncate());
-        }
-    });
-}
-
 /// Byte ranges of case-insensitive (ASCII) matches.
-pub(super) fn matches(text: &str, term: &str) -> Vec<(usize, usize)> {
-    if term.is_empty() || term.len() > text.len() {
-        return vec![];
-    }
-    let haystack = text.as_bytes();
-    let needle: Vec<u8> = term.bytes().map(|b| b.to_ascii_lowercase()).collect();
-    let mut found = vec![];
-    let mut index = 0;
-    while index + needle.len() <= haystack.len() {
-        if haystack[index..index + needle.len()]
-            .iter()
-            .zip(&needle)
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
-        {
-            found.push((index, index + needle.len()));
-            index += needle.len();
-        } else {
-            index += 1;
+pub(super) fn matches<'a>(
+    text: &'a str,
+    term: &'a str,
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        if term.is_empty() {
+            return None;
         }
-    }
-    found
+        let start = offset
+            + text.as_bytes()[offset..]
+                .windows(term.len())
+                .position(|candidate| candidate.eq_ignore_ascii_case(term.as_bytes()))?;
+        offset = start + term.len();
+        Some((start, offset))
+    })
+    .fuse()
 }
 
 fn body_kind(head: &str, body: &str) -> Body {
@@ -387,7 +339,6 @@ fn spans(text: &str, kind: Kind, p: &Palette, visuals: &egui::Visuals) -> Spans 
                 return spans;
             };
             http_head(&text[..body_start], 0, p, &mut spans, visuals);
-            let _ = head_end;
             let body = &text[body_start..];
             match body_kind(&text[..head_end], body) {
                 Body::Json => json(body, body_start, p, &mut spans),
@@ -424,17 +375,16 @@ pub(super) fn layout(
         covered = end;
     }
     push(&mut colored, covered, text.len(), p.text);
-    let found = matches(text, find);
+    let mut found = matches(text, find).peekable();
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
-    let mut next_match = 0;
     for (start, end, color) in colored {
         let mut at = start;
         while at < end {
-            while next_match < found.len() && found[next_match].1 <= at {
-                next_match += 1;
+            while found.peek().is_some_and(|&(_, end)| end <= at) {
+                found.next();
             }
-            let (piece_end, highlighted) = match found.get(next_match) {
+            let (piece_end, highlighted) = match found.peek() {
                 Some(&(m_start, m_end)) if m_start <= at => (m_end.min(end), true),
                 Some(&(m_start, _)) if m_start < end => (m_start, false),
                 _ => (end, false),
@@ -459,10 +409,10 @@ struct LayoutCache {
 pub(super) fn layouter(
     kind: Kind,
     id: egui::Id,
-) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> Arc<egui::Galley> {
+    find: &str,
+) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> Arc<egui::Galley> + '_ {
     move |ui, buffer, wrap_width| {
         let text = buffer.as_str();
-        let find = find_term(ui.ctx());
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let font_sources =
             ui.fonts_mut(|fonts| fonts.definitions().families.get(&font.family).cloned());
@@ -470,7 +420,7 @@ pub(super) fn layouter(
         std::hash::Hash::hash(
             &(
                 text,
-                &find,
+                find,
                 kind,
                 wrap_width.to_bits(),
                 ui.visuals().dark_mode,
@@ -504,7 +454,7 @@ pub(super) fn layouter(
         if let Some(galley) = cached {
             return galley;
         }
-        let job = layout(text, kind, &find, font, wrap_width, ui.visuals());
+        let job = layout(text, kind, find, font, wrap_width, ui.visuals());
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         ui.data_mut(|data| {
             let cache = data.get_temp_mut_or_default::<LayoutCache>(cache_id);
@@ -529,7 +479,7 @@ mod tests {
         for frame in 0..20 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let mut render = layouter(Kind::Http, egui::Id::new(frame));
+                    let mut render = layouter(Kind::Http, egui::Id::new(frame), "");
                     let text = "GET / HTTP/1.1\r\n\r\n";
                     let first = render(ui, &text, 400.0);
                     assert!(Arc::ptr_eq(&first, &render(ui, &text, 400.0)));
@@ -548,7 +498,7 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 for document in 100..120 {
-                    layouter(Kind::Plain, egui::Id::new(document))(ui, &"text", 400.0);
+                    layouter(Kind::Plain, egui::Id::new(document), "")(ui, &"text", 400.0);
                 }
             });
         });
@@ -655,8 +605,10 @@ mod tests {
 
     #[test]
     fn find_highlights_case_insensitive_matches_across_tokens() {
-        assert_eq!(matches("Token token TOKEN", "token").len(), 3);
-        assert!(matches("abc", "").is_empty());
+        assert_eq!(matches("Token token TOKEN", "token").count(), 3);
+        assert_eq!(matches("abc", "").next(), None);
+        assert_eq!(matches("πaAa", "aa").collect::<Vec<_>>(), [(2, 4)]);
+        assert_eq!(matches("é É", "é").collect::<Vec<_>>(), [(0, 2)]);
         let sections = colours(
             "GET /search?q=Secret HTTP/1.1\r\nX-Secret: 1\r\n\r\n",
             Kind::Http,

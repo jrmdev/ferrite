@@ -97,8 +97,22 @@ fn notify(engine: &Engine) {
     engine.scanner.activity.fetch_add(1, Ordering::SeqCst);
 }
 fn persist(engine: &Engine, job: &mut ScanJob) -> Result<()> {
+    persist_checkpoint(engine, job, &[])
+}
+fn persist_checkpoint(
+    engine: &Engine,
+    job: &mut ScanJob,
+    notes: &[(String, u64, bool)],
+) -> Result<()> {
+    let mut project = engine.project.lock().unwrap();
+    // An active job can be deleted while its worker is settling.
+    if !project.contains_scan_job(job.id) {
+        return Ok(());
+    }
     job.updated_ms = super::now();
-    engine.project.lock().unwrap().put_scan_job(job.clone())?;
+    project.put_scan_notes(notes)?;
+    project.put_scan_job(job.clone())?;
+    drop(project);
     notify(engine);
     Ok(())
 }
@@ -118,11 +132,8 @@ fn persist_due(
     if !due {
         return Ok(());
     }
-    if !notes.is_empty() {
-        let pending = std::mem::take(notes);
-        engine.project.lock().unwrap().put_scan_notes(&pending)?;
-    }
-    persist(engine, job)?;
+    persist_checkpoint(engine, job, notes)?;
+    notes.clear();
     *last = Some(Instant::now());
     Ok(())
 }
@@ -210,6 +221,10 @@ fn spawn(engine: Arc<Engine>, job: ScanJob, retry_failed: bool) -> Result<()> {
         !controls.contains_key(&job.id),
         "This scan is already running or settling"
     );
+    ensure!(
+        engine.project.lock().unwrap().contains_scan_job(job.id),
+        "Scan does not exist"
+    );
     controls.insert(job.id, tx);
     drop(controls);
     notify(&engine);
@@ -219,7 +234,7 @@ fn spawn(engine: Arc<Engine>, job: ScanJob, retry_failed: bool) -> Result<()> {
             let saved = engine.project.lock().unwrap().scan_job(id);
             if let Some(mut failed) = saved {
                 failed.status = ScanStatus::Failed;
-                failed.message = format!("{error:#}");
+                failed.message = crate::error::friendly(&error);
                 let _ = persist(&engine, &mut failed);
             }
             engine.log_error(format!("Scanner {id}: {error:#}"));
@@ -312,6 +327,19 @@ pub fn cancel(engine: Arc<Engine>, id: u64) -> Result<()> {
     job.status = ScanStatus::Cancelled;
     job.message = "Cancelled".into();
     persist(&engine, &mut job)
+}
+pub fn delete(engine: &Engine, id: u64) -> Result<()> {
+    let controls = engine.scanner.runner.controls.lock().unwrap();
+    let mut project = engine.project.lock().unwrap();
+    project.delete_scan_job(id)?;
+    if let Some(control) = controls.get(&id) {
+        control.send_replace(Command::Cancel);
+        engine.scanner.runner.pool.changed.notify_waiters();
+    }
+    drop(project);
+    drop(controls);
+    notify(engine);
+    Ok(())
 }
 pub fn retry(engine: Arc<Engine>, id: u64) -> Result<()> {
     ensure!(
@@ -748,7 +776,9 @@ fn threshold_reached(job: &ScanJob) -> bool {
             && failed * 100 >= finished * usize::from(job.settings.failed_item_percent))
 }
 fn set_failure_action(engine: &Engine, id: u64, action: FailureAction) {
-    if let Some(sender) = engine.scanner.runner.controls.lock().unwrap().get(&id) {
+    if let Some(sender) = engine.scanner.runner.controls.lock().unwrap().get(&id)
+        && matches!(*sender.borrow(), Command::Run | Command::Pause)
+    {
         sender.send_replace(if action == FailureAction::Pause {
             Command::Pause
         } else {
@@ -782,6 +812,7 @@ async fn run(
     let mut audited_tls = BTreeSet::new();
     let mut pending_notes: Vec<(String, u64, bool)> = Vec::new();
     let mut last_persist: Option<Instant> = None;
+    let mut redirected_baseline = false;
     'items: for item_index in 0..job.items.len() {
         if job.items[item_index].status == ScanStatus::Completed {
             continue;
@@ -861,7 +892,10 @@ async fn run(
             }
             Err(error) => {
                 job.items[item_index].status = ScanStatus::Failed;
-                job.items[item_index].message = format!("Cannot build audit plan: {error:#}");
+                job.items[item_index].message = format!(
+                    "Cannot build audit plan: {}",
+                    crate::error::friendly(&error)
+                );
                 job.skipped += 1;
                 persist(&engine, &mut job)?;
                 continue;
@@ -872,7 +906,7 @@ async fn run(
             job.items[item_index].message = if audited_this_item {
                 "TLS audit finished".into()
             } else {
-                "No applicable enabled active checks".into()
+                "No injection points or enabled applicable checks. Capture the submitted request (with parameter values) and scan that request.".into()
             };
             persist(&engine, &mut job)?;
             continue;
@@ -944,6 +978,12 @@ async fn run(
             baseline
         };
         let baseline_denied = matches!(baseline.status, 401 | 403);
+        // A followed redirect changes the audited resource. That is legitimate
+        // for canonical URLs, but silent when a session or CSRF token expired:
+        // every probe then measures the redirect target instead of the request.
+        if baseline.note.contains("redirect:") {
+            redirected_baseline = true;
+        }
         let evaluation = checks::CachedBaseline::new(&baseline);
         pending_notes.push((baseline_note.clone(), baseline.id, true));
         let (mut completed, mut series_results) =
@@ -1015,7 +1055,14 @@ async fn run(
                 continue;
             }
             tokio::select! {
-                changed=control.changed()=>{changed.context("Scanner control closed")?;persist(&engine,&mut job)?;}
+                changed = control.changed() => {
+                    changed.context("Scanner control closed")?;
+                    let command = *control.borrow();
+                    if matches!(command, Command::Run | Command::Pause) {
+                        job.status = command_status(command);
+                        persist(&engine, &mut job)?;
+                    }
+                }
                 outcome=tasks.join_next(),if !tasks.is_empty()=>{
                     let Some(outcome)=outcome else {continue;};
                     let outcome=match outcome.context("Scanner worker panicked")? {
@@ -1135,8 +1182,15 @@ async fn run(
             ScanStatus::Completed
         };
         job.message = format!(
-            "{} requests, {} transport failures, {} skipped probes",
-            job.requests, job.failures, job.skipped
+            "{} requests, {} transport failures, {} skipped probes{}",
+            job.requests,
+            job.failures,
+            job.skipped,
+            if redirected_baseline {
+                "; one or more selected requests redirected - scan the final response row"
+            } else {
+                ""
+            }
         );
     }
     persist_due(
@@ -1157,6 +1211,60 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleted_scan_stays_deleted_when_a_worker_saves_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scans.ferrite");
+        let copy = dir.path().join("copy.ferrite");
+        let mut project = crate::project::Project::temporary();
+        project.save_to_disk(&path).unwrap();
+        let mut job = ScanJob {
+            id: project.allocate_scan_id(),
+            name: "In progress".into(),
+            check_version: super::super::CHECK_VERSION,
+            status: ScanStatus::Running,
+            created_ms: 1,
+            updated_ms: 1,
+            settings: ScanSettings::default(),
+            items: vec![],
+            requests: 0,
+            failures: 0,
+            findings: 0,
+            skipped: 0,
+            message: String::new(),
+        };
+        let notes = vec![(format!("scan:{};item:0;baseline", job.id), 1, true)];
+        project.put_scan_job(job.clone()).unwrap();
+        project.put_scan_notes(&notes).unwrap();
+        let engine = Engine::new(project).unwrap();
+        let (sender, receiver) = watch::channel(Command::Run);
+        engine
+            .scanner
+            .runner
+            .controls
+            .lock()
+            .unwrap()
+            .insert(job.id, sender);
+
+        delete(&engine, job.id).unwrap();
+        assert_eq!(*receiver.borrow(), Command::Cancel);
+        persist_checkpoint(&engine, &mut job, &notes).unwrap();
+        let project = engine.project.lock().unwrap();
+        assert!(project.scan_jobs().is_empty());
+        assert!(project.scan_notes("scan:").unwrap().is_empty());
+        project.save_as(&copy).unwrap();
+        drop(project);
+        drop(engine);
+
+        for file in [path, copy] {
+            let reopened = crate::project::Project::open_existing(&file).unwrap();
+            assert!(reopened.scan_jobs().is_empty());
+            assert!(reopened.scan_notes("scan:").unwrap().is_empty());
+            assert_eq!(reopened.allocate_scan_id(), job.id + 1);
+        }
+    }
+
     #[test]
     fn pacing_modes_have_bounded_repeatable_spacing() {
         let mut s = ScanSettings {

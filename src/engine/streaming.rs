@@ -248,7 +248,7 @@ impl<'a> StreamHistory<'a> {
 
     fn finish(&mut self, result: &Result<()>) {
         self.finished = true;
-        self.record(result.as_ref().err().map(|error| format!("{error:#}")));
+        self.record(result.as_ref().err().map(crate::error::friendly));
     }
 
     fn record(&self, error: Option<String>) {

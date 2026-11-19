@@ -57,15 +57,15 @@ fn cached_preview(
     }
     let key = id.with(("json-preview", config.epoch, payload));
     let cache_id = egui::Id::new("json-preview-cache");
-    let cached = ctx
-        .data(|data| data.get_temp::<Cache>(cache_id))
-        .unwrap_or_default();
-    if let Some((_, _, rendered)) = cached
-        .entries
-        .iter()
-        .find(|(entry, source, _)| *entry == key && source.as_ref() == text)
-    {
-        return rendered.clone().map(|text| (key, text));
+    let cached = ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Cache>(cache_id)
+            .entries
+            .iter()
+            .find(|(entry, source, _)| *entry == key && source.as_ref() == text)
+            .map(|(_, _, rendered)| rendered.clone())
+    });
+    if let Some(rendered) = cached {
+        return rendered.map(|text| (key, text));
     }
     let rendered = if payload {
         format_json("", text)

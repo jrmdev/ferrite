@@ -1,10 +1,21 @@
-use eframe::egui;
+use super::highlight;
+use crate::engine::Stage;
+use eframe::egui::{
+    self,
+    text::{CCursor, CCursorRange},
+};
+use std::borrow::Cow;
 
-pub(super) fn message_view(bytes: &[u8], all_hex: bool) -> String {
+pub(super) fn message_view(bytes: &[u8], all_hex: bool) -> Cow<'_, str> {
     if all_hex {
-        return super::hex(bytes);
+        return Cow::Owned(super::hex(bytes));
     }
-    String::from_utf8_lossy(bytes).into_owned()
+    String::from_utf8_lossy(bytes)
+}
+
+pub(super) enum Find<'a> {
+    Text(Stage),
+    WithHex(Stage, &'a mut bool),
 }
 
 /// The scroll viewport stays bounded; text grows downwards and wraps at its width.
@@ -12,8 +23,9 @@ pub(super) fn http_editor(
     ui: &mut egui::Ui,
     text: &mut dyn egui::TextBuffer,
     document: impl std::hash::Hash,
+    find: Option<Find<'_>>,
 ) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
-    editor(ui, text, document, Content::Http)
+    editor(ui, text, document, Content::Http, find)
 }
 
 pub(super) fn websocket_editor(
@@ -27,6 +39,7 @@ pub(super) fn websocket_editor(
         text,
         document,
         if hex { Content::Raw } else { Content::Json },
+        None,
     )
 }
 
@@ -39,11 +52,11 @@ pub(super) fn websocket_intercept_editor(
 ) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
     let id = ui.make_persistent_id(("http-editor", document));
     let kind = if hex {
-        super::highlight::Kind::Plain
+        highlight::Kind::Plain
     } else {
-        super::highlight::Kind::Json
+        highlight::Kind::Json
     };
-    render(ui, text, id, kind)
+    render(ui, text, id, kind, None)
 }
 
 enum Content {
@@ -57,12 +70,13 @@ fn editor(
     text: &mut dyn egui::TextBuffer,
     document: impl std::hash::Hash,
     content: Content,
+    find: Option<Find<'_>>,
 ) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
     let id = ui.make_persistent_id(("http-editor", document));
     let kind = match content {
-        Content::Http => super::highlight::Kind::Http,
-        Content::Json => super::highlight::Kind::Json,
-        Content::Raw => super::highlight::Kind::Plain,
+        Content::Http => highlight::Kind::Http,
+        Content::Json => highlight::Kind::Json,
+        Content::Raw => highlight::Kind::Plain,
     };
     let preview = match content {
         Content::Http => super::json_preview::preview(ui.ctx(), id, text.as_str()),
@@ -78,19 +92,122 @@ fn editor(
         }
         ui.data_mut(|data| data.insert_temp(key.with("edit"), edit));
         if !text.is_mutable() || !edit {
-            return render(ui, &mut preview.as_ref(), key, kind);
+            return render(ui, &mut preview.as_ref(), key, kind, find);
         }
     }
-    render(ui, text, id, kind)
+    render(ui, text, id, kind, find)
+}
+
+#[derive(Clone, Default)]
+struct FindState {
+    term: String,
+    document: Option<egui::Id>,
+    current: Option<usize>,
+}
+
+impl FindState {
+    fn show(&mut self, ui: &mut egui::Ui, text: &str, find: Find<'_>) -> Option<CCursorRange> {
+        let (stage, hex) = match find {
+            Find::Text(stage) => (stage, None),
+            Find::WithHex(stage, hex) => (stage, Some(hex)),
+        };
+        let (hint, hex_label) = match stage {
+            Stage::Request => ("Find text in request", "Request is hex"),
+            Stage::Response => ("Find text in response", "Response as hex"),
+        };
+        ui.horizontal_wrapped(|ui| {
+            if let Some(hex) = hex {
+                if ui.checkbox(hex, hex_label).changed() {
+                    // The caller uses the new mode when preparing the message for the next frame.
+                    ui.ctx().request_repaint();
+                }
+                if ui.available_size_before_wrap().x < 170.0 {
+                    ui.end_row();
+                }
+            }
+            let width = ui.available_size_before_wrap().x;
+            let search_width = (width * 0.65).min(width - 52.0).clamp(24.0, 260.0);
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.term)
+                        .hint_text(hint)
+                        .desired_width(search_width),
+                )
+                .changed()
+            {
+                self.current = None;
+            }
+
+            let count = highlight::matches(text, &self.term).count();
+            self.current = self.current.filter(|&index| index < count);
+            let previous = ui
+                .add_enabled(count > 0, egui::Button::new("<"))
+                .on_hover_text("Previous match")
+                .clicked();
+            let next = ui
+                .add_enabled(count > 0, egui::Button::new(">"))
+                .on_hover_text("Next match")
+                .clicked();
+            let selection = if previous || next {
+                let index = match (previous, self.current) {
+                    (true, Some(index)) if index > 0 => index - 1,
+                    (true, _) => count - 1,
+                    (false, Some(index)) => (index + 1) % count,
+                    (false, None) => 0,
+                };
+                self.current = Some(index);
+                let (start, end) = highlight::matches(text, &self.term).nth(index).unwrap();
+                let first = text[..start].chars().count();
+                let last = first + text[start..end].chars().count();
+                Some(CCursorRange::two(CCursor::new(first), CCursor::new(last)))
+            } else {
+                None
+            };
+
+            if !self.term.is_empty() {
+                let width = ui.available_size_before_wrap().x;
+                if width >= 44.0 && ui.small_button("Clear").clicked() {
+                    self.term.clear();
+                    self.current = None;
+                } else if ui.available_size_before_wrap().x > 0.0 {
+                    let status = match self.current {
+                        Some(index) => format!("{} / {count}", index + 1),
+                        None if count == 1 => "1 match".into(),
+                        None => format!("{count} matches"),
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(status).weak()).truncate());
+                }
+            }
+            selection
+        })
+        .inner
+    }
 }
 
 fn render(
     ui: &mut egui::Ui,
     text: &mut dyn egui::TextBuffer,
     id: egui::Id,
-    kind: super::highlight::Kind,
+    kind: highlight::Kind,
+    find: Option<Find<'_>>,
 ) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
-    let mut layouter = super::highlight::layouter(kind, id);
+    let mut search = FindState::default();
+    let mut selection = None;
+    let search_id = ui.make_persistent_id("message-find");
+    let has_find = find.is_some();
+    if let Some(find) = find {
+        search = ui.data(|data| data.get_temp(search_id)).unwrap_or_default();
+        if search.document != Some(id) {
+            search.document = Some(id);
+            search.current = None;
+        }
+        selection = egui::TopBottomPanel::bottom(search_id)
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| search.show(ui, text.as_str(), find))
+            .inner;
+    }
+
     let viewport = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     let available = viewport.size();
     let height = available.y.max(1.0);
@@ -102,16 +219,17 @@ fn render(
         ui.visuals().widgets.inactive.corner_radius,
         background,
     );
-    egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical()
         .id_salt(id.with("scroll"))
         .auto_shrink([false, false])
         .min_scrolled_height(0.0)
         .max_height(height)
         .max_width(available.x.max(1.0))
         .show(ui, |ui| {
+            let mut layouter = highlight::layouter(kind, id, &search.term);
             // add_sized centers oversized widgets, which can move long HTTP messages
             // outside the viewport. A minimum height fills the pane without that layout.
-            egui::TextEdit::multiline(text)
+            let mut output = egui::TextEdit::multiline(text)
                 .id(id.with("text"))
                 .background_color(background)
                 .font(egui::TextStyle::Monospace)
@@ -123,13 +241,158 @@ fn render(
                 .cursor_at_end(false)
                 .code_editor()
                 .layouter(&mut layouter)
-                .show(ui)
-        })
+                .show(ui);
+            if let Some(range) = selection {
+                output.state.cursor.set_char_range(Some(range));
+                output.state.clone().store(ui.ctx(), output.response.id);
+                // The arrow click can clear focus while TextEdit is drawing.
+                output.response.request_focus();
+                ui.ctx().request_repaint();
+                let start = output.galley.pos_from_cursor(range.secondary);
+                let end = output.galley.pos_from_cursor(range.primary);
+                ui.scroll_to_rect(
+                    start.union(end).translate(output.galley_pos.to_vec2()),
+                    None,
+                );
+            }
+            output
+        });
+    if has_find {
+        if output.inner.response.changed() {
+            search.current = None;
+        }
+        ui.data_mut(|data| data.insert_temp(search_id, search));
+    }
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_find_navigates_and_scrolls_only_its_own_pane() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut request = "GET /needle HTTP/1.1\r\n\r\n".to_owned();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\r\nπ needle\n{}needle\n{}",
+            "filler\n".repeat(100),
+            "filler\n".repeat(30),
+        );
+        let mut request_hex = false;
+        let mut response_hex = false;
+        let mut frame = |events| {
+            let mut editors = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(840.0, 260.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let [mut left, mut right] =
+                            super::super::split_panes(ui, "test-messages", false, 0.5);
+                        editors = Some([
+                            http_editor(
+                                &mut left,
+                                &mut request,
+                                1,
+                                Some(Find::WithHex(Stage::Request, &mut request_hex)),
+                            ),
+                            http_editor(
+                                &mut right,
+                                &mut response.as_str(),
+                                2,
+                                Some(Find::WithHex(Stage::Response, &mut response_hex)),
+                            ),
+                        ]);
+                    });
+                },
+            );
+            (output.shapes, editors.unwrap())
+        };
+        let position = |shapes: &[egui::epaint::ClippedShape], label: &str| {
+            shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.job.text == label && text.pos.x > 420.0 =>
+                    {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing response find control {label:?}"))
+        };
+        let click = |pos| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+        };
+
+        let (shapes, [_, pane]) = frame(vec![]);
+        let query = position(&shapes, "Find text in response");
+        assert!(query.y > pane.inner_rect.bottom());
+        frame(click(query));
+        let (shapes, [request, pane]) = frame(vec![egui::Event::Text("needle".into())]);
+        let has_highlights = |galley: &egui::Galley| {
+            galley
+                .job
+                .sections
+                .iter()
+                .any(|s| s.format.background != egui::Color32::TRANSPARENT)
+        };
+        assert!(!has_highlights(&request.inner.galley));
+        assert!(has_highlights(&pane.inner.galley));
+
+        let next = position(&shapes, ">");
+        let previous = position(&shapes, "<");
+        frame(click(next));
+        let (_, [_, pane]) = frame(vec![]);
+        let first = pane.inner.cursor_range.unwrap();
+        assert_eq!(first.slice_str(&response), "needle");
+        assert_eq!(pane.state.offset.y, 0.0);
+
+        frame(click(previous));
+        let (_, [_, pane]) = frame(vec![]);
+        let last = pane.inner.cursor_range.unwrap();
+        assert_eq!(last.slice_str(&response), "needle");
+        assert!(last.primary.index > first.primary.index);
+        assert!(pane.state.offset.y > 0.0);
+        let (_, [_, pane]) = frame(vec![]);
+        let match_pos = pane
+            .inner
+            .galley
+            .pos_from_cursor(last.primary)
+            .translate(pane.inner.galley_pos.to_vec2());
+        assert!(
+            pane.inner_rect.contains_rect(match_pos),
+            "Match at {match_pos:?} is outside {:?}",
+            pane.inner_rect,
+        );
+        let scrolled_offset = pane.state.offset.y;
+
+        frame(click(next));
+        let (shapes, [_, pane]) = frame(vec![]);
+        assert_eq!(pane.inner.cursor_range, Some(first));
+        assert!(pane.state.offset.y < scrolled_offset);
+
+        let hex_checkbox = position(&shapes, "Response as hex");
+        assert!(hex_checkbox.y > pane.inner_rect.bottom());
+        assert!((hex_checkbox.y - query.y).abs() < 4.0);
+        frame(click(hex_checkbox));
+        assert!(response_hex);
+        assert!(!request_hex);
+    }
 
     #[test]
     fn json_preview_changes_the_view_without_modifying_editable_or_read_only_messages() {
@@ -243,7 +506,7 @@ mod tests {
             message_view(b"HTTP/1.1 200 OK\r\n\r\n\0a\0", false),
             "HTTP/1.1 200 OK\r\n\r\n\0a\0"
         );
-        let output = render(&egui::Context::default(), &mut view.as_str(), 350.0, 1);
+        let output = render(&egui::Context::default(), &mut view.as_ref(), 350.0, 1);
         assert_visible_at_start(&output);
         assert_eq!(output.inner.galley.job.text, view);
     }
@@ -255,7 +518,9 @@ mod tests {
             b"HTTP/2 204\r\nX-Test: 1\r\n\r\n",
             "HTTP/2 200\r\n\r\nHello π\n".as_bytes(),
         ] {
-            assert_eq!(message_view(bytes, false).as_bytes(), bytes);
+            let view = message_view(bytes, false);
+            assert!(matches!(view, Cow::Borrowed(_)));
+            assert_eq!(view.as_bytes(), bytes);
         }
     }
 
@@ -276,7 +541,12 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    editor = Some(http_editor(ui, text, document));
+                    editor = Some(http_editor(
+                        ui,
+                        text,
+                        document,
+                        Some(Find::Text(Stage::Response)),
+                    ));
                 });
             },
         );

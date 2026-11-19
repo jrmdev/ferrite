@@ -12,7 +12,12 @@ use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use rand_core::OsRng;
 use regex::Regex;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use std::{collections::BTreeSet, io::Read, sync::LazyLock};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, HashMap},
+    io::Read,
+    sync::LazyLock,
+};
 mod advanced;
 mod charset;
 mod reflection;
@@ -110,6 +115,16 @@ fn build_definitions() -> Vec<IssueDefinition> {
             false,
             "A cookie does not explicitly declare its cross-site delivery policy.",
             "Set an appropriate SameSite policy and retain separate CSRF defenses.",
+        ),
+        (
+            "csrf",
+            "Missing anti-CSRF protection",
+            Medium,
+            true,
+            false,
+            false,
+            "A form or request that changes a password, email, or similarly sensitive account value has no recognizable anti-CSRF token.",
+            "Validate a per-session anti-CSRF token server-side, submit state changes with POST, and set SameSite cookies.",
         ),
         (
             "cookie-domain",
@@ -743,12 +758,12 @@ fn build_definitions() -> Vec<IssueDefinition> {
         ),
         (
             "path-traversal",
-            "File path traversal",
+            "Path traversal / local file inclusion",
             High,
             false,
             true,
             false,
-            "A traversal payload returns recognizable operating-system file content.",
+            "A traversal or inclusion payload returns recognizable operating-system file content.",
             "Avoid user-controlled paths or resolve them beneath a fixed permitted directory.",
         ),
         (
@@ -965,7 +980,9 @@ pub fn definitions() -> Vec<IssueDefinition> {
 
 /// Cached definition lookup for hot paths such as finding ingestion.
 pub fn definition(id: &str) -> Option<&'static IssueDefinition> {
-    catalog().iter().find(|definition| definition.id == id)
+    static BY_ID: LazyLock<HashMap<&'static str, &'static IssueDefinition>> =
+        LazyLock::new(|| catalog().iter().map(|def| (def.id.as_str(), def)).collect());
+    BY_ID.get(id).copied()
 }
 
 fn candidate(
@@ -987,9 +1004,6 @@ fn candidate(
         }],
     }
 }
-fn issue_severity(id: &str) -> Severity {
-    definition(id).map_or(Severity::Information, |definition| definition.severity)
-}
 fn re(pattern: &str, value: &str) -> bool {
     static REGEXES: std::sync::OnceLock<
         std::sync::RwLock<std::collections::BTreeMap<String, Option<Regex>>>,
@@ -1006,16 +1020,197 @@ fn re(pattern: &str, value: &str) -> bool {
     }
     result
 }
-fn is_html(message: &Message) -> bool {
-    message
-        .header("Content-Type")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("html"))
-}
 fn is_json(message: &Message) -> bool {
     message
         .header("Content-Type")
         .is_some_and(|v| v.to_ascii_lowercase().contains("json"))
 }
+fn csrf_token_name(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("csrf")
+        || normalized.contains("xsrf")
+        || normalized.contains("authenticitytoken")
+        || normalized.contains("requestverificationtoken")
+        || matches!(
+            normalized.as_str(),
+            "token" | "nonce" | "usertoken" | "formtoken" | "securitytoken"
+        )
+}
+fn csrf_sensitive_field(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    [
+        "password", "passwd", "pwd", "email", "secret", "account", "role", "admin", "delete",
+        "remove", "update", "transfer", "amount", "ssn", "credit",
+    ]
+    .iter()
+    .any(|word| normalized.contains(word))
+}
+fn csrf_sensitive_form(names: &[String], content: &str) -> bool {
+    let passwords = names
+        .iter()
+        .filter(|name| {
+            let name = name.to_ascii_lowercase();
+            name.contains("password") || name.contains("passwd") || name.contains("pwd")
+        })
+        .count();
+    let has_password_input = re(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?password\b"#, content);
+    let changes_existing = names.iter().any(|name| {
+        let name = name.to_ascii_lowercase();
+        [
+            "new", "confirm", "change", "update", "delete", "remove", "email", "account", "role",
+        ]
+        .iter()
+        .any(|word| name.contains(word))
+    });
+    (has_password_input && (passwords >= 2 || changes_existing))
+        || (changes_existing && names.iter().any(|name| csrf_sensitive_field(name)))
+}
+fn html_attribute(tag: &str, attribute: &str) -> Option<String> {
+    static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)\b([a-z_:][a-z0-9_:.\-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
+            .unwrap()
+    });
+    ATTRIBUTE.captures_iter(tag).find_map(|capture| {
+        capture
+            .get(1)
+            .filter(|name| name.as_str().eq_ignore_ascii_case(attribute))?;
+        Some(
+            capture
+                .get(2)
+                .or(capture.get(3))
+                .or(capture.get(4))?
+                .as_str()
+                .to_owned(),
+        )
+    })
+}
+fn csrf_token_field(content: &str) -> bool {
+    static TAG: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<(?:input|textarea|select)\b[^>]*>").unwrap());
+    TAG.find_iter(content).any(|tag| {
+        let tag = tag.as_str();
+        html_attribute(tag, "name")
+            .filter(|name| csrf_token_name(name))
+            .is_some_and(|_| {
+                html_attribute(tag, "value").is_some_and(|value| !value.trim().is_empty())
+            })
+    })
+}
+fn csrf_form_detail(body: &str) -> Option<String> {
+    static FORM_OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<form\b").unwrap());
+    static FORM_CLOSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)</form\s*>").unwrap());
+    let mut cursor = 0;
+    // Bounded iteration and linear scans keep a hostile page from turning form
+    // discovery into quadratic work.
+    for _ in 0..64 {
+        let Some(open) = FORM_OPEN.find_at(body, cursor) else {
+            break;
+        };
+        let Some(tag_end) = body[open.end()..].find('>') else {
+            break;
+        };
+        let attributes = &body[open.end()..open.end() + tag_end];
+        let content_start = open.end() + tag_end + 1;
+        let Some(close) = FORM_CLOSE.find_at(body, content_start) else {
+            break;
+        };
+        let content = &body[content_start..close.start()];
+        let names: Vec<String> = FORM_INPUT_NAME
+            .captures_iter(content)
+            .map(|capture| capture[1].to_owned())
+            .collect();
+        if csrf_sensitive_form(&names, content) && !csrf_token_field(content) {
+            let method = FORM_METHOD
+                .captures(attributes)
+                .map(|capture| capture[1].to_ascii_lowercase())
+                .unwrap_or_else(|| "get".into());
+            return Some(if method == "get" {
+                "A sensitive form submits with GET and has no recognizable anti-CSRF token.".into()
+            } else {
+                format!(
+                    "A {method} form submits sensitive values and has no recognizable anti-CSRF token."
+                )
+            });
+        }
+        cursor = close.end();
+    }
+    None
+}
+fn csrf_request_detail(request: &Message, parameters: &[(String, String)]) -> Option<String> {
+    if !matches!(request.method(), "POST" | "PUT" | "PATCH" | "DELETE")
+        || request.header("Authorization").is_some()
+    {
+        return None;
+    }
+    let content_type = request
+        .header("Content-Type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // JSON and XML bodies require a CORS preflight, so a simple cross-site form
+    // cannot submit them; form encodings remain CSRF-capable.
+    if !content_type.contains("application/x-www-form-urlencoded")
+        && !content_type.contains("multipart/form-data")
+        && !content_type.contains("text/plain")
+    {
+        return None;
+    }
+    let has_session = header_values(request, "Cookie")
+        .flat_map(|header| header.split(';'))
+        .filter_map(|pair| pair.split_once('='))
+        .any(|(name, value)| session_name(name.trim()) && !value.trim().is_empty());
+    if !has_session {
+        return None;
+    }
+    let header_token = request
+        .headers
+        .iter()
+        .any(|(name, value)| csrf_token_name(name) && !value.trim().is_empty());
+    let parameter_token = parameters
+        .iter()
+        .any(|(name, value)| csrf_token_name(name) && !value.is_empty());
+    if header_token || parameter_token {
+        return None;
+    }
+    let sensitive = parameters
+        .iter()
+        .filter(|(name, _)| csrf_sensitive_field(name))
+        .count();
+    let changes_existing = parameters.iter().any(|(name, _)| {
+        let name = name.to_ascii_lowercase();
+        [
+            "new", "confirm", "change", "update", "delete", "remove", "email", "account", "role",
+        ]
+        .iter()
+        .any(|word| name.contains(word))
+    });
+    (sensitive >= 2 || (sensitive >= 1 && changes_existing)).then(|| {
+        "A session-authenticated state-changing request submits sensitive values without a recognizable anti-CSRF token.".into()
+    })
+}
+fn csrf_query_detail(url: &url::Url) -> Option<String> {
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    if pairs.is_empty() || pairs.iter().any(|(name, _)| csrf_token_name(name)) {
+        return None;
+    }
+    let sensitive = pairs.iter().any(|(name, _)| csrf_sensitive_field(name));
+    let changes_existing = pairs.iter().any(|(name, _)| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "change" | "update" | "delete" | "remove" | "save" | "submit" | "confirm"
+        )
+    });
+    (sensitive && changes_existing).then(|| {
+        "A state-changing GET request carries sensitive values without an anti-CSRF token.".into()
+    })
+}
+
 /// All values for a repeated header. Security headers are frequently sent more
 /// than once, and only reading the first occurrence manufactures findings when
 /// a later, stricter header is present.
@@ -1105,15 +1300,17 @@ fn csp_script_unsafe(policies: &[String]) -> bool {
     })
 }
 fn bounded_body(message: &Message, limit: usize) -> Option<Vec<u8>> {
+    decoded_body(message, limit).map(Cow::into_owned)
+}
+
+fn decoded_body(message: &Message, limit: usize) -> Option<Cow<'_, [u8]>> {
     if message.body.len() > limit {
         return None;
     }
-    let mut body = message.body.clone();
-    let encodings: Vec<_> = message
-        .headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Encoding"))
-        .flat_map(|(_, v)| v.split(','))
+    let mut body = Cow::Borrowed(message.body.as_slice());
+    let encodings: Vec<_> = header_values(message, "Content-Encoding")
+        .flat_map(|v| v.split(','))
+        .take(9)
         .map(|x| x.trim().to_ascii_lowercase())
         .collect();
     if encodings.len() > 8 {
@@ -1122,19 +1319,19 @@ fn bounded_body(message: &Message, limit: usize) -> Option<Vec<u8>> {
     for encoding in encodings.iter().rev() {
         let mut reader: Box<dyn Read + '_> = match encoding.as_str() {
             "identity" => continue,
-            "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(body.as_slice())),
+            "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(body.as_ref())),
             "deflate"
                 if body.len() > 1
                     && body[0] & 15 == 8
                     && u16::from_be_bytes([body[0], body[1]]).is_multiple_of(31) =>
             {
-                Box::new(flate2::read::ZlibDecoder::new(body.as_slice()))
+                Box::new(flate2::read::ZlibDecoder::new(body.as_ref()))
             }
-            "deflate" => Box::new(flate2::read::DeflateDecoder::new(body.as_slice())),
-            "br" => Box::new(brotli::Decompressor::new(body.as_slice(), 4096)),
+            "deflate" => Box::new(flate2::read::DeflateDecoder::new(body.as_ref())),
+            "br" => Box::new(brotli::Decompressor::new(body.as_ref(), 4096)),
             "zstd" => Box::new(
                 ruzstd::decoding::StreamingDecoder::new_with_max_window_size(
-                    body.as_slice(),
+                    body.as_ref(),
                     limit.max(8 * 1024 * 1024) as u64,
                 )
                 .ok()?,
@@ -1151,17 +1348,21 @@ fn bounded_body(message: &Message, limit: usize) -> Option<Vec<u8>> {
             return None;
         }
         drop(reader);
-        body = decoded;
+        body = Cow::Owned(decoded);
     }
     Some(body)
 }
 
 fn text_body(message: &Message, limit: usize) -> Option<String> {
-    let body = bounded_body(message, limit)?;
+    let body = decoded_body(message, limit)?;
     let media_type = message
         .header("Content-Type")
         .unwrap_or("")
         .to_ascii_lowercase();
+    decoded_text(&body, &media_type, limit).map(Cow::into_owned)
+}
+
+fn decoded_text<'a>(body: &'a [u8], media_type: &str, limit: usize) -> Option<Cow<'a, str>> {
     let charset = media_type.split(';').find_map(|part| {
         let (name, value) = part.split_once('=')?;
         name.trim()
@@ -1169,7 +1370,7 @@ fn text_body(message: &Message, limit: usize) -> Option<String> {
             .then(|| value.trim().trim_matches(['\"', '\'']))
     });
     if let Some(bytes) = body.strip_prefix(&[0xef, 0xbb, 0xbf]) {
-        let text = String::from_utf8_lossy(bytes).into_owned();
+        let text = String::from_utf8_lossy(bytes);
         return (text.len() <= limit).then_some(text);
     }
     let bom_little = body.starts_with(&[0xff, 0xfe]);
@@ -1193,11 +1394,10 @@ fn text_body(message: &Message, limit: usize) -> Option<String> {
                 return None;
             }
         }
-        return Some(text);
+        return Some(Cow::Owned(text));
     }
-    let bytes = body.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&body);
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Some(text.to_owned()),
+    match std::str::from_utf8(body) {
+        Ok(text) => Some(Cow::Borrowed(text)),
         Err(_)
             if media_type.starts_with("text/")
                 || media_type.contains("json")
@@ -1206,7 +1406,7 @@ fn text_body(message: &Message, limit: usize) -> Option<String> {
         {
             // ASCII delimiters and generated markers survive replacement for legacy
             // ASCII-compatible web encodings. Captured and transmitted bytes stay raw.
-            let text = String::from_utf8_lossy(bytes).into_owned();
+            let text = String::from_utf8_lossy(body);
             (text.len() <= limit).then_some(text)
         }
         Err(_) => None,
@@ -1263,22 +1463,26 @@ fn source_code(body: &str) -> bool {
 }
 fn jwks(body: &str) -> Option<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    v.get("keys")?
-        .as_array()?
-        .iter()
-        .any(|k| k.get("kty").is_some())
-        .then_some(v)
+    jwk_keys(&v).is_some().then_some(v)
+}
+fn jwk_keys(json: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    let keys = json.get("keys")?.as_array()?;
+    keys.iter()
+        .any(|key| key.get("kty").is_some())
+        .then_some(keys)
 }
 fn openapi(body: &str) -> bool {
-    if serde_json::from_str::<serde_json::Value>(body)
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .is_some_and(|v| {
-            (v.get("openapi").is_some() || v.get("swagger").is_some())
-                && v.get("paths").is_some_and(|p| p.is_object())
-        })
-    {
-        return true;
-    }
+        .as_ref()
+        .is_some_and(openapi_json)
+        || openapi_yaml(body)
+}
+fn openapi_json(json: &serde_json::Value) -> bool {
+    (json.get("openapi").is_some() || json.get("swagger").is_some())
+        && json.get("paths").is_some_and(|paths| paths.is_object())
+}
+fn openapi_yaml(body: &str) -> bool {
     re(r#"(?im)^\s*(?:openapi|swagger)\s*:\s*["']?[0-9]"#, body) && re(r"(?im)^\s*paths\s*:", body)
 }
 
@@ -1297,6 +1501,11 @@ static PASSWORD_INPUT: LazyLock<Regex> =
 static FORM_ACTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)<form\b[^>]*\baction\s*=\s*["']((?:https?:)?//[^"']+)["']"#).unwrap()
 });
+static FORM_INPUT_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<(?:input|textarea|select)\b[^>]*\bname\s*=\s*["']?([^"'\s>]+)"#).unwrap()
+});
+static FORM_METHOD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bmethod\s*=\s*["']?([a-z]+)"#).unwrap());
 static SCRIPT_SRC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)<script\b[^>]*\bsrc\s*=\s*["']((?:https?:)?//[^"']+)["']"#).unwrap()
 });
@@ -1311,79 +1520,188 @@ static ANCHOR_BLANK: LazyLock<Regex> =
 static JAVASCRIPT_URI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?is)\b(?:href|src|action)\s*=\s*["']\s*javascript:"#).unwrap());
 
+pub(super) fn passive_check_enabled(settings: &ScanSettings, id: &str) -> bool {
+    settings.check_enabled(id)
+        && (settings.static_javascript || !(id.contains("javascript") || id == "static-dom"))
+}
+
+type FindingPriority = (bool, Severity);
+
+struct PassiveFindings<'a> {
+    settings: Option<&'a ScanSettings>,
+    entries: Vec<(FindingPriority, Candidate)>,
+    limit: usize,
+    lowest: usize,
+    omitted: bool,
+}
+
+impl PassiveFindings<'_> {
+    fn add(&mut self, id: &str, confidence: Confidence, point: &str, detail: impl Into<String>) {
+        if self
+            .settings
+            .is_some_and(|settings| !passive_check_enabled(settings, id))
+        {
+            return;
+        }
+        let severity = definition(id).map_or(Severity::Information, |def| def.severity);
+        // Keep observed key material even when other issues fill the budget.
+        let priority = (id == "private-key", severity);
+        let full = self.entries.len() == self.limit;
+        if full {
+            self.omitted = true;
+            if priority <= self.entries[self.lowest].0 {
+                return;
+            }
+        }
+        let entry = (
+            priority,
+            Candidate {
+                affected: None,
+                issue_id: id.into(),
+                confidence,
+                insertion_point: point.into(),
+                detail: detail.into(),
+                evidence: vec![],
+            },
+        );
+        if full {
+            self.entries[self.lowest] = entry;
+        } else {
+            self.entries.push(entry);
+        }
+        if self.entries.len() == self.limit {
+            // The threshold only changes when a candidate is admitted.
+            self.lowest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (priority, _))| *priority)
+                .map_or(0, |(index, _)| index);
+        }
+    }
+
+    fn finish(self) -> (Vec<Candidate>, bool) {
+        (
+            self.entries
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect(),
+            self.omitted,
+        )
+    }
+}
+
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|bytes| bytes.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
 pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
+    analyze_passive(flow, limit, None).0
+}
+
+pub(super) fn passive_with_settings(
+    flow: &Exchange,
+    limit: usize,
+    settings: &ScanSettings,
+) -> (Vec<Candidate>, bool) {
+    analyze_passive(flow, limit, Some(settings))
+}
+
+fn analyze_passive(
+    flow: &Exchange,
+    limit: usize,
+    settings: Option<&ScanSettings>,
+) -> (Vec<Candidate>, bool) {
     let Ok(response) = Message::parse(&flow.response) else {
-        return vec![];
+        return (vec![], false);
     };
     let Ok(request) = Message::parse(&flow.request) else {
-        return vec![];
+        return (vec![], false);
     };
-    let body_opt = text_body(&response, limit);
-    let mut findings = advanced::passive_parsed(flow, &request, &response, body_opt.as_deref());
-    let candidate_limit = (64 * 1024 * 1024
+    let ct = response
+        .header("Content-Type")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let html = ct.contains("html");
+    let bytes = if flow.streamed_response.is_none() && flow.omitted_response_body_bytes.is_none() {
+        decoded_body(&response, limit)
+    } else {
+        None
+    };
+    let body_opt = bytes
+        .as_deref()
+        .and_then(|bytes| decoded_text(bytes, &ct, limit));
+    let body = body_opt.as_deref().unwrap_or_default();
+    let policies = body_opt
+        .as_deref()
+        .filter(|_| html)
+        .map(|body| csp_policies(&response, body));
+    let trimmed = body.trim_start();
+    let json = if trimmed.starts_with(['{', '[']) {
+        serde_json::from_str::<serde_json::Value>(body).ok()
+    } else {
+        None
+    };
+    let limit = (64 * 1024 * 1024
         / (flow
             .request
             .len()
             .saturating_add(flow.response.len())
             .max(1)))
     .clamp(1, 64);
-    findings.truncate(candidate_limit);
-    // Preserve observed key material even when a response floods the finding
-    // budget with cookie policy issues. Display severity still follows the catalog.
-    let priority = |id: &str| (id == "private-key", issue_severity(id));
-    let mut add = |id: &str, confidence: Confidence, point: &str, detail: String| {
-        let incoming = Candidate {
-            affected: None,
-            issue_id: id.into(),
-            confidence,
-            insertion_point: point.into(),
-            detail,
-            evidence: vec![],
-        };
-        if findings.len() < candidate_limit {
-            findings.push(incoming);
-        } else if let Some((index, lowest)) = findings
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, c)| priority(&c.issue_id))
-            && priority(id) > priority(&lowest.issue_id)
-        {
-            findings[index] = incoming;
-        }
+    let mut findings = PassiveFindings {
+        settings,
+        entries: vec![],
+        limit,
+        lowest: 0,
+        omitted: false,
     };
-    let html = is_html(&response);
+    advanced::passive_parsed(
+        flow,
+        &request,
+        &response,
+        body,
+        policies.as_deref(),
+        json.as_ref(),
+        &mut findings,
+    );
+    let mut add = |id: &str, confidence: Confidence, point: &str, detail: String| {
+        findings.add(id, confidence, point, detail);
+    };
     let mut scopes = BTreeSet::new();
-    for (_, cookie) in response
-        .headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("Set-Cookie"))
-    {
-        let attrs: Vec<_> = cookie.split(';').map(str::trim).collect();
-        let Some((name, value)) = attrs[0].split_once('=') else {
+    let host = flow.destination.host.to_ascii_lowercase();
+    for cookie in header_values(&response, "Set-Cookie") {
+        let mut parts = cookie.split(';');
+        let Some((name, value)) = parts.next().and_then(|pair| pair.split_once('=')) else {
             continue;
         };
-        if value.is_empty() {
+        let name = name.trim();
+        if name.is_empty() || value.trim().is_empty() {
             continue;
         }
-        let has = |name: &str| {
-            attrs.iter().skip(1).any(|a| {
-                a.split('=')
-                    .next()
-                    .is_some_and(|v| v.eq_ignore_ascii_case(name))
-            })
-        };
-        let scope = |name: &str| {
-            attrs
-                .iter()
-                .skip(1)
-                .find_map(|a| {
-                    a.split_once('=')
-                        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .map(|(_, v)| v.to_owned())
-                })
-                .unwrap_or_default()
-        };
-        if flow.destination.tls && !has("secure") {
+        let (mut secure, mut http_only, mut has_same_site) = (false, false, false);
+        let (mut same_site, mut domain, mut path) = (None, None, None);
+        for part in parts {
+            let (key, value) = part
+                .split_once('=')
+                .map_or((part, None), |(key, value)| (key, Some(value.trim())));
+            let key = key.trim();
+            if key.eq_ignore_ascii_case("secure") {
+                secure = true;
+            } else if key.eq_ignore_ascii_case("httponly") {
+                http_only = true;
+            } else if key.eq_ignore_ascii_case("samesite") {
+                has_same_site = true;
+                same_site = same_site.or(value);
+            } else if key.eq_ignore_ascii_case("domain") {
+                domain = domain.or(value);
+            } else if key.eq_ignore_ascii_case("path") {
+                path = path.or(value);
+            }
+        }
+        if flow.destination.tls && !secure {
             add(
                 "cookie-secure",
                 Confidence::Certain,
@@ -1391,7 +1709,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Cookie {name} lacks Secure on an HTTPS response."),
             );
         }
-        if !has("httponly") {
+        if !http_only {
             add(
                 "cookie-httponly",
                 Confidence::Certain,
@@ -1399,7 +1717,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Cookie {name} lacks HttpOnly."),
             );
         }
-        if !has("samesite") {
+        if !has_same_site {
             add(
                 "cookie-samesite",
                 Confidence::Certain,
@@ -1407,9 +1725,16 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Cookie {name} has no explicit SameSite attribute."),
             );
         }
-        let domain = scope("domain").trim_start_matches('.').to_ascii_lowercase();
-        let host = flow.destination.host.to_ascii_lowercase();
-        if !domain.is_empty() && host != domain && host.ends_with(&format!(".{domain}")) {
+        let domain = domain
+            .unwrap_or_default()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let path = path.unwrap_or_default();
+        if !domain.is_empty()
+            && host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+        {
             add(
                 "cookie-domain",
                 Confidence::Certain,
@@ -1417,7 +1742,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Cookie domain {domain} includes hosts besides {host}."),
             );
         }
-        if !scopes.insert((name.to_owned(), domain.clone(), scope("path"))) {
+        let host_only = domain.is_empty();
+        if !scopes.insert((name, domain, path)) {
             add(
                 "duplicate-cookies",
                 Confidence::Certain,
@@ -1425,10 +1751,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Repeated Set-Cookie for {name} with the same domain/path."),
             );
         }
-        let lower_name = name.to_ascii_lowercase();
-        let secure = has("secure");
-        let path_scope = scope("path");
-        if lower_name.starts_with("__host-") && (!secure || !domain.is_empty() || path_scope != "/")
+        if starts_with_ignore_ascii_case(name, "__host-") && (!secure || !host_only || path != "/")
         {
             add(
                 "cookie-invalid",
@@ -1438,7 +1761,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                     "Cookie {name} uses the __Host- prefix but does not set Secure, Path=/ and an empty Domain."
                 ),
             );
-        } else if lower_name.starts_with("__secure-") && !secure {
+        } else if starts_with_ignore_ascii_case(name, "__secure-") && !secure {
             add(
                 "cookie-invalid",
                 Confidence::Certain,
@@ -1446,7 +1769,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Cookie {name} uses the __Secure- prefix without Secure."),
             );
         }
-        if scope("samesite").eq_ignore_ascii_case("none") && !secure {
+        if same_site.is_some_and(|value| value.eq_ignore_ascii_case("none")) && !secure {
             add(
                 "cookie-invalid",
                 Confidence::Certain,
@@ -1466,35 +1789,30 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "The HTTPS response lacks a positive HSTS max-age.".into(),
         );
     }
-    let header_csp = response
-        .headers
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Security-Policy"))
-        .flat_map(|(_, v)| v.split(',').map(str::trim))
-        .collect::<Vec<_>>();
-    let csp = csp_policies(&response, body_opt.as_deref().unwrap_or(""));
     if html {
         let xfo = header_values(&response, "X-Frame-Options").any(|v| {
             v.split(',')
                 .map(str::trim)
                 .any(|v| matches!(v.to_ascii_lowercase().as_str(), "deny" | "sameorigin"))
         });
-        let frame = header_csp.iter().any(|v| {
-            csp_sources(v, &["frame-ancestors"])
-                .is_some_and(|src| !src.is_empty() && !src.iter().any(|s| s == "*"))
-        });
+        let frame = header_values(&response, "Content-Security-Policy")
+            .flat_map(|v| v.split(','))
+            .any(|v| {
+                csp_sources(v, &["frame-ancestors"])
+                    .is_some_and(|src| !src.is_empty() && !src.iter().any(|s| s == "*"))
+            });
         if !xfo && !frame {
             add("clickjacking",Confidence::Firm,"framing policy","No enforcing frame-ancestors or valid X-Frame-Options restriction was found. Authentication and page sensitivity require review.".into());
         }
-        // Multiple enforced policies intersect: report unsafe script policy only when every policy allows it.
-        if !csp.is_empty() && csp_script_unsafe(&csp) {
+        // An unobserved meta policy could restrict the policy from the headers.
+        if let Some(policies) = &policies
+            && !policies.is_empty()
+            && csp_script_unsafe(policies)
+        {
             add("csp-unsafe-script",Confidence::Firm,"Content-Security-Policy","All enforced CSP policies permit unsafe-inline without a nonce/hash, or unsafe-eval.".into());
         }
     }
-    if (html
-        || response
-            .header("Content-Type")
-            .is_some_and(|v| v.contains("javascript")))
+    if (html || ct.contains("javascript"))
         && !header_values(&response, "X-Content-Type-Options").any(|v| {
             v.split(',')
                 .any(|v| v.trim().eq_ignore_ascii_case("nosniff"))
@@ -1539,6 +1857,11 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         );
     }
     let url = url::Url::parse(&flow.url).ok();
+    if request.method() == "GET"
+        && let Some(detail) = url.as_ref().and_then(csrf_query_detail)
+    {
+        add("csrf", Confidence::Firm, "URL query", detail);
+    }
     for (name, value) in url.as_ref().into_iter().flat_map(|u| u.query_pairs()) {
         if !value.is_empty() && password_name(&name) {
             add(
@@ -1557,13 +1880,15 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             );
         }
     }
+    let mut parameters = form_pairs(&request);
     if !flow.destination.tls
-        && (request
-            .header("Authorization")
-            .is_some_and(|v| v.starts_with("Basic "))
-            || form_pairs(&request)
-                .iter()
-                .any(|(k, v)| password_name(k) && !v.is_empty()))
+        && (header_values(&request, "Authorization").any(|value| {
+            value.split_once(' ').is_some_and(|(scheme, credentials)| {
+                scheme.eq_ignore_ascii_case("Basic") && !credentials.trim().is_empty()
+            })
+        }) || parameters
+            .iter()
+            .any(|(k, v)| password_name(k) && !v.is_empty()))
     {
         add(
             "cleartext-password",
@@ -1573,13 +1898,13 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 .into(),
         );
     }
+    let request_cookies = || {
+        header_values(&request, "Cookie")
+            .flat_map(|header| header.split(';'))
+            .filter_map(|pair| pair.split_once('='))
+    };
     if (request.header("Authorization").is_some()
-        || request.header("Cookie").is_some_and(|v| {
-            v.split(';').any(|c| {
-                c.split_once('=')
-                    .is_some_and(|(k, _)| session_name(k.trim()))
-            })
-        }))
+        || request_cookies().any(|(name, _)| session_name(name.trim())))
         && header_values(&response, "Cache-Control").any(|v| {
             v.split(',')
                 .any(|d| d.trim().eq_ignore_ascii_case("public"))
@@ -1603,7 +1928,6 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             );
         }
     }
-    let mut parameters = form_pairs(&request);
     parameters.extend(
         url.as_ref()
             .into_iter()
@@ -1618,6 +1942,9 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 .into_iter()
                 .map(|(k, _, _, v)| (k, v)),
         );
+    }
+    if let Some(detail) = csrf_request_detail(&request, &parameters) {
+        add("csrf", Confidence::Firm, "request", detail);
     }
     for (name, value) in &parameters {
         if re(
@@ -1658,11 +1985,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "A Java serialization stream signature was found in captured HTTP bytes.".into(),
         );
     }
-    let ct = response
-        .header("Content-Type")
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if let Some(bytes) = bounded_body(&response, limit) {
+    if let Some(bytes) = bytes.as_deref() {
         if (bytes.starts_with(b"\x89PNG\r\n\x1a\n") && !ct.contains("png"))
             || (bytes.starts_with(b"\xff\xd8\xff") && !ct.contains("jpeg") && !ct.contains("jpg"))
             || ((bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
@@ -1675,18 +1998,18 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("Binary response signature conflicts with declared type {ct:?}."),
             );
         }
-        if let Some((id, point, detail)) = charset::finding(&response, &bytes) {
+        if let Some((id, point, detail)) = charset::finding(&response, bytes) {
             add(id, Confidence::Certain, point, detail);
         }
     }
-    let Some(body) = body_opt else {
-        return findings;
-    };
     for (name, password) in parameters
         .iter()
         .filter(|(k, v)| password_name(k) && v.len() >= 6)
     {
-        if body.contains(password) {
+        if body_opt
+            .as_ref()
+            .is_some_and(|body| body.contains(password))
+        {
             add(
                 "password-response",
                 Confidence::Certain,
@@ -1694,20 +2017,11 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("The submitted {name} value appears literally in the response body."),
             );
         }
-        if request
-            .header("Cookie")
-            .into_iter()
-            .chain(
-                response
-                    .headers
-                    .iter()
-                    .filter(|(k, _)| k.eq_ignore_ascii_case("Set-Cookie"))
-                    .map(|(_, v)| v.as_str()),
-            )
-            .any(|v| {
-                v.split(';')
-                    .any(|c| c.split_once('=').is_some_and(|(_, v)| v == password))
-            })
+        let response_cookies = header_values(&response, "Set-Cookie")
+            .filter_map(|header| header.split(';').next()?.split_once('='));
+        if request_cookies()
+            .chain(response_cookies)
+            .any(|(name, value)| !name.trim().is_empty() && value.trim() == password)
         {
             add(
                 "password-cookie",
@@ -1717,12 +2031,15 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             );
         }
     }
+    let Some(body) = body_opt.as_deref() else {
+        return findings.finish();
+    };
     if re(
         r"(?s)-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----[A-Za-z0-9+/=\s]+-----END (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----",
-        &body,
+        body,
     ) || re(
         r"(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?-----END PGP PRIVATE KEY BLOCK-----",
-        &body,
+        body,
     ) {
         add(
             "private-key",
@@ -1731,7 +2048,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "A complete private-key PEM envelope is present.".into(),
         );
     }
-    if sql_error(&body) {
+    if sql_error(body) {
         add(
             "sql-disclosure",
             Confidence::Firm,
@@ -1741,7 +2058,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     }
     if re(
         r"(?m)(?:^\s*at [a-zA-Z_$][\w.$]+\([^\r\n]+\.java:\d+\)|^\s*at\s+[^\r\n]*:\d+:\d+|^\s*from\s+[^\r\n]*:\d+:in\s+|^goroutine \d+ \[running\]:|Traceback \(most recent call last\):|Fatal error: Uncaught [^\r\n]+ in [^\r\n]+ on line \d+|System\.[\w.]+Exception:)",
-        &body,
+        body,
     ) {
         add(
             "stack-trace",
@@ -1750,7 +2067,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "A recognizable Java, Python, PHP, or .NET stack trace is present.".into(),
         );
     }
-    if source_code(&body) {
+    if source_code(body) {
         add(
             "source-code",
             Confidence::Firm,
@@ -1758,12 +2075,12 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "Server-side source syntax is exposed in the response.".into(),
         );
     }
-    for (id, detail) in diagnostic_pages(&body) {
+    for (id, detail) in diagnostic_pages(body) {
         add(id, Confidence::Firm, "response body", detail.into());
     }
     if html
-        && re(r"(?i)<title>\s*(?:Index of |Directory listing for )", &body)
-        && re(r#"(?i)(?:parent directory|<a href=|href=["']\?C=)"#, &body)
+        && re(r"(?i)<title>\s*(?:Index of |Directory listing for )", body)
+        && re(r#"(?i)(?:parent directory|<a href=|href=["']\?C=)"#, body)
     {
         add(
             "directory-listing",
@@ -1775,7 +2092,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
     if url
         .as_ref()
         .is_some_and(|u| u.path().ends_with("/robots.txt"))
-        && re(r"(?im)^\s*User-agent\s*:", &body)
+        && re(r"(?im)^\s*User-agent\s*:", body)
     {
         add(
             "robots",
@@ -1784,7 +2101,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "The response contains robots exclusion directives.".into(),
         );
     }
-    if openapi(&body) {
+    if json.as_ref().is_some_and(openapi_json) || openapi_yaml(body) {
         add(
             "openapi",
             Confidence::Certain,
@@ -1792,17 +2109,17 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             "A JSON API definition contains a version field and paths object.".into(),
         );
     }
-    if let Some(keys) = jwks(&body) {
+    if let Some(keys) = json.as_ref().and_then(jwk_keys) {
         add(
             "jwks",
             Confidence::Certain,
             "response body",
             "A JSON Web Key Set is present.".into(),
         );
-        if keys["keys"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|k| k.get("d").is_some() || k.get("k").is_some())
-        }) {
+        if keys
+            .iter()
+            .any(|k| k.get("d").is_some() || k.get("k").is_some())
+        {
             add(
                 "jwk-private",
                 Confidence::Certain,
@@ -1812,7 +2129,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         }
     }
     if let Some(ip) = PRIVATE_IP
-        .find_iter(&body)
+        .find_iter(body)
         .map(|m| m.as_str())
         .find(|v| v.parse::<std::net::Ipv4Addr>().is_ok())
     {
@@ -1823,7 +2140,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             format!("Internal IPv4 address {ip} is exposed."),
         );
     }
-    if let Some(email) = EMAIL.find(&body) {
+    if let Some(email) = EMAIL.find(body) {
         add(
             "email",
             Confidence::Certain,
@@ -1832,7 +2149,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         );
     }
     if let Some(card) = CARD
-        .find_iter(&body)
+        .find_iter(body)
         .find(|m| luhn(m.as_str()) && plausible_card(m.as_str()))
     {
         let digits: String = card.as_str().chars().filter(char::is_ascii_digit).collect();
@@ -1848,7 +2165,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         );
     }
     if html {
-        if re(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?file\b"#, &body) {
+        if re(r#"(?i)<input\b[^>]*\btype\s*=\s*["']?file\b"#, body) {
             add(
                 "file-upload",
                 Confidence::Certain,
@@ -1856,7 +2173,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "The page contains an HTML file upload input.".into(),
             );
         }
-        if PASSWORD_INPUT.find_iter(&body).any(|tag| {
+        if PASSWORD_INPUT.find_iter(body).any(|tag| {
             !re(
                 r#"(?i)\bautocomplete\s*=\s*["']?(?:off|new-password)"#,
                 tag.as_str(),
@@ -1869,7 +2186,10 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "A password input does not declare autocomplete=off or new-password.".into(),
             );
         }
-        for c in FORM_ACTION.captures_iter(&body) {
+        if let Some(detail) = csrf_form_detail(body) {
+            add("csrf", Confidence::Firm, "form", detail);
+        }
+        for c in FORM_ACTION.captures_iter(body) {
             let action = if c[1].starts_with("//") {
                 format!("https:{}", &c[1])
             } else {
@@ -1891,8 +2211,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
         if flow.destination.tls
             && (re(
                 r#"(?i)<(?:script|iframe|object|embed|link)\b[^>]*(?:src|data|href)\s*=\s*["']http://"#,
-                &body,
-            ) || re(r#"(?i)<form\b[^>]*\baction\s*=\s*["']http://"#, &body))
+                body,
+            ) || re(r#"(?i)<form\b[^>]*\baction\s*=\s*["']http://"#, body))
         {
             add(
                 "mixed-content",
@@ -1901,7 +2221,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "HTTPS HTML references an active resource using http://.".into(),
             );
         }
-        for caps in SCRIPT_SRC.captures_iter(&body) {
+        for caps in SCRIPT_SRC.captures_iter(body) {
             let value = if caps[1].starts_with("//") {
                 format!("https:{}", &caps[1])
             } else {
@@ -1919,8 +2239,8 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 break;
             }
         }
-        if re(r#"(?i)<input\b[^>]*type\s*=\s*["']?password\b"#, &body)
-            && (!flow.destination.tls || re(r#"(?i)<form\b[^>]*action\s*=\s*["']http://"#, &body))
+        if re(r#"(?i)<input\b[^>]*type\s*=\s*["']?password\b"#, body)
+            && (!flow.destination.tls || re(r#"(?i)<form\b[^>]*action\s*=\s*["']http://"#, body))
         {
             add(
                 "cleartext-password",
@@ -1930,7 +2250,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             );
         }
         if let Some(target) = META_REFRESH_URL
-            .captures(&body)
+            .captures(body)
             .and_then(|caps| caps.get(1))
             .map(|capture| capture.as_str())
             && url::Url::parse(target).ok().is_some_and(|destination| {
@@ -1945,7 +2265,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 format!("The page redirects to another origin through meta refresh: {target}."),
             );
         }
-        if ANCHOR_BLANK.find_iter(&body).any(|tag| {
+        if ANCHOR_BLANK.find_iter(body).any(|tag| {
             let tag = tag.as_str().to_ascii_lowercase();
             !(tag.contains("noopener") || tag.contains("noreferrer"))
         }) {
@@ -1956,7 +2276,7 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
                 "A target=_blank link omits rel=noopener/noreferrer.".into(),
             );
         }
-        if JAVASCRIPT_URI.is_match(&body) {
+        if JAVASCRIPT_URI.is_match(body) {
             add(
                 "javascript-uri",
                 Confidence::Tentative,
@@ -1965,19 +2285,14 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             );
         }
     }
-    let ct = response
-        .header("Content-Type")
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let trimmed = body.trim_start().to_ascii_lowercase();
-    let json_signature = (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && serde_json::from_str::<serde_json::Value>(&body).is_ok()
+    let json_signature = json.is_some()
         && !ct.contains("json")
         && !ct.contains("javascript")
         && !ct.contains("plain");
     if (body.starts_with("%PDF-") && !ct.contains("pdf"))
         || json_signature
-        || ((trimmed.starts_with("<!doctype html") || trimmed.starts_with("<html"))
+        || ((starts_with_ignore_ascii_case(trimmed, "<!doctype html")
+            || starts_with_ignore_ascii_case(trimmed, "<html"))
             && !ct.contains("html")
             && !ct.contains("plain"))
     {
@@ -1999,10 +2314,13 @@ pub fn passive(flow: &Exchange, limit: usize) -> Vec<Candidate> {
             ),
         );
     }
-    if (html || ct.contains("javascript")) && static_dom(&body, html) {
+    if (html || ct.contains("javascript"))
+        && settings.is_none_or(|settings| passive_check_enabled(settings, "static-dom"))
+        && static_dom(body, html)
+    {
         add("static-dom",Confidence::Tentative,"captured JavaScript","A direct URL-source-to-DOM/evaluation-sink expression appears in captured source. Browser execution and exploitability have not been verified.".into());
     }
-    findings
+    findings.finish()
 }
 
 fn password_name(name: &str) -> bool {
@@ -2019,10 +2337,26 @@ fn session_name(name: &str) -> bool {
             "sid" | "jsessionid" | "phpsessid" | "auth_token" | "access_token"
         )
 }
+/// True when the request submits a password, so injection evidence implies an
+/// authentication-bypass impact as well as data access.
+pub(crate) fn credential_request(message: &Message) -> bool {
+    let from_query = message.target().split_once('?').is_some_and(|(_, query)| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(name, value)| password_name(&name) && !value.is_empty())
+    });
+    from_query
+        || form_pairs(message)
+            .iter()
+            .any(|(name, value)| password_name(name) && !value.is_empty())
+}
 fn form_pairs(message: &Message) -> Vec<(String, String)> {
     if !message
         .header("Content-Type")
-        .is_some_and(|v| v.starts_with("application/x-www-form-urlencoded"))
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| {
+            mime.trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
     {
         return vec![];
     }
@@ -2437,6 +2771,11 @@ enum Location {
         json: bool,
         raw: bool,
     },
+    Graphql {
+        start: usize,
+        end: usize,
+        quoted: bool,
+    },
     Cookie {
         index: usize,
     },
@@ -2586,6 +2925,90 @@ fn json_spans(body: &str, limit: usize) -> Vec<(String, usize, usize, String)> {
     }
     out
 }
+/// Skip a GraphQL string token and return the byte offset after its closing quote.
+fn skip_graphql_string(bytes: &[u8], mut index: usize) -> usize {
+    index += 1;
+    let mut escape = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if escape {
+            escape = false;
+        } else if byte == b'\\' {
+            escape = true;
+        } else if byte == b'"' {
+            break;
+        }
+    }
+    index
+}
+/// Locate string and numeric GraphQL arguments inside a query document.
+/// Offsets refer to the decoded query string, so callers can rewrite the query
+/// without corrupting the surrounding JSON request body.
+fn graphql_argument_spans(query: &str, limit: usize) -> Vec<(String, usize, usize, bool, String)> {
+    let bytes = query.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() && out.len() < limit {
+        match bytes[index] {
+            b'"' => index = skip_graphql_string(bytes, index),
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let name_start = index;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                let name = &query[name_start..index];
+                let mut next = index;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if bytes.get(next) != Some(&b':') {
+                    continue;
+                }
+                next += 1;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                let Some(&value_start_byte) = bytes.get(next) else {
+                    break;
+                };
+                if value_start_byte == b'"' {
+                    let end = skip_graphql_string(bytes, next);
+                    if end <= bytes.len() {
+                        // GraphQL string escapes are JSON-compatible.
+                        let value =
+                            serde_json::from_str::<String>(&query[next..end]).unwrap_or_default();
+                        out.push((name.into(), next, end, true, value));
+                    }
+                    index = end.max(next + 1);
+                } else if value_start_byte == b'-' || value_start_byte.is_ascii_digit() {
+                    let start = next;
+                    while next < bytes.len()
+                        && (bytes[next].is_ascii_digit() || b"-+.eE".contains(&bytes[next]))
+                    {
+                        next += 1;
+                    }
+                    out.push((name.into(), start, next, false, query[start..next].into()));
+                    index = next;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    out
+}
+/// Encode a value as a GraphQL/JSON string literal so arbitrary payload bytes
+/// stay inside the argument instead of breaking the document.
+fn graphql_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
+}
 fn allowed_parameter(name: &str, settings: &ScanSettings) -> bool {
     !settings.excluded_parameters.iter().any(|pattern| {
         if let Some(prefix) = pattern.strip_suffix('*') {
@@ -2612,7 +3035,8 @@ fn points(
     const HEADER: usize = 5;
     const PATH: usize = 6;
     const NESTED: usize = 7;
-    let mut buckets: [Vec<Point>; 8] = Default::default();
+    const GRAPHQL: usize = 8;
+    let mut buckets: [Vec<Point>; 9] = Default::default();
     // Bound construction itself, not only the final merge. A request with a
     // very large parameter list must not allocate one Point per parameter.
     let source_cap = settings.max_insertion_points.saturating_mul(4).max(32);
@@ -2696,6 +3120,14 @@ fn points(
                 offset += part.len() + 1;
             }
         } else if ct.contains("json") {
+            let graphql_query = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("query")
+                        .and_then(|query| query.as_str())
+                        .map(str::to_owned)
+                });
             for (index, (name, start, end, value)) in json_spans(
                 body,
                 settings.max_insertion_points.saturating_mul(4).max(16),
@@ -2703,6 +3135,11 @@ fn points(
             .into_iter()
             .enumerate()
             {
+                // A GraphQL query string is an envelope: injecting into it
+                // replaces the whole document and never reaches an argument.
+                if graphql_query.is_some() && name == "query" {
+                    continue;
+                }
                 if settings.scan_json_values && allowed_parameter(&name, settings) {
                     buckets[BODY_VALUE].push(Point {
                         name: name.clone(),
@@ -2716,6 +3153,23 @@ fn points(
                         },
                         wraps: vec![],
                     });
+                }
+            }
+            if let Some(query) = &graphql_query {
+                for (index, (name, start, end, quoted, value)) in
+                    graphql_argument_spans(query, source_cap)
+                        .into_iter()
+                        .enumerate()
+                {
+                    if settings.scan_json_values && allowed_parameter(&name, settings) {
+                        buckets[GRAPHQL].push(Point {
+                            name: name.clone(),
+                            label: format!("GraphQL argument {name} [{index}]"),
+                            original: value,
+                            location: Location::Graphql { start, end, quoted },
+                            wraps: vec![],
+                        });
+                    }
                 }
             }
             if settings.scan_json_body && serde_json::from_str::<serde_json::Value>(body).is_ok() {
@@ -2956,7 +3410,13 @@ fn nested_points(
     if depth >= 3 || point.original.len() > 256 * 1024 || out.len() >= cap {
         return;
     }
-    let mut containers = vec![(point.original.clone(), vec![])];
+    let mut containers = Vec::new();
+    // Only structured containers produce nested points. A bare number, string,
+    // or literal is valid JSON but has no child member to inject into; parsing
+    // it would add empty-named children and duplicate every finding.
+    if point.original.trim_start().starts_with(['{', '[']) {
+        containers.push((point.original.clone(), vec![]));
+    }
     for (url, padded) in [(false, true), (true, false)] {
         let value = if url {
             URL_SAFE_NO_PAD.decode(&point.original)
@@ -3044,6 +3504,33 @@ fn point_request(
                 format!("{key}={}", encoded(&payload))
             };
             replace_target(&mut request, &format!("{path}?{}", parts.join("&")));
+        }
+        Location::Graphql { start, end, quoted } => {
+            let mut document: serde_json::Value = serde_json::from_slice(&request.body)?;
+            let query = document
+                .get("query")
+                .and_then(|query| query.as_str())
+                .ok_or_else(|| anyhow::anyhow!("GraphQL body lost its query string"))?
+                .to_owned();
+            anyhow::ensure!(
+                start <= end
+                    && end <= query.len()
+                    && query.is_char_boundary(start)
+                    && query.is_char_boundary(end),
+                "GraphQL argument span is outside the query"
+            );
+            let replacement = if quoted {
+                graphql_string_literal(&payload)
+            } else {
+                payload.clone()
+            };
+            let mut updated =
+                String::with_capacity(query.len() + replacement.len().saturating_sub(end - start));
+            updated.push_str(&query[..start]);
+            updated.push_str(&replacement);
+            updated.push_str(&query[end..]);
+            document["query"] = serde_json::Value::String(updated);
+            request.body = serde_json::to_vec(&document)?;
         }
         Location::Body {
             start,
@@ -4105,6 +4592,12 @@ pub fn evaluate_cached(
     if matches!(&probe.matcher, Matcher::Xss { .. }) {
         finding.detail = "The exact injected executable HTML markup was returned in a token context outside quoted attributes, comments, raw text, and inert containers. Browser execution, CSP bypass, and practical exploitability require manual verification.".into();
     }
+    if probe.issue_id.starts_with("sqli")
+        && Message::parse(&baseline.exchange.request)
+            .is_ok_and(|request| credential_request(&request))
+    {
+        finding.detail.push_str(" The affected parameter belongs to a credential submission, so successful exploitation can bypass authentication.");
+    }
     finding.evidence.insert(
         0,
         Evidence {
@@ -4665,6 +5158,12 @@ pub fn evaluate_series(baseline: &Exchange, results: &[(Probe, Exchange)]) -> Ve
                 label: "Selected baseline".into(),
                 exchange: baseline.clone(),
             }];
+            if family.starts_with("sql-")
+                && Message::parse(&baseline.request)
+                    .is_ok_and(|request| credential_request(&request))
+            {
+                c.detail.push_str(" The affected parameter belongs to a credential submission, so successful exploitation can bypass authentication.");
+            }
             for ((_, control), (_, positive)) in pairs {
                 c.evidence.push(Evidence {
                     label: "Negative/control probe".into(),

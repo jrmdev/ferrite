@@ -3,8 +3,10 @@
 use super::comparer_view::Slot;
 use super::{
     Event, Workbench, decode_editor, editable, editor_context, entry_menu, hex_headers,
-    http_editor, item_menu, split_panes, subsection_heading,
+    http_editor::{Find, http_editor},
+    item_menu, split_panes, subsection_heading,
 };
+use crate::engine::Stage;
 use crate::model::{Exchange, RepeaterTab};
 use eframe::egui::{self, RichText};
 
@@ -369,6 +371,10 @@ impl Workbench {
                     tab.request_hex = h;
                 }
             }
+            ui.separator();
+            let [mut request_ui, mut response_ui] = split_panes(ui, "repeater-editors", false, 0.5);
+            subsection_heading(&mut request_ui, "Request");
+            subsection_heading(&mut response_ui, "Response");
             let response = flow
                 .as_ref()
                 .map(|f| {
@@ -382,23 +388,6 @@ impl Workbench {
                     )
                 })
                 .unwrap_or_default();
-            egui::TopBottomPanel::bottom(ui.id().with("repeater-find"))
-                .resizable(false)
-                .frame(egui::Frame::NONE)
-                .show_inside(ui, |ui| {
-                    super::highlight::find_bar(
-                        ui,
-                        &[("request", &tab.request), ("response", &response)],
-                        |ui| {
-                            ui.checkbox(&mut tab.request_hex, "Request is hex");
-                            ui.checkbox(&mut self.response_hex, "Response as hex");
-                        },
-                    );
-                });
-            ui.separator();
-            let [mut request_ui, mut response_ui] = split_panes(ui, "repeater-editors", false, 0.5);
-            subsection_heading(&mut request_ui, "Request");
-            subsection_heading(&mut response_ui, "Response");
             let headers = hex_headers(
                 &mut request_ui,
                 &tab.request,
@@ -409,6 +398,7 @@ impl Workbench {
                 &mut request_ui,
                 &mut tab.request,
                 ("repeater-request", tab.id, tab.request_hex),
+                Some(Find::WithHex(Stage::Request, &mut tab.request_hex)),
             );
             let action = item_menu(&request_output.inner.response, false, None).or_else(|| {
                 headers
@@ -427,6 +417,7 @@ impl Workbench {
                     self.repeater_flow,
                     self.response_hex,
                 ),
+                Some(Find::WithHex(Stage::Response, &mut self.response_hex)),
             );
             if let Some(saved) = &flow {
                 if let Some(action) = entry_menu(&response_output.inner.response, true) {

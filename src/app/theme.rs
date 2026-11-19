@@ -1,6 +1,10 @@
 use crate::model::ColorScheme;
 use eframe::egui::{self, Color32, Stroke};
 
+pub(super) fn muted_detail_color(visuals: &egui::Visuals) -> Color32 {
+    Color32::from_gray(if visuals.dark_mode { 160 } else { 104 })
+}
+
 pub(super) fn timestamp_text(
     ui: &egui::Ui,
     text: &str,
@@ -8,18 +12,18 @@ pub(super) fn timestamp_text(
     color: Color32,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    let split = text.rfind('.').unwrap_or(text.len());
+    let split = text.find('.').unwrap_or(text.len());
     job.append(
         &text[..split],
         0.0,
         egui::TextFormat::simple(font.clone(), color),
     );
     if split < text.len() {
-        let lighter = color.lerp_to_gamma(
-            Color32::WHITE,
-            if ui.visuals().dark_mode { 0.35 } else { 0.25 },
+        job.append(
+            &text[split..],
+            0.0,
+            egui::TextFormat::simple(font, muted_detail_color(ui.visuals())),
         );
-        job.append(&text[split..], 0.0, egui::TextFormat::simple(font, lighter));
     }
     job
 }
@@ -256,6 +260,33 @@ mod tests {
                         ColorScheme::Light | ColorScheme::Cappuccino | ColorScheme::DesertMirage
                     )
             );
+        }
+    }
+
+    #[test]
+    fn every_color_scheme_uses_the_detail_color_for_the_timestamp_suffix() {
+        let ctx = egui::Context::default();
+        for scheme in ColorScheme::ALL {
+            apply(&ctx, scheme);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let text = "2026-11-19 09:48:10.808 AEDT";
+                    let visuals = ui.visuals();
+                    let color = visuals.text_color();
+                    let job = timestamp_text(ui, text, egui::FontId::default(), color);
+                    let [main, fraction] = job.sections.as_slice() else {
+                        panic!("Expected two timestamp sections for {scheme:?}");
+                    };
+                    assert_eq!(&job.text[main.byte_range.clone()], "2026-11-19 09:48:10");
+                    assert_eq!(&job.text[fraction.byte_range.clone()], ".808 AEDT");
+                    assert_eq!(main.format.color, color);
+                    assert_eq!(
+                        fraction.format.color,
+                        muted_detail_color(visuals),
+                        "{scheme:?} timestamp suffix color"
+                    );
+                });
+            });
         }
     }
 

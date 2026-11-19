@@ -2,14 +2,20 @@
 use crate::model::{Destination, Exchange};
 use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 use serde::{Serialize, Serializer};
-use std::{io::Write, path::Path};
+use std::{
+    borrow::Borrow,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 #[derive(Serialize)]
-struct Export<'a> {
+struct Export<T> {
     format: &'static str,
     version: u32,
-    items: Vec<Item<'a>>,
+    items: T,
 }
+
+struct Items<'a, T>(&'a [T]);
 
 #[derive(Serialize)]
 struct Item<'a> {
@@ -35,14 +41,11 @@ fn base64_bytes<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::
     serializer.collect_str(&Base64Display::new(bytes, &STANDARD))
 }
 
-pub fn export_selected(path: &Path, exchanges: &[Exchange]) -> anyhow::Result<()> {
-    anyhow::ensure!(!exchanges.is_empty(), "Select at least one history item");
-    let export = Export {
-        format: "ferrite-history",
-        version: 1,
-        items: exchanges
-            .iter()
-            .map(|flow| Item {
+impl<T: Borrow<Exchange>> Serialize for Items<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|flow| {
+            let flow = flow.borrow();
+            Item {
                 id: flow.id,
                 timestamp_ms: flow.timestamp_ms,
                 tool: &flow.tool,
@@ -57,8 +60,24 @@ pub fn export_selected(path: &Path, exchanges: &[Exchange]) -> anyhow::Result<()
                 note: &flow.note,
                 request_base64: &flow.request,
                 response_base64: &flow.response,
-            })
-            .collect(),
+            }
+        }))
+    }
+}
+
+pub fn export_selected(path: &Path, exchanges: &[Exchange]) -> anyhow::Result<()> {
+    export_items(path, exchanges)
+}
+
+pub(crate) fn export_items<T: Borrow<Exchange>>(
+    path: &Path,
+    exchanges: &[T],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!exchanges.is_empty(), "Select at least one history item");
+    let export = Export {
+        format: "ferrite-history",
+        version: 1,
+        items: Items(exchanges),
     };
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -67,11 +86,11 @@ pub fn export_selected(path: &Path, exchanges: &[Exchange]) -> anyhow::Result<()
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let mut file = BufWriter::new(options.open(path)?);
     let result = (|| -> anyhow::Result<()> {
         serde_json::to_writer_pretty(&mut file, &export)?;
         file.flush()?;
-        file.sync_all()?;
+        file.get_ref().sync_all()?;
         Ok(())
     })();
     if result.is_err() {

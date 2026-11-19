@@ -1,15 +1,21 @@
 //! MCP server controls: status, clients, permissions, approvals, setup and audit.
-use super::{Event, Workbench, subsection_heading, timestamp};
+use super::{Event, Workbench, listen_interface_combo, subsection_heading, timestamp};
 use crate::mcp::{
     McpSettings, Outcome, Permission,
     host::{Capability, Decision},
     ipc::{self, IpcServer},
+    network::NetworkServer,
 };
 use eframe::egui::{self, RichText};
+use std::net::IpAddr;
 
 #[derive(Default)]
 pub(super) struct State {
     pub(super) server: Option<IpcServer>,
+    pub(super) network_server: Option<NetworkServer>,
+    network_stopping: bool,
+    network_error: Option<String>,
+    listen_draft: Option<(Option<IpAddr>, u16)>,
     pub(super) starting: bool,
     draft: Option<McpSettings>,
     audit_search: String,
@@ -21,6 +27,7 @@ pub(super) struct State {
 enum Setup {
     Choose,
     Local,
+    Network,
     Ssh,
 }
 
@@ -51,6 +58,8 @@ impl Workbench {
     }
 
     pub(super) fn stop_mcp(&mut self) {
+        self.stop_mcp_network();
+        self.mcp_view.network_error = None;
         self.mcp.deny_all();
         if let Some(server) = self.mcp_view.server.take() {
             self.runtime.spawn(server.stop());
@@ -62,11 +71,9 @@ impl Workbench {
         match result {
             Ok(server) if self.preferences.mcp().enabled => {
                 self.mcp_view.last_error = None;
-                self.notify(
-                    "MCP",
-                    format!("MCP server ready on {} for local clients", server.address()),
-                );
+                self.notify("MCP", format!("MCP relay ready on {}", server.address()));
                 self.mcp_view.server = Some(server);
+                self.restart_mcp_network();
             }
             // Disabled while starting: discard.
             Ok(server) => drop(server),
@@ -78,20 +85,62 @@ impl Workbench {
     }
 
     fn apply_mcp(&mut self, settings: McpSettings) {
-        let was_enabled = self.preferences.mcp().enabled;
+        let previous = self.preferences.mcp();
+        let was_enabled = previous.enabled;
+        let network_changed = previous.network_ip != settings.network_ip
+            || previous.network_port != settings.network_port;
         let result = self.preferences.set_mcp(settings.clone());
         if self.report(result).is_none() {
             return;
         }
         self.mcp.set_settings(settings.clone());
-        self.mcp_view.draft = None;
+        if network_changed {
+            if let Some(draft) = &mut self.mcp_view.draft {
+                draft.network_ip = settings.network_ip;
+                draft.network_port = settings.network_port;
+            }
+        } else {
+            self.mcp_view.draft = None;
+        }
         match (was_enabled, settings.enabled) {
             (false, true) => self.start_mcp(),
             (true, false) => {
                 self.stop_mcp();
                 self.notify("MCP", "MCP server disabled; clients were disconnected");
             }
+            (true, true) if network_changed => self.restart_mcp_network(),
             _ => self.notify("MCP", "MCP settings saved"),
+        }
+    }
+
+    fn stop_mcp_network(&mut self) {
+        if let Some(server) = self.mcp_view.network_server.take() {
+            self.mcp_view.network_stopping = true;
+            let tx = self.tx.clone();
+            self.runtime.spawn(async move {
+                server.stop().await;
+                let _ = tx.send(Event::McpNetworkStopped);
+            });
+        }
+    }
+
+    pub(super) fn mcp_network_stopped(&mut self) {
+        self.mcp_view.network_stopping = false;
+        self.restart_mcp_network();
+    }
+
+    fn restart_mcp_network(&mut self) {
+        self.stop_mcp_network();
+        self.mcp_view.network_error = None;
+        let Some(address) = self.preferences.mcp().network_address() else {
+            return;
+        };
+        if self.mcp_view.server.is_none() || self.mcp_view.network_stopping {
+            return;
+        }
+        match NetworkServer::start(self.mcp.clone(), address, self.runtime.handle()) {
+            Ok(server) => self.mcp_view.network_server = Some(server),
+            Err(error) => self.mcp_view.network_error = Some(format!("{error:#}")),
         }
     }
 
@@ -181,14 +230,20 @@ impl Workbench {
             }
             match (&self.mcp_view.server, self.mcp_view.starting) {
                 (Some(server), _) => {
-                    ui.label(format!(
-                        "⏺ Listening on {} (loopback only, token required)",
-                        server.address()
-                    ))
-                    .on_hover_text(format!(
-                        "Endpoint file: {}",
-                        server.endpoint_path().display()
-                    ));
+                    if let Some(network) = &self.mcp_view.network_server {
+                        ui.label(format!("⏺ Listening at {}", network.url()));
+                    } else if self.mcp_view.network_stopping && saved.network_ip.is_some() {
+                        ui.label("Restarting network listener…");
+                    } else {
+                        ui.label(format!(
+                            "⏺ Listening on {} (loopback only, token required)",
+                            server.address()
+                        ))
+                        .on_hover_text(format!(
+                            "Endpoint file: {}",
+                            server.endpoint_path().display()
+                        ));
+                    }
                 }
                 (None, true) => {
                     ui.label("Starting…");
@@ -206,6 +261,50 @@ impl Workbench {
         });
         if let Some(error) = &self.mcp_view.last_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let saved = self.preferences.mcp().clone();
+        let can_restart = self.mcp_view.server.is_some() && !self.mcp_view.network_stopping;
+        let (network_ip, network_port) = self
+            .mcp_view
+            .listen_draft
+            .get_or_insert((saved.network_ip, saved.network_port));
+        let apply = ui
+            .horizontal(|ui| {
+                ui.label("Listen interface");
+                listen_interface_combo(ui, "mcp-listen-interface", network_ip);
+                ui.label("Port");
+                ui.add_enabled(
+                    network_ip.is_some(),
+                    egui::DragValue::new(network_port).range(1..=u16::MAX),
+                );
+                let changed =
+                    (*network_ip, *network_port) != (saved.network_ip, saved.network_port);
+                ui.add_enabled(
+                    changed || (can_restart && network_ip.is_some()),
+                    egui::Button::new("Apply"),
+                )
+                .clicked()
+            })
+            .inner;
+        if apply {
+            let settings = McpSettings {
+                network_ip: *network_ip,
+                network_port: *network_port,
+                ..saved.clone()
+            };
+            if settings == saved {
+                self.restart_mcp_network();
+            } else {
+                self.apply_mcp(settings);
+            }
+        }
+        if let Some(error) = self.mcp_view.network_error.clone() {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+                if ui.button("Retry").clicked() {
+                    self.restart_mcp_network();
+                }
+            });
         }
         ui.add_space(8.0);
         subsection_heading(ui, "Connected agents");
@@ -243,11 +342,12 @@ impl Workbench {
         }
         ui.add_space(8.0);
         subsection_heading(ui, "Permissions");
+        let saved = self.preferences.mcp().clone();
         let draft = self.mcp_view.draft.get_or_insert_with(|| saved.clone());
         egui::Grid::new("mcp-permissions").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             for (label, value, hint) in [
                 ("Send HTTP requests", &mut draft.send_requests, "send_http_request: in-scope requests through Ferrite's engine"),
-                ("Active scans", &mut draft.active_scans, "start_active_scan and cancel_scan, using the project's scanner settings"),
+                ("Active scans", &mut draft.active_scans, "start_active_scan (stdio) and cancel_scan, using the project's scanner settings"),
             ] {
                 ui.label(label).on_hover_text(hint);
                 egui::ComboBox::from_id_salt(label)
@@ -329,9 +429,12 @@ impl Workbench {
                 self.mcp_view.setup = Some(Setup::Local);
             }
             if ui
-                .selectable_label(setup == Setup::Ssh, "Another machine")
+                .selectable_label(setup == Setup::Network, "Another machine")
                 .clicked()
             {
+                self.mcp_view.setup = Some(Setup::Network);
+            }
+            if ui.selectable_label(setup == Setup::Ssh, "SSH").clicked() {
                 self.mcp_view.setup = Some(Setup::Ssh);
             }
             if ui.small_button("Close").clicked() {
@@ -342,6 +445,10 @@ impl Workbench {
             return;
         };
         if setup == Setup::Choose {
+            return;
+        }
+        if setup == Setup::Network {
+            self.mcp_network_setup(ui);
             return;
         }
         let exe = std::env::current_exe()
@@ -362,7 +469,7 @@ impl Workbench {
                     "mcpServers": {"ferrite": {"command": "ssh", "args": ["-T", "-o", "BatchMode=yes", "USER@FERRITE_HOST", command]}}
                 })
             }
-            Setup::Choose => unreachable!(),
+            Setup::Choose | Setup::Network => unreachable!(),
         };
         let json = serde_json::to_string_pretty(&config).unwrap_or_default();
         ui.label("1. Keep this window open with the MCP server enabled.");
@@ -391,6 +498,37 @@ impl Workbench {
             "3. Start or reconnect your client and use Ferrite's MCP tools."
         });
         ui.weak("Without this window, `ferrite mcp --headless --project FILE` serves a project directly (see ferrite mcp --help).");
+    }
+
+    fn mcp_network_setup(&self, ui: &mut egui::Ui) {
+        let Some(server) = &self.mcp_view.network_server else {
+            ui.label("Choose a network address under Listen interface, select Apply and enable the MCP server.");
+            return;
+        };
+        let config = serde_json::json!({
+            "mcpServers": {"ferrite": {
+                "type": "http",
+                "url": server.url(),
+                "headers": {"Authorization": "Bearer YOUR_TOKEN"}
+            }}
+        });
+        let json = serde_json::to_string_pretty(&config).unwrap_or_default();
+        ui.label("1. Keep Ferrite open. Use an encrypted private network or an HTTPS reverse proxy to protect the token and project data.");
+        ui.label("2. Add a Streamable HTTP server in your MCP client using this URL and Authorization header. Replace YOUR_TOKEN with the copied token.");
+        ui.add(egui::Label::new(RichText::new(&json).monospace()));
+        ui.horizontal(|ui| {
+            for (label, value) in [
+                ("Copy configuration", json),
+                ("Copy URL", server.url()),
+                ("Copy bearer token", server.token().to_owned()),
+            ] {
+                if ui.small_button(label).clicked() {
+                    ui.ctx().copy_text(value);
+                }
+            }
+        });
+        ui.label("3. Start or reconnect the client. Network clients can inspect the project, use Repeater and send in-scope requests according to the Send HTTP requests permission.");
+        ui.weak("Configuration formats vary by client. Ferrite issues a new bearer token when the listener restarts.");
     }
 
     fn mcp_audit(&mut self, ui: &mut egui::Ui) {

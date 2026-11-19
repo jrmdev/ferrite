@@ -1,10 +1,13 @@
 use super::{
-    EntryAction, http_editor, item_menu, message_view, response_content::ResponseCache,
+    EntryAction,
+    http_editor::{Find, http_editor, message_view},
+    item_menu,
+    response_content::ResponseCache,
     split_panes, subsection_heading, timestamp,
 };
 use crate::{
     display_timezone::DisplayTimezone,
-    engine::Engine,
+    engine::{Engine, Stage},
     model::Exchange,
     scanner::{
         self, DelayMode, FailureAction, Finding, ReviewState, ScanJob, ScanMode, ScanSettings,
@@ -51,6 +54,15 @@ enum LibrarySort {
     Issue,
     Detection,
     Intrusive,
+}
+
+enum ScanAction {
+    Pause,
+    Resume,
+    Cancel,
+    Retry,
+    ScanAgain,
+    Delete,
 }
 
 fn sort_header(ui: &mut egui::Ui, title: &str, active: bool, descending: bool) -> bool {
@@ -103,6 +115,7 @@ pub(super) struct State {
     search: String,
     issue_search: String,
     severity: Option<Severity>,
+    host: Option<String>,
     source: Option<ScanMode>,
     review: Option<ReviewState>,
     sort: Sort,
@@ -110,7 +123,8 @@ pub(super) struct State {
     library_sort: LibrarySort,
     library_descending: bool,
     evidence_index: usize,
-    hex: bool,
+    request_hex: bool,
+    response_hex: bool,
     response_cache: ResponseCache,
     seen: (u64, u64),
     last_refresh: Option<std::time::Instant>,
@@ -138,6 +152,7 @@ impl Default for State {
             search: String::new(),
             issue_search: String::new(),
             severity: None,
+            host: None,
             source: None,
             review: None,
             sort: Sort::Severity,
@@ -145,7 +160,8 @@ impl Default for State {
             library_sort: LibrarySort::Severity,
             library_descending: true,
             evidence_index: 0,
-            hex: false,
+            request_hex: false,
+            response_hex: false,
             response_cache: ResponseCache::default(),
             seen: (u64::MAX, u64::MAX),
             last_refresh: None,
@@ -274,7 +290,11 @@ impl State {
         self.finding_detail = None;
         self.seen = activity;
         self.last_refresh = Some(now);
-        if self.selected_scan.is_none() {
+        if !self
+            .jobs
+            .iter()
+            .any(|job| Some(job.id) == self.selected_scan)
+        {
             self.selected_scan = self.jobs.first().map(|j| j.id);
         }
     }
@@ -337,30 +357,31 @@ impl State {
         let selected = self
             .jobs
             .iter()
-            .find(|job| Some(job.id) == self.selected_scan)
-            .cloned();
+            .find(|job| Some(job.id) == self.selected_scan);
         let mut action = None;
         ui.horizontal_wrapped(|ui| {
-            if let Some(job)=&selected {
-                ui.strong(format!("Scan #{}",job.id));
-                let running=matches!(job.status,ScanStatus::Queued|ScanStatus::Running);
-                if ui.add_enabled(running,egui::Button::new("Pause")).clicked(){action=Some("pause");}
-                if ui.add_enabled(matches!(job.status,ScanStatus::Paused|ScanStatus::Interrupted),egui::Button::new("Resume")).clicked(){action=Some("resume");}
-                if ui.add_enabled(job.status.unfinished()||job.status==ScanStatus::Interrupted,egui::Button::new("Cancel")).clicked(){action=Some("cancel");}
-                if ui.add_enabled(!running,egui::Button::new("Retry failed")).clicked(){action=Some("retry");}
-            } else {ui.weak("Select requests in History, Target, Intercept, or Repeater and choose Send to > Scanner.");}
-        });
-        if let (Some(action), Some(job)) = (action, &selected) {
-            match action {
-                "pause" => scanner::runner::pause(engine.clone(), job.id)?,
-                "resume" => scanner::runner::resume(engine.clone(), job.id)?,
-                "cancel" => scanner::runner::cancel(engine.clone(), job.id)?,
-                _ => scanner::runner::retry(engine.clone(), job.id)?,
+            if let Some(job) = selected {
+                ui.strong(format!("Scan #{}", job.id));
+                let running = matches!(job.status, ScanStatus::Queued | ScanStatus::Running);
+                let can_resume = matches!(job.status, ScanStatus::Paused | ScanStatus::Interrupted);
+                let can_cancel = job.status.unfinished() || job.status == ScanStatus::Interrupted;
+                let buttons = [
+                    ("Pause", ScanAction::Pause, running),
+                    ("Resume", ScanAction::Resume, can_resume),
+                    ("Cancel", ScanAction::Cancel, can_cancel),
+                    ("Retry failed", ScanAction::Retry, !running),
+                ];
+                for (label, button_action, enabled) in buttons {
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        action = Some((job.id, button_action));
+                    }
+                }
+            } else {
+                ui.weak("Select requests in History, Target, Intercept, or Repeater and choose Send to > Scanner.");
             }
-            self.seen = (u64::MAX, u64::MAX);
-            self.last_refresh = None;
-        }
+        });
         let [mut table_ui, mut detail_ui] = split_panes(ui, "scanner-scans-split", true, 0.48);
+        table_ui.style_mut().interaction.selectable_labels = false;
         let table_height = table_ui.available_height().max(40.0);
         let page_rows =
             ((table_height - 24.0).max(0.0) / (24.0 + table_ui.spacing().item_spacing.y)) as usize;
@@ -368,9 +389,11 @@ impl State {
         let target = super::table_arrow_navigation(
             &mut table_ui,
             focus_id,
-            self.jobs
-                .iter()
-                .position(|job| Some(job.id) == self.selected_scan),
+            || {
+                self.jobs
+                    .iter()
+                    .position(|job| Some(job.id) == self.selected_scan)
+            },
             self.jobs.len(),
             page_rows,
         );
@@ -409,16 +432,7 @@ impl State {
                     body.row(24.0, |mut row| {
                         row.set_selected(Some(job.id) == self.selected_scan);
                         row.col(|ui| {
-                            if ui
-                                .selectable_label(
-                                    Some(job.id) == self.selected_scan,
-                                    format!("#{}", job.id),
-                                )
-                                .clicked()
-                            {
-                                super::focus_table(ui, focus_id);
-                                self.selected_scan = Some(job.id);
-                            }
+                            ui.label(format!("#{}", job.id));
                         });
                         row.col(|ui| {
                             ui.add(egui::Label::new(&job.name).truncate());
@@ -443,20 +457,64 @@ impl State {
                         row.col(|ui| {
                             ui.label(job.findings.to_string());
                         });
-                        if row.response().clicked() {
-                            row.response()
+                        let response = row.response();
+                        if response.clicked() || response.secondary_clicked() {
+                            response
                                 .ctx
                                 .memory_mut(|memory| memory.request_focus(focus_id));
                             self.selected_scan = Some(job.id);
                         }
+                        egui::Popup::context_menu(&response)
+                            .id(focus_id.with(("scan-menu", job.id)))
+                            .show(|ui| {
+                                let (label, scan_action) = match job.status {
+                                    ScanStatus::Running => ("Pause", ScanAction::Pause),
+                                    ScanStatus::Paused => ("Resume", ScanAction::Resume),
+                                    _ => ("Scan again", ScanAction::ScanAgain),
+                                };
+                                if ui.button(label).clicked() {
+                                    action = Some((job.id, scan_action));
+                                    ui.close();
+                                }
+                                if ui.button("Delete").clicked() {
+                                    action = Some((job.id, ScanAction::Delete));
+                                    ui.close();
+                                }
+                            });
                     });
                 }
             });
+        if let Some((id, action)) = action {
+            match action {
+                ScanAction::Pause => scanner::runner::pause(engine.clone(), id)?,
+                ScanAction::Resume => scanner::runner::resume(engine.clone(), id)?,
+                ScanAction::Cancel => scanner::runner::cancel(engine.clone(), id)?,
+                ScanAction::Retry => scanner::runner::retry(engine.clone(), id)?,
+                ScanAction::ScanAgain => {
+                    use anyhow::Context as _;
+                    let job = engine
+                        .project
+                        .lock()
+                        .unwrap()
+                        .scan_job(id)
+                        .context("Scan does not exist")?;
+                    anyhow::ensure!(
+                        !matches!(job.status, ScanStatus::Running | ScanStatus::Paused),
+                        "Scan state changed; reopen the row menu"
+                    );
+                    let sources = job.items.into_iter().map(|item| item.source).collect();
+                    self.select_scan(scanner::runner::start(engine.clone(), sources)?);
+                }
+                ScanAction::Delete => scanner::runner::delete(engine, id)?,
+            }
+            self.seen = (u64::MAX, u64::MAX);
+            self.last_refresh = None;
+            self.refresh(engine);
+        }
         let selected = self
             .jobs
             .iter()
-            .find(|job| Some(job.id) == self.selected_scan)
-            .cloned();
+            .find(|job| Some(job.id) == self.selected_scan);
         if let Some(job) = selected {
             detail_ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("Scan #{} · {}", job.id, job.status.label()));
@@ -471,12 +529,17 @@ impl State {
                 .id_salt("scanner-scan-items")
                 .show(&mut detail_ui, |ui| {
                     for (index, item) in job.items.iter().enumerate() {
+                        let status = if item.status == ScanStatus::Running {
+                            job.status
+                        } else {
+                            item.status
+                        };
                         egui::CollapsingHeader::new(format!(
                             "{} {} {} · {}",
                             index + 1,
                             item.source.method,
                             item.source.url,
-                            item.status.label()
+                            status.label()
                         ))
                         .id_salt((job.id, index))
                         .show(ui, |ui| {
@@ -518,14 +581,20 @@ impl State {
                         .to_lowercase()
                         .contains(&search))
             })
-            .map(|finding| FindingRow {
-                id: finding.id,
-                severity: finding.severity,
-                title: finding.title.clone(),
-                source: source_label(finding),
-                url: finding_host(&finding.url),
-                confidence: finding.confidence,
-                state: finding.state,
+            .filter_map(|finding| {
+                let host = finding_host(&finding.url);
+                if self.host.as_ref().is_some_and(|selected| selected != &host) {
+                    return None;
+                }
+                Some(FindingRow {
+                    id: finding.id,
+                    severity: finding.severity,
+                    title: finding.title.clone(),
+                    source: source_label(finding),
+                    url: host,
+                    confidence: finding.confidence,
+                    state: finding.state,
+                })
             })
             .collect();
         findings.sort_by(|left, right| {
@@ -555,6 +624,19 @@ impl State {
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
             ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0));
+            egui::ComboBox::from_id_salt("scanner-host-filter")
+                .selected_text(self.host.as_deref().unwrap_or("All hosts"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.host, None, "All hosts");
+                    let hosts: std::collections::BTreeSet<_> = self
+                        .findings
+                        .iter()
+                        .map(|finding| finding_host(&finding.url))
+                        .collect();
+                    for host in hosts {
+                        ui.selectable_value(&mut self.host, Some(host.clone()), host);
+                    }
+                });
             egui::ComboBox::from_id_salt("scanner-severity-filter")
                 .selected_text(self.severity.map_or("All severities", Severity::label))
                 .show_ui(ui, |ui| {
@@ -607,9 +689,11 @@ impl State {
         let target = super::table_arrow_navigation(
             &mut table_ui,
             focus_id,
-            findings
-                .iter()
-                .position(|finding| Some(finding.id) == self.selected_finding),
+            || {
+                findings
+                    .iter()
+                    .position(|finding| Some(finding.id) == self.selected_finding)
+            },
             findings.len(),
             ((height - 24.0).max(0.0) / 22.0) as usize,
         );
@@ -871,7 +955,6 @@ impl State {
                         }
                     }
                 });
-            ui.checkbox(&mut self.hex, "Hex");
             if ui.button("Send to Repeater").clicked() {
                 self.action = Some((
                     EntryAction::Repeater,
@@ -891,19 +974,25 @@ impl State {
             split_panes(ui, "scanner-evidence-editors", false, 0.5);
         subsection_heading(&mut request_ui, "Request");
         subsection_heading(&mut response_ui, "Response");
-        let request = message_view(&exchange.request, self.hex);
+        let request = message_view(&exchange.request, self.request_hex);
         let response = self.response_cache.get(
             exchange.id,
             &exchange.response,
             exchange.omitted_response_body_bytes,
             exchange.streamed_response,
-            self.hex,
+            self.response_hex,
             engine.settings().max_message_bytes,
         );
         let request_out = http_editor(
             &mut request_ui,
-            &mut request.as_str(),
-            ("scanner-request", finding.id, self.evidence_index, self.hex),
+            &mut request.as_ref(),
+            (
+                "scanner-request",
+                finding.id,
+                self.evidence_index,
+                self.request_hex,
+            ),
+            Some(Find::WithHex(Stage::Request, &mut self.request_hex)),
         );
         let response_out = http_editor(
             &mut response_ui,
@@ -912,8 +1001,9 @@ impl State {
                 "scanner-response",
                 finding.id,
                 self.evidence_index,
-                self.hex,
+                self.response_hex,
             ),
+            Some(Find::WithHex(Stage::Response, &mut self.response_hex)),
         );
         if let Some(action) = item_menu(&request_out.inner.response, false, None)
             .or_else(|| item_menu(&response_out.inner.response, false, None))
@@ -961,9 +1051,11 @@ impl State {
         let target = super::table_arrow_navigation(
             &mut table_ui,
             focus_id,
-            sorted.iter().position(|definition| {
-                self.selected_issue.as_deref() == Some(definition.id.as_str())
-            }),
+            || {
+                sorted.iter().position(|definition| {
+                    self.selected_issue.as_deref() == Some(definition.id.as_str())
+                })
+            },
             sorted.len(),
             ((height - 24.0).max(0.0) / 22.0) as usize,
         );
@@ -1410,6 +1502,159 @@ fn parse_codes(text: &str) -> Option<Vec<u16>> {
 mod tests {
     use super::*;
     use crate::scanner::Confidence;
+
+    #[tokio::test]
+    async fn scan_rows_accept_right_clicks_over_text_and_show_the_paused_item_state() {
+        let mut project = crate::project::Project::temporary();
+        let source = finding(1, Severity::Low).evidence.remove(0).exchange;
+        let item = scanner::ScanItem {
+            source,
+            status: ScanStatus::Running,
+            next_probe: 0,
+            completed: 0,
+            failures: 0,
+            message: String::new(),
+        };
+        let paused = ScanJob {
+            id: 1,
+            check_version: scanner::CHECK_VERSION,
+            name: "Saved scan".into(),
+            status: ScanStatus::Paused,
+            created_ms: 1,
+            updated_ms: 1,
+            settings: ScanSettings::default(),
+            items: vec![item],
+            requests: 0,
+            failures: 0,
+            findings: 0,
+            skipped: 0,
+            message: String::new(),
+        };
+        project.put_scan_job(paused.clone()).unwrap();
+        for (id, name, status) in [
+            (2, "Running scan", ScanStatus::Running),
+            (3, "Completed scan", ScanStatus::Completed),
+        ] {
+            project
+                .put_scan_job(ScanJob {
+                    id,
+                    name: name.into(),
+                    status,
+                    items: vec![scanner::ScanItem {
+                        status,
+                        ..paused.items[0].clone()
+                    }],
+                    ..paused.clone()
+                })
+                .unwrap();
+        }
+        let engine = Engine::new(project).unwrap();
+        let context = egui::Context::default();
+        let mut view = State::default();
+        let mut frame = |events| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 620.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        view.show(ui, &engine, DisplayTimezone::Utc).unwrap();
+                    });
+                },
+            )
+        };
+        fn click(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+        fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        }
+        for (name, expected) in [
+            ("Running scan", "Pause"),
+            ("Completed scan", "Scan again"),
+            ("Saved scan", "Resume"),
+        ] {
+            let pos = text_position(&frame(vec![]), name);
+            let hovered = frame(vec![egui::Event::PointerMoved(pos)]);
+            assert_eq!(
+                hovered.platform_output.cursor_icon,
+                egui::CursorIcon::Default
+            );
+            frame(vec![click(pos, egui::PointerButton::Secondary, true)]);
+            frame(vec![click(pos, egui::PointerButton::Secondary, false)]);
+            let output = frame(vec![]);
+            let menu_labels: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.pos.y >= pos.y
+                            && ["Pause", "Resume", "Scan again", "Delete"]
+                                .contains(&text.galley.job.text.as_str()) =>
+                    {
+                        Some(text.galley.job.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(menu_labels, [expected, "Delete"]);
+            if name == "Saved scan" {
+                assert!(output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("1 GET ") && text.galley.job.text.ends_with(" · Paused"))
+                }));
+                let delete = text_position(&output, "Delete");
+                frame(vec![
+                    egui::Event::PointerMoved(delete),
+                    click(delete, egui::PointerButton::Primary, true),
+                ]);
+                frame(vec![click(delete, egui::PointerButton::Primary, false)]);
+                assert!(engine.project.lock().unwrap().scan_job(1).is_none());
+            } else if name == "Completed scan" {
+                let repeat = text_position(&output, "Scan again");
+                frame(vec![
+                    egui::Event::PointerMoved(repeat),
+                    click(repeat, egui::PointerButton::Primary, true),
+                ]);
+                frame(vec![click(repeat, egui::PointerButton::Primary, false)]);
+                let project = engine.project.lock().unwrap();
+                assert_eq!(project.scan_job(3).unwrap().status, ScanStatus::Completed);
+                let new_job = project.scan_job(4).unwrap();
+                assert_eq!(new_job.status, ScanStatus::Queued);
+                assert_eq!(
+                    new_job.items[0].source.request,
+                    paused.items[0].source.request
+                );
+            }
+            frame(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert_eq!(view.selected_scan, Some(4));
+    }
+
     #[test]
     fn throttle_codes_are_validated_as_http_statuses() {
         assert_eq!(parse_codes("429, 503, 504"), Some(vec![429, 503, 504]));
@@ -1499,6 +1744,33 @@ mod tests {
         );
     }
     #[test]
+    fn host_filter_matches_the_displayed_host_and_combines_with_severity() {
+        let low = finding(1, Severity::Low);
+        let mut high = finding(2, Severity::High);
+        high.url = "https://example.test:8443/other".into();
+        let mut other_host = finding(3, Severity::High);
+        other_host.url = "https://sub.example.test/".into();
+        let mut view = State {
+            findings: vec![low, high, other_host],
+            host: Some("example.test".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            view.filtered_findings()
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        view.severity = Some(Severity::High);
+        let rows = view.filtered_findings();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 2);
+        view.host = None;
+        assert_eq!(view.filtered_findings().len(), 2);
+    }
+
+    #[test]
     fn filtering_uses_all_provenance_and_severity_sort() {
         let low = finding(1, Severity::Low);
         let mut high = finding(2, Severity::High);
@@ -1568,6 +1840,24 @@ mod tests {
                         });
                         assert!(!output.shapes.is_empty());
                         assert!(view.error.is_empty(), "{}", view.error);
+                        if tab == Tab::Findings {
+                            let position = |label| {
+                                output.shapes.iter().find_map(|shape| match &shape.shape {
+                                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                                        Some(text.pos)
+                                    }
+                                    _ => None,
+                                })
+                            };
+                            let hosts = position("All hosts").unwrap();
+                            let severities = position("All severities").unwrap();
+                            assert!(hosts.x < severities.x);
+                            if detail == DetailTab::Evidence {
+                                let request_hex = position("Request is hex").unwrap();
+                                let response_hex = position("Response as hex").unwrap();
+                                assert!(request_hex.x < response_hex.x);
+                            }
+                        }
                     }
                 }
             }

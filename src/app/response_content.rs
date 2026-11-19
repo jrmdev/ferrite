@@ -3,7 +3,11 @@ use crate::{
     model::{StreamCapture, StreamReason},
 };
 use anyhow::{Result, bail, ensure};
-use std::{borrow::Cow, io::Read, sync::Arc};
+use std::{
+    borrow::Cow,
+    io::{self, Cursor, Read},
+    sync::Arc,
+};
 
 pub(super) const DISPLAY_LIMIT: usize = 3 * 1024 * 1024;
 
@@ -44,13 +48,32 @@ type Reader<'a> = Box<dyn Read + 'a>;
 // A streaming adapter is needed because zstd permits concatenated frames and
 // skippable metadata, including when nested inside another content encoding.
 struct ZstdReader<'a> {
-    source: Option<Reader<'a>>,
-    decoder: Option<ruzstd::decoding::StreamingDecoder<Reader<'a>, ruzstd::decoding::FrameDecoder>>,
+    source: Option<ZstdInput<'a>>,
+    decoder:
+        Option<ruzstd::decoding::StreamingDecoder<ZstdInput<'a>, ruzstd::decoding::FrameDecoder>>,
     limit: usize,
 }
 
+struct ZstdInput<'a> {
+    reader: Reader<'a>,
+    prefix: Option<Cursor<[u8; 4]>>,
+}
+
+impl Read for ZstdInput<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if let Some(prefix) = &mut self.prefix {
+            let count = prefix.read(out)?;
+            if count != 0 || out.is_empty() {
+                return Ok(count);
+            }
+            self.prefix = None;
+        }
+        self.reader.read(out)
+    }
+}
+
 impl Read for ZstdReader<'_> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -62,7 +85,10 @@ impl Read for ZstdReader<'_> {
                 }
                 self.source = Some(self.decoder.take().unwrap().into_inner());
             }
-            let mut source = self.source.take().unwrap();
+            let mut source = self
+                .source
+                .take()
+                .ok_or_else(|| io::Error::other("Zstandard stream failed"))?;
             let mut magic = [0u8; 4];
             if source.read(&mut magic[..1])? == 0 {
                 self.source = Some(source);
@@ -73,20 +99,22 @@ impl Read for ZstdReader<'_> {
                 let mut size = [0; 4];
                 source.read_exact(&mut size)?;
                 let size = u32::from_le_bytes(size) as u64;
-                let copied = std::io::copy(&mut source.by_ref().take(size), &mut std::io::sink())?;
+                let copied = io::copy(&mut source.by_ref().take(size), &mut io::sink())?;
                 if copied != size {
-                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    return Err(io::ErrorKind::UnexpectedEof.into());
                 }
                 self.source = Some(source);
                 continue;
             }
-            let source: Reader<'_> = Box::new(std::io::Cursor::new(magic).chain(source));
+            // Reuse the prefix buffer across frames so each frame reads directly
+            // from the underlying stream once its magic bytes are consumed.
+            source.prefix = Some(Cursor::new(magic));
             self.decoder = Some(
                 ruzstd::decoding::StreamingDecoder::new_with_max_window_size(
                     source,
                     self.limit.max(8 * 1024 * 1024) as u64,
                 )
-                .map_err(std::io::Error::other)?,
+                .map_err(io::Error::other)?,
             );
         }
     }
@@ -128,7 +156,10 @@ fn body_preview_bytes(message: &Message, raw_body: &[u8], limit: usize) -> BodyP
             "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(reader)),
             "br" => Box::new(brotli::Decompressor::new(reader, 4096)),
             "zstd" => Box::new(ZstdReader {
-                source: Some(reader),
+                source: Some(ZstdInput {
+                    reader,
+                    prefix: None,
+                }),
                 decoder: None,
                 limit,
             }),
@@ -322,7 +353,7 @@ fn display(bytes: &[u8], hex: bool, limit: usize) -> String {
             }
         }
     }
-    super::http_editor::message_view(bytes, hex)
+    super::http_editor::message_view(bytes, hex).into_owned()
 }
 
 /// Keep one rendered response and refresh it when streaming metadata changes.
@@ -597,6 +628,17 @@ mod tests {
             decoded(&message("zstd", frames), 4096).unwrap().body,
             b"after metadata"
         );
+    }
+
+    #[test]
+    fn zstd_preview_reads_many_frames_through_one_source() {
+        let metadata = b"\x50\x2a\x4d\x18\x01\0\0\0x";
+        let frame = compress("zstd", b"ok");
+        let frames = [metadata.as_slice(), &frame].concat().repeat(2048);
+        let message = message("zstd, gzip", compress("gzip", &frames));
+        let preview = body_preview(&message, 1024 * 1024);
+        assert!(preview.decoded);
+        assert_eq!(preview.body, b"ok".repeat(2048));
     }
 
     #[test]

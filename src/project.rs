@@ -36,10 +36,11 @@ pub struct Project {
     ws_summaries: BTreeMap<(u64, u64), MessageSummary>,
     ws_memory: BTreeMap<(u64, u64), CapturedMessage>,
     scan_jobs: BTreeMap<u64, crate::scanner::ScanJob>,
+    last_deleted_scan_id: u64,
     scan_index: BTreeMap<String, (u64, bool)>,
     findings: BTreeMap<u64, crate::scanner::Finding>,
     audit: Vec<crate::mcp::AuditEntry>,
-    annotations: BTreeMap<u64, crate::history::Annotation>,
+    annotations: Arc<BTreeMap<u64, crate::history::Annotation>>,
 }
 
 pub use history_reader::HistoryReader;
@@ -58,10 +59,11 @@ impl Project {
             ws_summaries: BTreeMap::new(),
             ws_memory: BTreeMap::new(),
             scan_jobs: BTreeMap::new(),
+            last_deleted_scan_id: 0,
             scan_index: BTreeMap::new(),
             findings: BTreeMap::new(),
             audit: vec![],
-            annotations: BTreeMap::new(),
+            annotations: Default::default(),
         }
         .normalised()
     }
@@ -165,10 +167,11 @@ impl Project {
             ws_summaries: BTreeMap::new(),
             ws_memory: BTreeMap::new(),
             scan_jobs: BTreeMap::new(),
+            last_deleted_scan_id: 0,
             scan_index: BTreeMap::new(),
             findings: BTreeMap::new(),
             audit: vec![],
-            annotations: BTreeMap::new(),
+            annotations: Default::default(),
         }
         .normalised();
         project.load_websockets()?;
@@ -269,7 +272,12 @@ impl Project {
         self.ws_sessions.retain(|id, _| !deleted.contains(id));
         self.ws_summaries.retain(|(id, _), _| !deleted.contains(id));
         self.ws_memory.retain(|(id, _), _| !deleted.contains(id));
-        self.annotations.retain(|id, _| !deleted.contains(id));
+        if ids.iter().any(|id| self.annotations.contains_key(id)) {
+            let annotations = Arc::make_mut(&mut self.annotations);
+            for id in ids {
+                annotations.remove(id);
+            }
+        }
         Ok(())
     }
     pub fn get(&self, id: u64) -> Result<Option<Exchange>> {

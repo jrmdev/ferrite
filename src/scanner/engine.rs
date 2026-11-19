@@ -74,18 +74,16 @@ impl Engine {
             .unwrap_or_else(|| project.workspace.scanner.clone());
         let mut count = 0;
         for candidate in candidates {
-            if !settings.check_enabled(&candidate.issue_id) {
+            let enabled = match mode {
+                ScanMode::Passive => checks::passive_check_enabled(&settings, &candidate.issue_id),
+                ScanMode::Active => settings.check_enabled(&candidate.issue_id),
+            };
+            if !enabled {
                 continue;
             }
             let Some(definition) = checks::definition(&candidate.issue_id) else {
                 continue;
             };
-            if mode == ScanMode::Passive
-                && !settings.static_javascript
-                && (candidate.issue_id.contains("javascript") || candidate.issue_id == "static-dom")
-            {
-                continue;
-            }
             let timestamp = now();
             let (affected_url, affected_method) = candidate
                 .affected
@@ -98,10 +96,20 @@ impl Engine {
             } else {
                 candidate.evidence
             };
+            // A confirmed injection in a credential field is also an
+            // authentication-bypass impact, not only a data-access issue.
+            let title = if candidate.issue_id.starts_with("sqli")
+                && Message::parse(&base.request)
+                    .is_ok_and(|request| checks::credential_request(&request))
+            {
+                format!("{} (authentication bypass)", definition.name)
+            } else {
+                definition.name.clone()
+            };
             let finding = Finding {
                 id: 0,
                 issue_id: definition.id.clone(),
-                title: definition.name.clone(),
+                title,
                 severity: definition.severity,
                 original_severity: definition.severity,
                 confidence: candidate.confidence,
@@ -192,23 +200,16 @@ impl Engine {
                 let Some((flow, config)) = next else {
                     break;
                 };
-                if !engine.settings().scope.contains(&flow.url) {
+                let settings = engine.settings();
+                if !settings.scope.contains(&flow.url) {
                     continue;
                 }
-                let mut candidates = checks::passive(
+                let (candidates, omitted) = checks::passive_with_settings(
                     &flow,
-                    engine.settings().max_message_bytes.min(8 * 1024 * 1024),
+                    settings.max_message_bytes.min(8 * 1024 * 1024),
+                    &config,
                 );
-                candidates.retain(|c| {
-                    config.check_enabled(&c.issue_id)
-                        && (config.static_javascript
-                            || !(c.issue_id.contains("javascript") || c.issue_id == "static-dom"))
-                });
-                let budget = (64 * 1024 * 1024usize
-                    / (flow.request.len() + flow.response.len()).max(1))
-                .clamp(1, 64);
-                if candidates.len() >= budget {
-                    candidates.truncate(budget);
+                if omitted {
                     engine.log_error(format!("Passive analysis of exchange #{} reached its finding/evidence budget; additional results may be omitted",flow.id));
                 }
                 if let Err(error) =
@@ -341,7 +342,7 @@ impl Engine {
         let mut flow = capture.flow.take().unwrap();
         flow.duration_ms = capture.started.elapsed().as_millis() as u64;
         if let Err(error) = result {
-            flow.error = Some(format!("{error:#}"));
+            flow.error = Some(crate::error::friendly(&error));
         }
         self.project.lock().unwrap().record(&flow)?;
         self.activity.fetch_add(1, Ordering::SeqCst);
@@ -354,6 +355,46 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::project::Project;
+
+    #[tokio::test]
+    async fn disabled_passive_checks_do_not_take_the_finding_budget() {
+        let mut project = Project::temporary();
+        project.workspace.settings.scope.include = vec!["^https://example.com/".into()];
+        project.workspace.scanner.enabled_checks = vec!["cookie-samesite".into()];
+        let engine = Engine::new(project).unwrap();
+        let mut response = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..80 {
+            response.extend_from_slice(format!("Set-Cookie: cookie{i}=value\r\n").as_bytes());
+        }
+        response.extend_from_slice(b"\r\n");
+        let flow = Exchange {
+            id: 1,
+            timestamp_ms: 0,
+            tool: "Proxy".into(),
+            destination: Destination::from_url("https://example.com/").unwrap(),
+            url: "https://example.com/".into(),
+            method: "GET".into(),
+            request: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            response,
+            status: 200,
+            duration_ms: 0,
+            error: None,
+            note: String::new(),
+            omitted_response_body_bytes: None,
+            streamed_response: None,
+        };
+        engine.enqueue_passive(&flow);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while engine.scanner.passive_running.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let findings = engine.project.lock().unwrap().findings();
+        assert_eq!(findings.len(), 64);
+        assert!(findings.iter().all(|f| f.issue_id == "cookie-samesite"));
+    }
 
     #[test]
     fn passive_overload_keeps_diagnostics_bounded_without_a_ui_consumer() {

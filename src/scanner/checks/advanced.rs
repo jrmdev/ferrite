@@ -12,6 +12,9 @@ pub(super) enum Matcher {
     },
     GraphqlSuggestions,
     GraphqlContentType,
+    GraphqlBatching,
+    GraphqlInterface,
+    GraphqlAliasOverload,
     Series {
         family: String,
         phase: usize,
@@ -53,6 +56,9 @@ pub(super) fn definitions() -> Vec<IssueDefinition> {
         ("html-comment-secret", "Sensitive-looking data in HTML comment", Low,true,false,false,"An HTML comment contains an explicitly labeled password or secret.","Remove secrets from delivered source and rotate exposed credentials."),
         ("graphql-suggestions", "GraphQL field suggestions enabled", Low,false,true,false,"An invalid field query returns schema field suggestions.","Disable unnecessary field suggestions on production endpoints."),
         ("graphql-content-type", "GraphQL accepts simple cross-site content type", Low,false,true,false,"The endpoint executes a GraphQL operation submitted as text/plain.","Enforce the intended JSON media type and implement CSRF defenses."),
+        ("graphql-batching", "GraphQL query batching enabled", Low,false,true,false,"The endpoint accepts an array of operations in one request.","Disable batching unless required, and enforce per-request operation and cost limits."),
+        ("graphql-interface", "GraphQL IDE interface exposed", Medium,false,true,false,"A GraphQL development interface is reachable and returns an interactive HTML application.","Disable development interfaces in production or restrict them to trusted operators."),
+        ("graphql-alias-overload", "GraphQL alias overloading accepted", Low,false,true,false,"A single operation accepts many aliases of the same field without an apparent complexity limit.","Apply query cost or alias limits and reject operations that exceed them."),
         ("ldap-injection", "Possible LDAP injection", High,false,true,false,"A delimiter probe introduces an LDAP filter parser diagnostic absent from the baseline.","Use safe LDAP filter construction and context-specific escaping."),
         ("xpath-injection", "Possible XPath injection", High,false,true,false,"A delimiter probe introduces an XPath parser diagnostic absent from the baseline.","Use parameterized XPath expressions or strict context-specific escaping."),
         ("xml-injection", "Possible XML injection", Medium,false,true,false,"An input delimiter introduces an XML parser diagnostic absent from the baseline.","Build XML with a structured serializer and validate user-controlled values."),
@@ -89,38 +95,18 @@ fn strict_script(values: &[String]) -> bool {
             .any(|s| s.starts_with("'nonce-") || s.starts_with("'sha"))
 }
 
-/// Passive checks over already parsed messages and an already decoded body.
-/// `checks::passive` calls this directly so an exchange is parsed and
-/// decompressed once per worker instead of once per module.
+/// Passive checks on the parsed response and shared finding budget.
 pub(super) fn passive_parsed(
     flow: &Exchange,
     request: &Message,
     response: &Message,
-    body: Option<&str>,
-) -> Vec<Candidate> {
-    let mut out = vec![];
-    let budget =
-        (64 * 1024 * 1024usize / (flow.request.len() + flow.response.len()).max(1)).clamp(1, 64);
-    let severity = |id: &str| super::issue_severity(id);
+    body: &str,
+    policies: Option<&[String]>,
+    json: Option<&serde_json::Value>,
+    findings: &mut super::PassiveFindings<'_>,
+) {
     let mut add = |id: &str, confidence: Confidence, point: &str, detail: &str| {
-        let incoming = Candidate {
-            affected: None,
-            issue_id: id.into(),
-            confidence,
-            insertion_point: point.into(),
-            detail: detail.into(),
-            evidence: vec![],
-        };
-        if out.len() < budget {
-            out.push(incoming);
-        } else if let Some((index, lowest)) = out
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, c)| severity(&c.issue_id))
-            && severity(id) > severity(&lowest.issue_id)
-        {
-            out[index] = incoming;
-        }
+        findings.add(id, confidence, point, detail);
     };
     if !flow.destination.tls {
         add(
@@ -138,9 +124,7 @@ pub(super) fn passive_parsed(
             "Wildcard CORS grants noncredentialed cross-origin access; verify intended public exposure.",
         );
     }
-    let body = body.unwrap_or_default();
-    if is_html(response) {
-        let policies = csp_policies(response, body);
+    if let Some(policies) = policies {
         if policies.is_empty() {
             if response
                 .header("Content-Security-Policy-Report-Only")
@@ -200,7 +184,16 @@ pub(super) fn passive_parsed(
                     elem.as_deref().is_none_or(broad),
                 ]
             };
-            if (0..3).any(|capability| policies.iter().all(|p| style_capabilities(p)[capability])) {
+            let mut shared_style = [true; 3];
+            for policy in policies {
+                for (shared, allowed) in shared_style.iter_mut().zip(style_capabilities(policy)) {
+                    *shared &= allowed;
+                }
+                if !shared_style.contains(&true) {
+                    break;
+                }
+            }
+            if shared_style.contains(&true) {
                 add(
                     "csp-style",
                     Confidence::Tentative,
@@ -366,10 +359,7 @@ pub(super) fn passive_parsed(
         || url::Url::parse(&flow.url)
             .ok()
             .is_some_and(|u| u.query_pairs().any(|(k, v)| k == "query" && !v.is_empty()));
-    if graphql_request
-        && serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .is_some_and(|v| v.get("data").is_some() || v.get("errors").is_some())
+    if graphql_request && json.is_some_and(|v| v.get("data").is_some() || v.get("errors").is_some())
     {
         add(
             "graphql-endpoint",
@@ -378,7 +368,6 @@ pub(super) fn passive_parsed(
             "The request contains a GraphQL query and the response uses its data/errors envelope.",
         );
     }
-    out
 }
 
 // One admission point applies the byte and count limits to every specialized probe.
@@ -520,37 +509,99 @@ pub(super) fn active_plan(base: &Exchange, settings: &ScanSettings) -> anyhow::R
         || url::Url::parse(&base.url)
             .is_ok_and(|u| u.path().to_ascii_lowercase().contains("graphql"));
     if graphql {
-        for (id, query, ct, matcher) in [
-            (
-                "graphql-suggestions",
-                r#"{"query":"query { __typenam }"}"#,
-                "application/json",
-                Matcher::GraphqlSuggestions,
-            ),
-            (
-                "graphql-content-type",
-                r#"{"query":"query { __typename }"}"#,
-                "text/plain",
-                Matcher::GraphqlContentType,
-            ),
-        ] {
-            let mut m = request.clone();
-            m.start = format!(
+        let graphql_post = |body: String, content_type: &str| -> anyhow::Result<Vec<u8>> {
+            let mut message = request.clone();
+            message.start = format!(
                 "POST {} HTTP/1.1",
                 origin_target(&request, &base.destination)?
             );
-            m.set("Content-Type", ct.into());
-            m.body = query.as_bytes().to_vec();
-            m.normalize_length();
+            message.set("Content-Type", content_type.into());
+            message.body = body.into_bytes();
+            message.normalize_length();
+            Ok(message.encode())
+        };
+        for field in ["__typenam", "user", "users", "system", "node"] {
+            let body = serde_json::json!({ "query": format!("query {{ {field} }}") }).to_string();
             push(
                 &mut out,
                 base,
                 settings,
-                id,
+                "graphql-suggestions",
                 "GraphQL query",
-                m.encode(),
+                graphql_post(body, "application/json")?,
                 false,
-                matcher,
+                Matcher::GraphqlSuggestions,
+            );
+        }
+        push(
+            &mut out,
+            base,
+            settings,
+            "graphql-content-type",
+            "GraphQL query",
+            graphql_post(r#"{"query":"query { __typename }"}"#.into(), "text/plain")?,
+            false,
+            Matcher::GraphqlContentType,
+        );
+        push(
+            &mut out,
+            base,
+            settings,
+            "graphql-batching",
+            "GraphQL query",
+            graphql_post(
+                serde_json::json!([
+                    { "query": "query { __typename }" },
+                    { "query": "query { __typename }" }
+                ])
+                .to_string(),
+                "application/json",
+            )?,
+            false,
+            Matcher::GraphqlBatching,
+        );
+        let aliases = (0..20)
+            .map(|index| format!("a{index}: __typename"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        push(
+            &mut out,
+            base,
+            settings,
+            "graphql-alias-overload",
+            "GraphQL query",
+            graphql_post(
+                serde_json::json!({ "query": format!("query {{ {aliases} }}") }).to_string(),
+                "application/json",
+            )?,
+            false,
+            Matcher::GraphqlAliasOverload,
+        );
+        let parent = url::Url::parse(&base.url)
+            .ok()
+            .and_then(|url| {
+                url.path()
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+            })
+            .unwrap_or_default();
+        for path in [format!("{parent}/graphiql"), format!("{parent}/playground")] {
+            let mut message = request.clone();
+            message.start = format!("GET {path} HTTP/1.1");
+            message.body.clear();
+            message.remove("Content-Type");
+            message.remove("Content-Length");
+            message.set("Accept", "text/html".into());
+            message.normalize_length();
+            push(
+                &mut out,
+                base,
+                settings,
+                "graphql-interface",
+                "GraphQL IDE path",
+                message.encode(),
+                false,
+                Matcher::GraphqlInterface,
             );
         }
     }
@@ -858,11 +909,54 @@ pub(super) fn evaluate_cached(
             serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .is_some_and(|v| {
-                    v["errors"].as_array().is_some_and(|a| {
-                        a.iter().any(|v| {
-                            v["message"].as_str().is_some_and(|s| {
-                                s.contains("Did you mean") && s.contains("__typename")
+                    v["errors"].as_array().is_some_and(|errors| {
+                        errors.iter().any(|error| {
+                            error["message"].as_str().is_some_and(|message| {
+                                message.to_ascii_lowercase().contains("did you mean")
                             })
+                        })
+                    })
+                }),
+            Confidence::Certain,
+        ),
+        Matcher::GraphqlBatching => (
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value.as_array().map(Vec::len))
+                .is_some_and(|length| length >= 2)
+                && serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .is_some_and(|responses| {
+                        responses.len() >= 2
+                            && responses.iter().all(|response| {
+                                response
+                                    .pointer("/data/__typename")
+                                    .is_some_and(|value| value.is_string())
+                            })
+                    }),
+            Confidence::Certain,
+        ),
+        Matcher::GraphqlInterface => (
+            m.status() == 200
+                && m.header("Content-Type")
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("html"))
+                && {
+                    let body = body.to_ascii_lowercase();
+                    body.contains("graphiql")
+                        || body.contains("graphql playground")
+                        || body.contains("altair")
+                },
+            Confidence::Firm,
+        ),
+        Matcher::GraphqlAliasOverload => (
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .is_some_and(|value| {
+                    value["data"].as_object().is_some_and(|data| {
+                        (0..20).all(|index| {
+                            data.get(&format!("a{index}"))
+                                .is_some_and(|value| value.is_string())
                         })
                     })
                 }),

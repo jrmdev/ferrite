@@ -248,7 +248,7 @@ impl Engine {
         if errors.len() >= 100 {
             errors.remove(0);
         }
-        errors.push(error);
+        errors.push(crate::error::friendly_text(&error));
     }
     async fn gate(
         &self,
@@ -509,7 +509,7 @@ impl Engine {
             Err(error) => {
                 upgrade = None;
                 live = None;
-                flow.error = Some(format!("{error:#}"));
+                flow.error = Some(crate::error::friendly(&error));
             }
         }
         flow.duration_ms = started.elapsed().as_millis() as u64;
@@ -518,8 +518,11 @@ impl Engine {
         if retain_history {
             let recorded = self.project.lock().unwrap().record(&flow);
             if live.is_some() {
-                if let Err(error) = recorded {
-                    self.log_error(format!("Could not record streaming response: {error:#}"));
+                match recorded {
+                    Ok(()) => self.enqueue_passive(&flow),
+                    Err(error) => {
+                        self.log_error(format!("Could not record streaming response: {error:#}"));
+                    }
                 }
             } else {
                 recorded?;

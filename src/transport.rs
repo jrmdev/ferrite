@@ -298,7 +298,16 @@ async fn open_response(
     proxy: bool,
 ) -> Result<(IncomingResponse, Option<Stream>)> {
     let upgrading = request.header("Upgrade").is_some();
-    let (mut stream, negotiated_h2) = connect_protocol(dest, settings, !upgrading, false).await?;
+    let h2_compatible = request.headers.iter().all(|(name, value)| {
+        http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && http::HeaderValue::from_bytes(value.as_bytes()).is_ok()
+    }) && request.headers.iter().fold(0usize, |size, (name, value)| {
+        size.saturating_add(name.len())
+            .saturating_add(value.len())
+            .saturating_add(32)
+    }) <= 65536;
+    let (mut stream, negotiated_h2) =
+        connect_protocol(dest, settings, !upgrading && h2_compatible, false).await?;
     ensure!(
         scope_check.is_none_or(|check| check()),
         "Scanner request is outside current target scope"
@@ -310,6 +319,7 @@ async fn open_response(
         .is_some_and(|v| v.starts_with("HTTP/2"));
     // Cleartext HTTP/2 uses prior knowledge. Conventional HTTP upstreams keep absolute-form HTTP/1.
     if !upgrading
+        && h2_compatible
         && (negotiated_h2
             || (!dest.tls && explicit_h2 && settings.upstream.kind != UpstreamKind::Http))
     {

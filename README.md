@@ -52,10 +52,10 @@ Press Ctrl-C to stop the listener. Run `ferrite --help` for more options.
 ## MCP clients and agents
 
 1. Open **MCP** in Ferrite and select **Enable MCP server**.
-2. Select **Connect an AI agent** and choose this machine or another machine. The MCP page provides copyable stdio configuration, using SSH for an agent on another machine; configuration formats and locations vary by client.
+2. Select **Connect an AI agent**. Choose **This machine** for stdio. For Streamable HTTP, choose a network address under **Listen interface**, set **Port** (default `8765`), select **Apply**, then choose **Another machine** to get the URL, bearer token and example configuration. **SSH** provides a stdio option for remote agents.
 3. Start or reconnect your client, then use Ferrite's tools. For example, ask an agent: "Using Ferrite, list the in-scope endpoints that take parameters and resend the last login request as another user."
 
-Sending requests asks for your approval by default and is always limited to the target scope; active scans are disabled until you allow them. Credential headers are shown to the client as `[REDACTED]` and restored by Ferrite when requests are resent. Every call is recorded in the project's audit trail. Without the window, `ferrite mcp --headless --project assessment.ferrite` serves a project directly. See [MCP server](docs/MCP.md) for the tool reference and security model.
+MCP requests are limited to the target scope. New GUI settings allow sending requests by default. Select **Ask each time** to require approval. Stdio clients can also start active scans when enabled. Credential headers are shown to the client as `[REDACTED]` and restored by Ferrite when requests are resent. Every call is recorded in the project's audit trail. Without the window, `ferrite mcp --headless --project assessment.ferrite` serves a project directly. See [MCP server](docs/MCP.md) for the tool reference and security model.
 
 ## Projects and traffic
 
@@ -92,7 +92,7 @@ The project uses egui for the desktop UI, Tokio for networking, redb for project
 
 - The browser is a separate managed window, not embedded in Ferrite.
 - Some Chromium background requests to Google services cannot be disabled by switches; filter History by scope to hide them.
-- MCP supports the stdio transport; the authenticated Streamable HTTP transport is structured for but not yet implemented. Response bodies returned to MCP clients are not redacted.
+- The built-in MCP Streamable HTTP listener uses plaintext HTTP. Use an encrypted private network or an HTTPS reverse proxy. Response bodies returned to MCP clients are not redacted.
 - Ferrite does not load third-party plugins yet.
 - History retains complete exchanges for display, so memory still grows with captured traffic. Incremental refreshes reuse unchanged exchanges, and temporary projects share their stored exchanges with the UI; MCP reads use a separate lock-free reader.
 

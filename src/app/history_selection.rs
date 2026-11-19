@@ -17,9 +17,14 @@ impl HistorySelection {
     }
 
     pub fn retain_visible(&mut self, visible: &[u64]) {
-        let visible_ids: HashSet<_> = visible.iter().copied().collect();
-        self.ids.retain(|id| visible_ids.contains(id));
-        if self.anchor.is_some_and(|id| !visible_ids.contains(&id)) {
+        let visible_ids =
+            (self.ids.len() > 1).then(|| visible.iter().copied().collect::<HashSet<_>>());
+        let contains = |id: &u64| match &visible_ids {
+            Some(ids) => ids.contains(id),
+            None => visible.contains(id),
+        };
+        self.ids.retain(contains);
+        if self.anchor.is_some_and(|id| !contains(&id)) {
             self.anchor = None;
         }
         if self.focused.is_some_and(|id| !self.ids.contains(&id)) {

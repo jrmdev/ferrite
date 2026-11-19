@@ -387,7 +387,7 @@ async fn receive(
                 history_id,
                 seq,
                 Some(&payload),
-                result.as_ref().err().map(|e| format!("{e:#}")),
+                result.as_ref().err().map(crate::error::friendly),
             )?;
             result?;
             if kind == Kind::Close {
@@ -477,7 +477,7 @@ async fn forward(context: ForwardContext<'_>, mut rx: mpsc::Receiver<Packet>) ->
                     history_id,
                     packet.sequence,
                     Some(&payload),
-                    result.as_ref().err().map(|e| format!("{e:#}")),
+                    result.as_ref().err().map(crate::error::friendly),
                 )?;
                 result?;
             }
@@ -645,7 +645,7 @@ pub(crate) async fn run_with_history(
         } else {
             SessionState::Error
         };
-        session.error = result.as_ref().err().map(|e| format!("{e:#}"));
+        session.error = result.as_ref().err().map(crate::error::friendly);
         session.closed_ms = Some(now());
         project.put_ws_session(session)?;
     }

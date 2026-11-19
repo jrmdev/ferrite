@@ -272,9 +272,11 @@ impl State {
         let session_target = super::table_arrow_navigation(
             &mut sessions_ui,
             session_focus,
-            self.sessions
-                .iter()
-                .position(|session| Some(session.id) == selected_session),
+            || {
+                self.sessions
+                    .iter()
+                    .position(|session| Some(session.id) == selected_session)
+            },
             self.sessions.len(),
             ((session_height - 25.0).max(0.0) / 24.0) as usize,
         );
@@ -382,9 +384,11 @@ impl State {
         let message_target = super::table_arrow_navigation(
             &mut table_ui,
             message_focus,
-            self.messages
-                .iter()
-                .position(|message| Some(message.sequence) == selected),
+            || {
+                self.messages
+                    .iter()
+                    .position(|message| Some(message.sequence) == selected)
+            },
             self.messages.len(),
             ((table_height - 25.0).max(0.0) / 24.0) as usize,
         );

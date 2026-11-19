@@ -7,8 +7,8 @@ The server exposes tools only. It contains no LLM integration, makes no decision
 ## Quick start
 
 1. Start Ferrite and open **MCP** in the sidebar.
-2. Select **Enable MCP server**. The status shows `Listening on 127.0.0.1:<port> (loopback only, token required)`.
-3. Select **Connect an AI agent** and choose **This machine** or **Another machine**. The page shows copyable stdio configuration for your choice. On this machine, set the command to the full path to the Ferrite executable and the arguments to `mcp`.
+2. Select **Enable MCP server**. **Listen interface** defaults to **Loopback only (127.0.0.1)**.
+3. Select **Connect an AI agent → This machine**. Use the displayed stdio configuration. Set the command to the full path to the Ferrite executable and the arguments to `mcp`.
 
    For clients that use an `mcpServers` JSON object, the configuration looks like this (see [examples/mcp.json](examples/mcp.json)):
 
@@ -20,28 +20,56 @@ The server exposes tools only. It contains no LLM integration, makes no decision
    }
    ```
 
-   Configuration formats and file locations differ between clients; consult your client's MCP setup instructions. On Windows, use the path to `ferrite.exe` and escape backslashes in JSON. The client launches `ferrite mcp` as a subprocess; do not configure the loopback bridge address as an MCP HTTP endpoint.
-   For an agent on another machine, use SSH as the stdio command on the agent's machine. For example, when Ferrite's host uses a POSIX login shell:
-
-   ```json
-   {
-     "mcpServers": {
-       "ferrite": {
-         "command": "ssh",
-         "args": ["-T", "-o", "BatchMode=yes", "USER@FERRITE_HOST", "'/path/to/ferrite' mcp"]
-       }
-     }
-   }
-   ```
-
-   Replace the user and host with the SSH login for the Ferrite machine, and use the executable path shown on the MCP page. SSH must be installed on the agent's machine, enabled on the Ferrite machine, and configured for non-interactive authentication with the host key already trusted. Log in as the same user running Ferrite, with access to the same Ferrite configuration directory. For a Windows SSH host, quote the executable path for its configured login shell. SSH carries stdio; the loopback bridge remains private and is not an MCP HTTP endpoint.
+   Configuration formats and file locations differ between clients. On Windows, use the path to `ferrite.exe` and escape backslashes in JSON. The client launches `ferrite mcp` as a subprocess.
 4. Start or reconnect the client. Connected agents appear on Ferrite's MCP page.
 5. Use the client's tool interface or ask its agent, for example:
    - "Using Ferrite, summarise the in-scope endpoints and which take parameters."
    - "Show me the last POST to /login in Ferrite and resend it with the username changed to bob."
    - "Search Ferrite's history for responses that contain stack traces."
 
-When a client sends a request, Ferrite asks you to approve it (default **Ask each time**), records it in History with the tool `MCP`, and lists the call in the **Audit trail**.
+Ferrite records sent requests in History with the tool `MCP` and lists the calls in the **Audit trail**. **Send HTTP requests** defaults to **Allow** in new GUI settings. Choose **Ask each time** to require approval. Saved settings retain their selected permission.
+
+## Connect from another machine
+
+1. Under **Listen interface**, choose an address the agent can reach, such as the IP of a private VPN interface. **Port** defaults to `8765`. Select **Apply** to save the address and port. If MCP is already enabled, this restarts the network listener. Turn on **Enable MCP server** and keep Ferrite open. The status shows the Streamable HTTP URL ending in `/mcp`.
+2. Select **Connect an AI agent → Another machine**. Copy the URL and bearer token into a Streamable HTTP server entry in your MCP client. Adapt the configuration to your client and replace `YOUR_TOKEN` with the copied token. The example address and port below stand in for the values in Ferrite.
+
+   ```json
+   {
+     "mcpServers": {
+       "ferrite": {
+         "type": "http",
+         "url": "http://192.168.1.10:8765/mcp",
+         "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+       }
+     }
+   }
+   ```
+
+3. Start or reconnect the client. Network clients can inspect the live project, use Repeater, send in-scope requests and cancel active scans under the respective MCP permissions. Stdio also provides `start_active_scan`. Ferrite saves the port and issues a new bearer token each time the network listener starts. Copy the new token into your client after a restart.
+
+The built-in HTTP listener sends the token and project data in plaintext. Use an encrypted private network or terminate HTTPS at a reverse proxy. For a reverse proxy, use the HTTPS URL in the client and forward `/mcp` and the `Authorization` header to Ferrite. Set the upstream `Host` header to the IP and port shown in Ferrite and disable response buffering for event streams. If a host firewall blocks the connection, allow the displayed TCP port from the agent's address.
+
+On Windows, allow Ferrite on your private network if Windows displays a firewall prompt. The active profile, notification settings and existing rules determine whether Windows shows the automatic prompt. [Windows Firewall rules](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/rules)
+
+### SSH with stdio
+
+Select **Connect an AI agent → SSH** to run the stdio relay remotely. **Loopback only** works for SSH because the relay runs on the Ferrite machine. Install SSH on the agent's machine and configure the Ferrite host for non-interactive authentication with a trusted host key. Log in as the user running Ferrite, with access to the same Ferrite configuration directory.
+
+For a Ferrite host using a POSIX login shell:
+
+```json
+{
+  "mcpServers": {
+    "ferrite": {
+      "command": "ssh",
+      "args": ["-T", "-o", "BatchMode=yes", "USER@FERRITE_HOST", "'/path/to/ferrite' mcp"]
+    }
+  }
+}
+```
+
+Use the SSH username and address for the Ferrite machine and the executable path shown on the MCP page. On a Windows SSH host, quote the executable path for its configured login shell.
 
 ## Architecture
 
@@ -49,6 +77,7 @@ When a client sends a request, Ferrite asks you to approve it (default **Ask eac
 flowchart LR
     C[MCP client / agent / harness] -- stdio JSON-RPC --> R["ferrite mcp (relay)"]
     R -- loopback TCP + 256-bit token --> H[MCP host in the Ferrite window]
+    C -- Streamable HTTP + bearer token --> H
     H --> T[Tool executor]
     T --> E[Engine: routing, upstream proxy, TLS, scope]
     T --> P[(Project: history, Repeater, findings, WebSockets, audit)]
@@ -59,18 +88,18 @@ flowchart LR
 - **Protocol**: the official Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) handles JSON-RPC, protocol version negotiation (2024-11-05 through 2026-07-28), `ping` and cancellation. Ferrite implements `tools/list` and `tools/call`.
 - **Relay (`ferrite mcp`)**: the process the MCP client launches. It never opens the project database. It reads the endpoint file, authenticates to the running Ferrite window and forwards tool calls. If Ferrite is not running, tools return a clear error and the relay reconnects on the next call, so Ferrite can be started after the client.
 - **Bridge**: the Ferrite window listens on a random `127.0.0.1` port and writes `{address, token, pid}` to `mcp-endpoint.json` in Ferrite's configuration directory (`<config dir>/ferrite`, or `FERRITE_CONFIG_DIR`) (mode `0600` on Unix; per-user `%APPDATA%` on Windows). The relay must present the 256-bit token, compared in constant time. Messages are newline-delimited JSON with size limits. The file is removed when MCP is disabled or Ferrite exits. A second Ferrite instance refuses to take over a live endpoint.
+- **Streamable HTTP** binds the selected interface address and saved port to serve `/mcp`. It uses a separate 256-bit bearer token, validates the `Host` header and rejects browser requests carrying an `Origin` header.
 - **Host**: tools always target the project currently open in the window, including after you switch projects. Long reads (history scans, searches, site maps) run on blocking threads with a lock-free snapshot reader, so they never stall proxy recording or the UI.
 - **Headless mode**: `ferrite mcp --headless --project FILE` runs the engine without a window and serves MCP on stdio directly. redb locks the project file, so the GUI and a headless server can never open the same project at once.
-- **Future transports**: tools are executed by a transport-independent `Backend`, so an authenticated loopback Streamable HTTP transport (rmcp's `transport-streamable-http-server`) can be added without changing tool code.
 
 ## Security model
 
 | Control | Behaviour |
 | --- | --- |
 | Opt-in | Disabled until enabled on the MCP page. The setting is application-wide |
-| Network exposure | The bridge binds `127.0.0.1` only, on a random port, and requires the token from the user-only endpoint file. Stdio needs no network listener |
+| Network exposure | The stdio bridge binds `127.0.0.1` and authenticates with the token from the user-only endpoint file. The optional Streamable HTTP endpoint binds the selected interface address and requires its own bearer token on every request |
 | Scope | `send_http_request` and `start_active_scan` refuse URLs outside the target scope, regardless of **Drop out of scope messages**. The check runs inside the engine against the same settings snapshot as the send, and absolute-form request lines must match the target origin. Only the Ferrite user can change scope |
-| Permissions | **Send HTTP requests** defaults to *Ask each time*; **Active scans** defaults to *Deny*. Each can be *Deny*, *Ask each time* or *Allow*. Approvals offer *Allow once*, *Allow for this session* (revoked when MCP is disabled or Ferrite exits) and *Deny*; unanswered requests are denied after two minutes |
+| Permissions | In new GUI settings, **Send HTTP requests** defaults to *Allow* and **Active scans** defaults to *Deny*. Each can be *Deny*, *Ask each time* or *Allow*. Approvals offer *Allow once*, *Allow for this session* (revoked when MCP is disabled or Ferrite exits) and *Deny*. Unanswered requests are denied after two minutes |
 | Rate limits | 60 requests per minute and 4 concurrent requests by default (configurable). Each connection is limited to 8 concurrent tool calls; calls time out after five minutes; large reads are paged |
 | Credentials | Values of `Cookie`, `Set-Cookie`, `Authorization`, `Proxy-Authorization`, API key and session/CSRF token headers are returned as `[REDACTED]` unless the user enables **Return Cookie, Authorization and similar header values**. A client can keep `[REDACTED]` in a request sent with `tab_id` or `base_exchange_id`, and Ferrite substitutes the original value locally. Bodies are not redacted |
 | Secrets never exposed | Upstream proxy credentials, the CA private key and Ferrite's settings are never returned |
@@ -131,7 +160,7 @@ Each call examines at most 50,000 exchanges (searches also stop after 256 MiB); 
 | `list_scanner_findings` | `min_severity`, `confidence`, `state`, `url_contains`, `offset`, `limit` | Finding summaries |
 | `get_scanner_finding` | `id`, `max_evidence_bytes` (default 8 KiB) | Description, remediation, notes and up to 20 evidence exchanges |
 | `get_scan_status` | `scan_id` | Jobs with progress counters and live scanner resource use |
-| `start_active_scan` | `exchange_ids` (1–50, all in scope) | `scan_id`. Requires the active scan permission; uses the project's scanner configuration, including whether intrusive checks are enabled |
+| `start_active_scan` | `exchange_ids` (1–50, all in scope) | `scan_id`. Available over stdio with the active scan permission. Uses the project's scanner configuration, including whether intrusive checks are enabled |
 | `cancel_scan` | `scan_id` | Requires the active scan permission |
 
 ### WebSockets
@@ -177,6 +206,9 @@ Set scope in the GUI before handing a project to a headless server: a new projec
 | --- | --- |
 | Tools return "Ferrite is not reachable" | Start Ferrite and enable the MCP server. The error names the endpoint file the relay looked for. Use `ferrite mcp --endpoint-file PATH` or `FERRITE_MCP_ENDPOINT` if you changed its location |
 | "Another Ferrite instance is already serving MCP" | Disable MCP in the other window first |
+| "Could not bind MCP to …" | Check that the interface still has the selected address. If the port is in use, choose another port and select **Apply**. Select **Retry** after the address and port are available |
+| Network MCP returns HTTP 401 | Copy the current bearer token and set `Authorization: Bearer YOUR_TOKEN` in the client |
+| Network MCP returns HTTP 403 | Use the exact IP and port shown in Ferrite. With a reverse proxy, set the upstream `Host` header to that IP and port |
 | "outside the target scope" | Add the target in **Target** |
 | "disabled for MCP clients" / "denied" | Change the permission on the MCP page, or approve the prompt |
 | Headless start fails to open the project | Close the project in the Ferrite window first |

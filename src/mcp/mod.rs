@@ -2,26 +2,31 @@
 //!
 //! Ferrite exposes its live engine to MCP clients through
 //! tools defined in [`tools`]. The protocol layer ([`server`]) uses the
-//! official `rmcp` SDK over stdio and talks to a [`server::Backend`]:
+//! official `rmcp` SDK and talks to a [`server::Backend`]:
 //!
 //! - **Relay** (`ferrite mcp`): forwards tool calls over an authenticated
 //!   loopback connection ([`ipc`]) to a running Ferrite GUI, which executes
 //!   them against its in-memory engine and project. The relay never opens the
 //!   project database, so there is a single writer.
+//! - **Streamable HTTP**: serves project, Repeater and scoped request tools
+//!   from the GUI on a selected address, with a separate bearer token.
 //! - **Headless** (`ferrite mcp --headless`): owns the project exclusively and
 //!   executes tools in-process.
 //!
 //! MCP is opt-in. Network-producing tools are confined to the target scope,
 //! rate- and concurrency-limited, and gated by per-capability permissions
-//! that default to asking (requests) or denying (active scans). Every call is
+//! that default to allowing requests and denying active scans in the GUI. Every call is
 //! recorded in the project's audit trail.
 pub mod host;
 pub mod ipc;
+#[cfg(feature = "gui")]
+pub mod network;
 mod redact;
 pub mod server;
 pub mod tools;
 
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 
 /// How a capability that produces network traffic is authorised.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +55,10 @@ impl Permission {
 pub struct McpSettings {
     /// Serve MCP clients from the running Ferrite window.
     pub enabled: bool,
+    /// Expose the Streamable HTTP endpoint on this interface address.
+    pub network_ip: Option<IpAddr>,
+    /// TCP port for the Streamable HTTP endpoint.
+    pub network_port: u16,
     /// Sending HTTP requests through Ferrite's engine (`send_http_request`).
     pub send_requests: Permission,
     /// Starting and cancelling active scans.
@@ -63,7 +72,9 @@ impl Default for McpSettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            send_requests: Permission::Ask,
+            network_ip: None,
+            network_port: 8765,
+            send_requests: Permission::Allow,
             active_scans: Permission::Deny,
             include_credentials: false,
             requests_per_minute: 60,
@@ -72,7 +83,13 @@ impl Default for McpSettings {
     }
 }
 impl McpSettings {
+    pub fn network_address(&self) -> Option<SocketAddr> {
+        self.network_ip
+            .map(|ip| SocketAddr::new(ip, self.network_port))
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.network_port != 0, "MCP listen port must be 1..65535");
         anyhow::ensure!(
             (1..=6000).contains(&self.requests_per_minute),
             "MCP request rate must be 1..6000 per minute"

@@ -1,9 +1,9 @@
-use crate::{history_export::export_selected, model::Exchange};
+use crate::{history_export::export_items, model::Exchange};
 use eframe::egui;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 pub(super) struct HistoryExport {
-    items: Vec<Exchange>,
+    items: Vec<Arc<Exchange>>,
     path: String,
     error: Option<String>,
 }
@@ -16,7 +16,7 @@ pub(super) enum ExportOutcome {
 }
 
 impl HistoryExport {
-    pub fn new(items: Vec<Exchange>) -> Self {
+    pub fn new(items: Vec<Arc<Exchange>>) -> Self {
         Self {
             items,
             path: "selected-history.json".into(),
@@ -40,7 +40,7 @@ impl HistoryExport {
             }
             ui.horizontal(|ui| {
                 if ui.button("Export JSON").clicked() {
-                    match export_selected(Path::new(&self.path), &self.items) {
+                    match export_items(Path::new(&self.path), &self.items) {
                         Ok(()) => {
                             result = ExportOutcome::Saved(format!(
                                 "Exported {} items to {}",

@@ -383,7 +383,11 @@ mod tests {
                 .unwrap_err()
                 .contains("disabled")
         );
-        let headless = host(McpSettings::default(), HostMode::Headless);
+        let ask = McpSettings {
+            send_requests: Permission::Ask,
+            ..Default::default()
+        };
+        let headless = host(ask.clone(), HostMode::Headless);
         assert!(
             headless
                 .authorise(Capability::SendRequests, "c", "GET /".into(), String::new())
@@ -391,7 +395,7 @@ mod tests {
                 .unwrap_err()
                 .contains("--allow-requests")
         );
-        let gui = host(McpSettings::default(), HostMode::Gui);
+        let gui = host(ask, HostMode::Gui);
         let waiting = {
             let gui = gui.clone();
             tokio::spawn(async move {

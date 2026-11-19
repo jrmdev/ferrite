@@ -1,5 +1,70 @@
-use crate::history::{HistoryFilter, ToolSelection};
+use super::history_table::{HistorySort, TableRows};
+use crate::{
+    history::{Annotation, HistoryFilter, ToolSelection},
+    model::{Exchange, Scope},
+};
 use eframe::egui;
+use std::{collections::BTreeMap, sync::Arc};
+
+pub(super) struct FilterKey {
+    pub revision: Option<u64>,
+    pub filter: HistoryFilter,
+    pub scope: Option<Scope>,
+    pub reveal: Option<u64>,
+    pub annotations: Arc<BTreeMap<u64, Annotation>>,
+}
+
+impl PartialEq for FilterKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
+            && self.filter == other.filter
+            && self.scope == other.scope
+            && self.reveal == other.reveal
+            && Arc::ptr_eq(&self.annotations, &other.annotations)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct HistoryMatches {
+    key: Option<FilterKey>,
+    rows: TableRows,
+    error: Option<String>,
+}
+
+impl HistoryMatches {
+    pub fn invalidate(&mut self) {
+        self.key = None;
+    }
+
+    pub fn update(
+        &mut self,
+        exchanges: &[Arc<Exchange>],
+        key: FilterKey,
+        sort: HistorySort,
+    ) -> (&mut TableRows, Option<&str>) {
+        if self.key.as_ref() != Some(&key) {
+            let compiled = key.filter.compile();
+            let in_scope = key
+                .scope
+                .as_ref()
+                .map(|scope| super::scope_matcher(scope, true));
+            self.rows
+                .rebuild(exchanges, sort, &key.annotations, |flow| {
+                    key.reveal == Some(flow.id)
+                        || compiled.as_ref().is_ok_and(|filter| {
+                            filter.matches_using(flow, key.annotations.get(&flow.id), |url| {
+                                in_scope.as_ref().is_some_and(|matches| matches(url))
+                            })
+                        })
+                });
+            self.error = compiled
+                .err()
+                .map(|error| format!("Invalid search pattern: {error}"));
+            self.key = Some(key);
+        }
+        (&mut self.rows, self.error.as_deref())
+    }
+}
 
 pub(super) fn show(ui: &mut egui::Ui, filter: &mut HistoryFilter) {
     egui::CollapsingHeader::new("Filters").show(ui, |ui| {
@@ -138,4 +203,87 @@ fn filter_group(ui: &mut egui::Ui, width: f32, height: f32, add: impl FnOnce(&mu
             add(ui);
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{model::Destination, project::Project};
+
+    #[test]
+    fn cached_history_tracks_changes_in_data_annotations_scope_and_reveal() {
+        let mut project = Project::temporary();
+        let mut exchange = Exchange {
+            id: 1,
+            timestamp_ms: 0,
+            tool: "Proxy".into(),
+            destination: Destination::from_url("http://example.test").unwrap(),
+            url: "http://example.test/".into(),
+            method: "GET".into(),
+            request: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            response: b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nold body".to_vec(),
+            status: 200,
+            duration_ms: 0,
+            error: None,
+            omitted_response_body_bytes: None,
+            streamed_response: None,
+            note: String::new(),
+        };
+        project.insert(exchange.clone()).unwrap();
+        let mut cache = HistoryMatches::default();
+        let mut rows = Vec::new();
+        let mut revision = None;
+        let mut filter = HistoryFilter {
+            search: "needle".into(),
+            ..Default::default()
+        };
+        let mut visible = |project: &Project, filter: &HistoryFilter, scope, reveal| {
+            project.sync_history(&mut rows, &mut revision).unwrap();
+            let (rows, error) = cache.update(
+                &rows,
+                FilterKey {
+                    revision,
+                    filter: filter.clone(),
+                    scope,
+                    reveal,
+                    annotations: project.annotation_snapshot(),
+                },
+                HistorySort::default(),
+            );
+            (rows.len(), error.is_some())
+        };
+        assert_eq!(visible(&project, &filter, None, None), (0, false));
+        exchange.response.extend_from_slice(b" needle");
+        project.insert(exchange).unwrap();
+        assert_eq!(visible(&project, &filter, None, None), (1, false));
+        filter.annotated_only = true;
+        assert_eq!(visible(&project, &filter, None, None), (0, false));
+        project
+            .set_annotations(&[(
+                1,
+                Annotation {
+                    comment: "note".into(),
+                    highlight: None,
+                },
+            )])
+            .unwrap();
+        assert_eq!(visible(&project, &filter, None, None), (1, false));
+        filter.in_scope_only = true;
+        assert_eq!(
+            visible(&project, &filter, Some(Scope::default()), None),
+            (0, false)
+        );
+        let scope = Scope {
+            include: vec!["example\\.test".into()],
+            ..Default::default()
+        };
+        assert_eq!(visible(&project, &filter, Some(scope), None), (1, false));
+        filter.in_scope_only = false;
+        filter.regex = true;
+        filter.search = "[".into();
+        assert_eq!(visible(&project, &filter, None, None), (0, true));
+        assert_eq!(visible(&project, &filter, None, Some(1)), (1, true));
+        project.delete(&[1]).unwrap();
+        assert_eq!(visible(&project, &filter, None, Some(1)), (0, true));
+    }
 }
