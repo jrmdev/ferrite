@@ -318,9 +318,9 @@ mod tests {
         assert_eq!(first.timezone(), DisplayTimezone::Utc);
         assert_eq!(first.editor_font(), &EditorFont::default());
         assert_eq!(first.browser(), &BrowserSettings::default());
-        // MCP is opt-in and asks before sending requests by default.
+        // MCP is opt-in. Sending requests is allowed by default once enabled.
         assert!(!first.mcp().enabled);
-        assert_eq!(first.mcp().send_requests, crate::mcp::Permission::Ask);
+        assert_eq!(first.mcp().send_requests, crate::mcp::Permission::Allow);
         assert_eq!(first.mcp().active_scans, crate::mcp::Permission::Deny);
         assert!(!first.mcp().include_credentials);
         let browser = BrowserSettings {
