@@ -1,5 +1,5 @@
 //! Managed browser controls: launch, lifecycle, tab navigation and settings.
-use super::{Event, FileAction, Level, Workbench, subsection_heading};
+use super::{Event, FileAction, Level, Workbench, editor_context, subsection_heading};
 use crate::browser::{self, Browser, BrowserSettings, ProfileMode, cdp};
 use eframe::egui::{self, RichText};
 use std::{
@@ -627,7 +627,9 @@ impl Workbench {
                 ui.add(egui::TextEdit::singleline(&mut draft.start_url).desired_width(360.0));
                 ui.end_row();
                 ui.label("Extra arguments");
-                ui.add(
+                editor_context::show_with_copy_menu(
+                    ui,
+                    ui.next_auto_id(),
                     egui::TextEdit::multiline(&mut self.browser.extra_args)
                         .hint_text("One --switch per line, e.g. --lang=en-AU")
                         .desired_rows(3)

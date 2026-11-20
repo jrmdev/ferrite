@@ -111,13 +111,13 @@ impl FindState {
             Find::Text(stage) => (stage, None),
             Find::WithHex(stage, hex) => (stage, Some(hex)),
         };
-        let (hint, hex_label) = match stage {
-            Stage::Request => ("Find text in request", "Request is hex"),
-            Stage::Response => ("Find text in response", "Response as hex"),
+        let hint = match stage {
+            Stage::Request => "Find text in request",
+            Stage::Response => "Find text in response",
         };
         ui.horizontal_wrapped(|ui| {
             if let Some(hex) = hex {
-                if ui.checkbox(hex, hex_label).changed() {
+                if ui.checkbox(hex, "Hex").changed() {
                     // The caller uses the new mode when preparing the message for the next frame.
                     ui.ctx().request_repaint();
                 }
@@ -229,8 +229,7 @@ fn render(
             let mut layouter = highlight::layouter(kind, id, &search.term);
             // add_sized centers oversized widgets, which can move long HTTP messages
             // outside the viewport. A minimum height fills the pane without that layout.
-            let mut output = egui::TextEdit::multiline(text)
-                .id(id.with("text"))
+            let edit = egui::TextEdit::multiline(text)
                 .background_color(background)
                 .font(egui::TextStyle::Monospace)
                 .desired_width(f32::INFINITY)
@@ -240,8 +239,8 @@ fn render(
                 .vertical_align(egui::Align::Min)
                 .cursor_at_end(false)
                 .code_editor()
-                .layouter(&mut layouter)
-                .show(ui);
+                .layouter(&mut layouter);
+            let mut output = super::editor_context::show(ui, id.with("text"), edit);
             if let Some(range) = selection {
                 output.state.cursor.set_char_range(Some(range));
                 output.state.clone().store(ui.ctx(), output.response.id);
@@ -269,6 +268,75 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_click_preserves_and_copies_the_message_editor_selection() {
+        let ctx = egui::Context::default();
+        let mut text = "GET / HTTP/1.1\r\n\r\nπ and café".to_owned();
+        let mut frame = |events| {
+            let mut editor = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let output = http_editor(ui, &mut text, "right-click", None).inner;
+                        super::super::editor_menu(&output, false, None);
+                        editor = Some(output);
+                    });
+                },
+            );
+            (editor.unwrap(), output)
+        };
+        let (editor, _) = frame(vec![]);
+        let range = CCursorRange::two(CCursor::new(18), CCursor::new(28));
+        let mut state = editor.state;
+        state.cursor.set_char_range(Some(range));
+        state.store(&ctx, editor.response.id);
+        editor.response.request_focus();
+
+        let pos = editor.response.rect.left_top() + egui::vec2(120.0, 7.0);
+        let click = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            let (editor, _) = frame(vec![click(pos, egui::PointerButton::Secondary, pressed)]);
+            assert_eq!(editor.state.cursor.char_range(), Some(range));
+            assert_eq!(editor.cursor_range, Some(range));
+        }
+        let (_, menu) = frame(vec![]);
+        let position = |output: &egui::FullOutput, label| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing menu item {label}"))
+        };
+        let copy = position(&menu, "Copy");
+        frame(vec![egui::Event::PointerMoved(copy)]);
+        frame(vec![click(copy, egui::PointerButton::Primary, true)]);
+        frame(vec![click(copy, egui::PointerButton::Primary, false)]);
+        let (_, submenu) = frame(vec![]);
+        let selection = position(&submenu, "Selection");
+        frame(vec![egui::Event::PointerMoved(selection)]);
+        frame(vec![click(selection, egui::PointerButton::Primary, true)]);
+        let (_, output) = frame(vec![click(selection, egui::PointerButton::Primary, false)]);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "π and café")
+        }));
+        assert_eq!(frame(vec![]).0.cursor_range, Some(range));
+    }
 
     #[test]
     fn message_find_navigates_and_scrolls_only_its_own_pane() {
@@ -354,16 +422,14 @@ mod tests {
         assert!(!has_highlights(&request.inner.galley));
         assert!(has_highlights(&pane.inner.galley));
 
-        let next = position(&shapes, ">");
-        let previous = position(&shapes, "<");
-        frame(click(next));
-        let (_, [_, pane]) = frame(vec![]);
+        frame(click(position(&shapes, ">")));
+        let (shapes, [_, pane]) = frame(vec![]);
         let first = pane.inner.cursor_range.unwrap();
         assert_eq!(first.slice_str(&response), "needle");
         assert_eq!(pane.state.offset.y, 0.0);
 
-        frame(click(previous));
-        let (_, [_, pane]) = frame(vec![]);
+        frame(click(position(&shapes, "<")));
+        let (shapes, [_, pane]) = frame(vec![]);
         let last = pane.inner.cursor_range.unwrap();
         assert_eq!(last.slice_str(&response), "needle");
         assert!(last.primary.index > first.primary.index);
@@ -381,14 +447,14 @@ mod tests {
         );
         let scrolled_offset = pane.state.offset.y;
 
-        frame(click(next));
+        frame(click(position(&shapes, ">")));
         let (shapes, [_, pane]) = frame(vec![]);
         assert_eq!(pane.inner.cursor_range, Some(first));
         assert!(pane.state.offset.y < scrolled_offset);
 
-        let hex_checkbox = position(&shapes, "Response as hex");
+        let hex_checkbox = position(&shapes, "Hex");
         assert!(hex_checkbox.y > pane.inner_rect.bottom());
-        assert!((hex_checkbox.y - query.y).abs() < 4.0);
+        assert!((hex_checkbox.y - position(&shapes, "needle").y).abs() < 4.0);
         frame(click(hex_checkbox));
         assert!(response_hex);
         assert!(!request_hex);

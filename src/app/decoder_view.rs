@@ -1,5 +1,5 @@
 //! Decoder: chained byte transformations with intermediate results.
-use super::{Workbench, subsection_heading};
+use super::{Workbench, editor_context, subsection_heading};
 use crate::{decoder::Transform, http};
 use eframe::egui::{self, RichText};
 
@@ -83,9 +83,10 @@ impl Workbench {
             .id_salt("decoder-input-scroll")
             .max_height(140.0)
             .show(ui, |ui| {
-                ui.add(
+                editor_context::show_with_copy_menu(
+                    ui,
+                    egui::Id::new("decoder-input"),
                     egui::TextEdit::multiline(&mut state.input)
-                        .id(egui::Id::new("decoder-input"))
                         .font(egui::TextStyle::Monospace)
                         .desired_rows(5)
                         .desired_width(f32::INFINITY)
@@ -165,7 +166,9 @@ impl Workbench {
                             .id_salt("output")
                             .max_height(180.0)
                             .show(ui, |ui| {
-                                ui.add(
+                                editor_context::show_with_copy_menu(
+                                    ui,
+                                    ui.next_auto_id(),
                                     egui::TextEdit::multiline(&mut text.as_str())
                                         .font(egui::TextStyle::Monospace)
                                         .desired_rows(2)

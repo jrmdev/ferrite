@@ -1,9 +1,8 @@
 use super::{
-    EntryAction,
+    EntryAction, editor_context, editor_menu,
     http_editor::{Find, http_editor, message_view},
-    item_menu,
     response_content::ResponseCache,
-    split_panes, subsection_heading, timestamp,
+    split_panes, subsection_heading, table_row_pressed, timestamp,
 };
 use crate::{
     display_timezone::DisplayTimezone,
@@ -458,10 +457,7 @@ impl State {
                             ui.label(job.findings.to_string());
                         });
                         let response = row.response();
-                        if response.clicked() || response.secondary_clicked() {
-                            response
-                                .ctx
-                                .memory_mut(|memory| memory.request_focus(focus_id));
+                        if table_row_pressed(&response, focus_id).is_some() {
                             self.selected_scan = Some(job.id);
                         }
                         egui::Popup::context_menu(&response)
@@ -764,15 +760,12 @@ impl State {
                         row.col(|ui| {
                             ui.add(egui::Label::new(finding.state.label()).selectable(false));
                         });
-                        if row.response().clicked() {
-                            row.response()
-                                .ctx
-                                .memory_mut(|memory| memory.request_focus(focus_id));
-                            if self.selected_finding != Some(finding.id) {
-                                self.selected_finding = Some(finding.id);
-                                self.evidence_index = 0;
-                                self.response_cache = ResponseCache::default();
-                            }
+                        if table_row_pressed(&row.response(), focus_id).is_some()
+                            && self.selected_finding != Some(finding.id)
+                        {
+                            self.selected_finding = Some(finding.id);
+                            self.evidence_index = 0;
+                            self.response_cache = ResponseCache::default();
                         }
                     });
                 }
@@ -874,7 +867,9 @@ impl State {
                                 }
                             });
                             ui.label("Notes");
-                            ui.add(
+                            editor_context::show_with_copy_menu(
+                                ui,
+                                ui.next_auto_id(),
                                 egui::TextEdit::multiline(&mut finding.notes)
                                     .desired_width(f32::INFINITY)
                                     .desired_rows(5),
@@ -1005,8 +1000,8 @@ impl State {
             ),
             Some(Find::WithHex(Stage::Response, &mut self.response_hex)),
         );
-        if let Some(action) = item_menu(&request_out.inner.response, false, None)
-            .or_else(|| item_menu(&response_out.inner.response, false, None))
+        if let Some(action) = editor_menu(&request_out.inner, false, None)
+            .or_else(|| editor_menu(&response_out.inner, false, None))
         {
             self.action = Some((action, exchange.clone()));
         }
@@ -1109,9 +1104,11 @@ impl State {
                         row.set_selected(
                             self.selected_issue.as_deref() == Some(definition.id.as_str()),
                         );
+                        let mut toggle = None;
                         row.col(|ui| {
                             let mut enabled = settings.check_enabled(&definition.id);
-                            if ui.checkbox(&mut enabled, "").changed() {
+                            let response = ui.checkbox(&mut enabled, "");
+                            if response.changed() {
                                 settings.disabled_checks.retain(|id| id != &definition.id);
                                 if !enabled {
                                     settings.disabled_checks.push(definition.id.clone());
@@ -1121,6 +1118,7 @@ impl State {
                                     settings.enabled_checks.push(definition.id.clone());
                                 }
                             }
+                            toggle = Some(response);
                         });
                         row.col(|ui| severity_label(ui, definition.severity));
                         row.col(|ui| {
@@ -1143,10 +1141,8 @@ impl State {
                                 .selectable(false),
                             );
                         });
-                        if row.response().clicked() {
-                            row.response()
-                                .ctx
-                                .memory_mut(|memory| memory.request_focus(focus_id));
+                        let response = row.response().union(toggle.unwrap());
+                        if table_row_pressed(&response, focus_id).is_some() {
                             self.selected_issue = Some(definition.id.clone());
                         }
                     });
@@ -1212,7 +1208,14 @@ impl State {
             coverage_settings(ui, &mut settings);
             ui.label("Excluded parameter names (one per line)");
             let excluded = self.excluded_parameters_text.get_or_insert_with(|| settings.excluded_parameters.join("\n"));
-            if ui.add(egui::TextEdit::multiline(excluded).desired_width(400.0).desired_rows(5)).changed() {
+            let id = ui.next_auto_id();
+            let output = editor_context::show(
+                ui,
+                id,
+                egui::TextEdit::multiline(excluded).desired_width(400.0).desired_rows(5),
+            );
+            editor_context::selection_menu(&output);
+            if output.response.changed() {
                 settings.excluded_parameters = excluded.lines().map(str::trim).filter(|name| !name.is_empty()).map(str::to_owned).collect();
             }
             ui.weak("Captured cookies, tokens, and Authorization headers are reused. Scans do not log in or refresh authentication automatically.");
@@ -1503,6 +1506,28 @@ mod tests {
     use super::*;
     use crate::scanner::Confidence;
 
+    fn pointer_button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn scan_rows_accept_right_clicks_over_text_and_show_the_paused_item_state() {
         let mut project = crate::project::Project::temporary();
@@ -1568,30 +1593,11 @@ mod tests {
                 },
             )
         };
-        fn click(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
-            egui::Event::PointerButton {
-                pos,
-                button,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
-            }
-        }
-        fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
-            output
-                .shapes
-                .iter()
-                .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.job.text == label => {
-                        Some(text.pos + text.galley.size() * 0.5)
-                    }
-                    _ => None,
-                })
-                .unwrap()
-        }
-        for (name, expected) in [
-            ("Running scan", "Pause"),
-            ("Completed scan", "Scan again"),
-            ("Saved scan", "Resume"),
+        let click = pointer_button;
+        for (name, status, expected) in [
+            ("Running scan", "Running", "Pause"),
+            ("Completed scan", "Completed", "Scan again"),
+            ("Saved scan", "Paused", "Resume"),
         ] {
             let pos = text_position(&frame(vec![]), name);
             let hovered = frame(vec![egui::Event::PointerMoved(pos)]);
@@ -1599,7 +1605,10 @@ mod tests {
                 hovered.platform_output.cursor_icon,
                 egui::CursorIcon::Default
             );
-            frame(vec![click(pos, egui::PointerButton::Secondary, true)]);
+            let pressed = frame(vec![click(pos, egui::PointerButton::Secondary, true)]);
+            assert!(pressed.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().starts_with("1 GET ") && text.galley.text().ends_with(status))
+            }));
             frame(vec![click(pos, egui::PointerButton::Secondary, false)]);
             let output = frame(vec![]);
             let menu_labels: Vec<_> = output
@@ -1618,9 +1627,6 @@ mod tests {
                 .collect();
             assert_eq!(menu_labels, [expected, "Delete"]);
             if name == "Saved scan" {
-                assert!(output.shapes.iter().any(|shape| {
-                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.starts_with("1 GET ") && text.galley.job.text.ends_with(" · Paused"))
-                }));
                 let delete = text_position(&output, "Delete");
                 frame(vec![
                     egui::Event::PointerMoved(delete),
@@ -1653,6 +1659,62 @@ mod tests {
             }]);
         }
         assert_eq!(view.selected_scan, Some(4));
+    }
+
+    #[test]
+    fn finding_and_library_rows_select_on_either_mouse_down() {
+        let mut project = crate::project::Project::temporary();
+        let target = finding(1, Severity::Low);
+        let mut other = finding(2, Severity::High);
+        other.issue_id = "other-check".into();
+        project.put_finding(target.clone()).unwrap();
+        project.put_finding(other).unwrap();
+        let engine = Engine::new(project).unwrap();
+        let definitions = scanner::checks::definitions();
+        let definition = &definitions[0];
+        let ctx = egui::Context::default();
+        let frame = |view: &mut State, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 620.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        view.show(ui, &engine, DisplayTimezone::Utc).unwrap();
+                    });
+                },
+            )
+        };
+
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+            let mut view = State {
+                tab: Tab::Findings,
+                selected_finding: Some(2),
+                issue_search: definition.id.clone(),
+                ..Default::default()
+            };
+            for (tab, label) in [
+                (Tab::Findings, &target.title),
+                (Tab::Issues, &definition.name),
+            ] {
+                view.tab = tab;
+                frame(&mut view, vec![]);
+                let pos = text_position(&frame(&mut view, vec![]), label);
+                frame(&mut view, vec![egui::Event::PointerMoved(pos)]);
+                frame(&mut view, vec![pointer_button(pos, button, true)]);
+                if tab == Tab::Findings {
+                    assert_eq!(view.selected_finding, Some(target.id));
+                } else {
+                    assert_eq!(view.selected_issue.as_deref(), Some(definition.id.as_str()));
+                }
+                frame(&mut view, vec![pointer_button(pos, button, false)]);
+            }
+        }
     }
 
     #[test]
@@ -1853,9 +1915,19 @@ mod tests {
                             let severities = position("All severities").unwrap();
                             assert!(hosts.x < severities.x);
                             if detail == DetailTab::Evidence {
-                                let request_hex = position("Request is hex").unwrap();
-                                let response_hex = position("Response as hex").unwrap();
-                                assert!(request_hex.x < response_hex.x);
+                                let hex_positions: Vec<_> = output
+                                    .shapes
+                                    .iter()
+                                    .filter_map(|shape| match &shape.shape {
+                                        egui::Shape::Text(text) if text.galley.text() == "Hex" => {
+                                            Some(text.pos.x)
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                assert!(
+                                    matches!(hex_positions.as_slice(), [request, response] if request < response)
+                                );
                             }
                         }
                     }

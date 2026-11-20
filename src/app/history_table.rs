@@ -1,5 +1,7 @@
 use super::history_viewport::HistoryViewport;
-use super::{EntryAction, entry_menu, history_selection::HistorySelection, timestamp};
+use super::{
+    EntryAction, entry_menu, history_selection::HistorySelection, table_row_pressed, timestamp,
+};
 use crate::display_timezone::DisplayTimezone;
 use crate::history::{Annotation, short_content_type};
 use crate::model::Exchange;
@@ -323,11 +325,10 @@ pub(super) fn show(
                         stripes.push(egui::Shape::rect_filled(rect.expand2(spacing * 0.5),
                             egui::CornerRadius::ZERO, fill));
                     }
-                    if response.clicked() || response.secondary_clicked() {
-                        response.ctx.memory_mut(|memory| memory.request_focus(focus_id));
+                    if let Some(button) = table_row_pressed(&response, focus_id) {
                         let modifiers = response.ctx.input(|input| input.modifiers);
                         selection.click(flow.id, visible, modifiers.command || modifiers.ctrl,
-                            modifiers.shift, response.secondary_clicked());
+                            modifiers.shift, button == egui::PointerButton::Secondary);
                     }
                     if let Some(value) = entry_menu(&response, true) {
                         let ids = if matches!(value, EntryAction::Intruder | EntryAction::CopyUrl
@@ -453,18 +454,42 @@ mod tests {
                     });
                 },
             );
+            selection.focused
         };
         frame(vec![]);
         let pos = egui::pos2(100.0, 43.0);
-        frame(vec![
+        let focused = frame(vec![
             egui::Event::PointerMoved(pos),
             egui::Event::PointerButton {
                 pos,
-                button: egui::PointerButton::Primary,
+                button: egui::PointerButton::Secondary,
                 pressed: true,
                 modifiers: egui::Modifiers::NONE,
             },
         ]);
+        assert_eq!(focused, Some(30));
+        frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let pos = egui::pos2(50.0, 66.0);
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        let focused = frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(focused, Some(29));
         frame(vec![egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,

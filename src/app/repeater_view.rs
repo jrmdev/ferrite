@@ -2,9 +2,9 @@
 //! created or sent by MCP clients are never overwritten by the UI.
 use super::comparer_view::Slot;
 use super::{
-    Event, Workbench, decode_editor, editable, editor_context, entry_menu, hex_headers,
+    Event, Workbench, decode_editor, editable, editor_context, editor_menu, hex_headers,
     http_editor::{Find, http_editor},
-    item_menu, split_panes, subsection_heading,
+    split_panes, subsection_heading,
 };
 use crate::engine::Stage;
 use crate::model::{Exchange, RepeaterTab};
@@ -63,7 +63,6 @@ impl Workbench {
     pub(super) fn select_repeater_tab(&mut self, tab: &RepeaterTab) {
         self.repeater_tab = tab.id;
         self.repeater_flow = tab.history.last().copied();
-        self.repeater_cursor = tab.history.len().saturating_sub(1);
     }
 
     pub(super) fn send_to_repeater(&mut self, flow: &Exchange) {
@@ -104,7 +103,6 @@ impl Workbench {
                 tab.history.push(flow.id);
                 if self.repeater_tab == tab_id {
                     self.repeater_flow = Some(flow.id);
-                    self.repeater_cursor = tab.history.len().saturating_sub(1);
                 }
             }
             drop(project);
@@ -300,29 +298,29 @@ impl Workbench {
                 ui.label(if busy { "Sending…" } else { "" });
             });
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        !tab.history.is_empty()
-                            && (self.repeater_flow.is_none() || self.repeater_cursor > 0),
-                        egui::Button::new("Previous"),
-                    )
-                    .clicked()
-                {
-                    self.repeater_cursor = self.repeater_cursor.saturating_sub(1);
-                    self.repeater_cursor = self.repeater_cursor.min(tab.history.len() - 1);
-                    self.repeater_flow = Some(tab.history[self.repeater_cursor]);
-                }
-                if ui
-                    .add_enabled(
-                        !tab.history.is_empty()
-                            && (self.repeater_flow.is_none()
-                                || self.repeater_cursor.saturating_add(1) < tab.history.len()),
-                        egui::Button::new("Next"),
-                    )
-                    .clicked()
-                {
-                    self.repeater_cursor = (self.repeater_cursor + 1).min(tab.history.len() - 1);
-                    self.repeater_flow = Some(tab.history[self.repeater_cursor]);
+                let current = tab
+                    .history
+                    .iter()
+                    .position(|&id| Some(id) == self.repeater_flow);
+                let previous = match current {
+                    Some(index) => index
+                        .checked_sub(1)
+                        .and_then(|index| tab.history.get(index)),
+                    None => tab.history.last(),
+                };
+                let next = tab.history.get(current.map_or(0, |index| index + 1));
+                for (label, id) in [("Previous", previous), ("Next", next)] {
+                    if ui
+                        .add_enabled(id.is_some(), egui::Button::new(label))
+                        .clicked()
+                        && let Some(&id) = id
+                        && let Some(flow) = self.history_exchange(id)
+                    {
+                        (tab.request, tab.request_hex) = editable(&flow.request);
+                        tab.destination = flow.destination.origin();
+                        self.repeater_flow = Some(id);
+                        ui.ctx().request_repaint();
+                    }
                 }
                 ui.label(format!("{} saved sends", tab.history.len()));
                 if tab.history.len() >= 2
@@ -331,11 +329,11 @@ impl Workbench {
                         .on_hover_text("Open this response and the send before it in Comparer")
                         .clicked()
                 {
-                    let current = self.repeater_cursor.clamp(1, tab.history.len() - 1);
+                    let current = current.unwrap_or(0).max(1);
                     let ids = [tab.history[current - 1], tab.history[current]];
                     let found: Vec<_> = ids
                         .iter()
-                        .filter_map(|id| self.rows.iter().find(|r| r.id == *id).cloned())
+                        .filter_map(|&id| self.history_exchange(id).cloned())
                         .collect();
                     if let [previous, shown] = found.as_slice() {
                         self.comparer.set(
@@ -353,7 +351,7 @@ impl Workbench {
             });
             let flow = self
                 .repeater_flow
-                .and_then(|id| self.rows.iter().find(|r| r.id == id))
+                .and_then(|id| self.history_exchange(id))
                 .cloned();
             if let Some(flow) = &flow {
                 ui.label(format!(
@@ -383,7 +381,7 @@ impl Workbench {
                         &f.response,
                         f.omitted_response_body_bytes,
                         f.streamed_response,
-                        self.response_hex,
+                        self.repeater_response_hex,
                         self.engine.settings().max_message_bytes,
                     )
                 })
@@ -392,18 +390,23 @@ impl Workbench {
                 &mut request_ui,
                 &tab.request,
                 tab.request_hex,
-                ("repeater-headers", tab.id),
+                ("repeater-headers", tab.id, self.repeater_flow),
             );
             let request_output = http_editor(
                 &mut request_ui,
                 &mut tab.request,
-                ("repeater-request", tab.id, tab.request_hex),
+                (
+                    "repeater-request",
+                    tab.id,
+                    self.repeater_flow,
+                    tab.request_hex,
+                ),
                 Some(Find::WithHex(Stage::Request, &mut tab.request_hex)),
             );
-            let action = item_menu(&request_output.inner.response, false, None).or_else(|| {
+            let action = editor_menu(&request_output.inner, false, None).or_else(|| {
                 headers
                     .as_ref()
-                    .and_then(|response| item_menu(response, false, None))
+                    .and_then(|output| editor_menu(output, false, None))
             });
             if let Some(action) = action {
                 editor_action = Some((action, editor_context::repeater(tab)));
@@ -415,15 +418,18 @@ impl Workbench {
                     "repeater-response",
                     tab.id,
                     self.repeater_flow,
-                    self.response_hex,
+                    self.repeater_response_hex,
                 ),
-                Some(Find::WithHex(Stage::Response, &mut self.response_hex)),
+                Some(Find::WithHex(
+                    Stage::Response,
+                    &mut self.repeater_response_hex,
+                )),
             );
             if let Some(saved) = &flow {
-                if let Some(action) = entry_menu(&response_output.inner.response, true) {
+                if let Some(action) = editor_menu(&response_output.inner, true, Some("Delete")) {
                     editor_action = Some((action, Ok((**saved).clone())));
                 }
-            } else if let Some(action) = item_menu(&response_output.inner.response, false, None) {
+            } else if let Some(action) = editor_menu(&response_output.inner, false, None) {
                 editor_action = Some((action, editor_context::repeater(tab)));
             }
         }

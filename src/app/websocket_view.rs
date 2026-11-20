@@ -1,6 +1,6 @@
 use super::http_editor::websocket_editor;
 use super::http_editor::websocket_intercept_editor;
-use super::{editable, hex, split_panes, timestamp, unhex};
+use super::{editable, editor_context, hex, split_panes, table_row_pressed, timestamp, unhex};
 use crate::{
     display_timezone::DisplayTimezone,
     engine::Engine,
@@ -349,7 +349,11 @@ impl State {
                                     ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
                             }
-                            row.response().context_menu(|ui| {
+                            let response = row.response();
+                            if table_row_pressed(&response, session_focus).is_some() {
+                                selected_session = Some(session.id);
+                            }
+                            response.context_menu(|ui| {
                                 if ui.button("Delete").clicked() {
                                     self.action = Some(Action::Delete(session.id));
                                     ui.close();
@@ -359,12 +363,6 @@ impl State {
                                     ui.close();
                                 }
                             });
-                            if row.response().clicked() {
-                                row.response()
-                                    .ctx
-                                    .memory_mut(|memory| memory.request_focus(session_focus));
-                                selected_session = Some(session.id);
-                            }
                         })
                     });
             });
@@ -490,10 +488,7 @@ impl State {
                                     ui.add(egui::Label::new(text).truncate().selectable(false));
                                 });
                             }
-                            if row.response().clicked() {
-                                row.response()
-                                    .ctx
-                                    .memory_mut(|memory| memory.request_focus(message_focus));
+                            if table_row_pressed(&row.response(), message_focus).is_some() {
                                 selected = Some(message.sequence);
                             }
                         })
@@ -537,7 +532,7 @@ impl State {
         if self.payload.is_none() {
             detail_ui.label("Select a message to inspect its payload.");
         } else {
-            websocket_editor(
+            let output = websocket_editor(
                 &mut detail_ui,
                 &mut self.detail.as_ref(),
                 (
@@ -549,6 +544,7 @@ impl State {
                 ),
                 self.hex,
             );
+            editor_context::selection_menu(&output.inner);
         }
         Ok(handshake)
     }
@@ -679,12 +675,13 @@ impl State {
             ));
             ui.label("Forward preserves the complete original payload.");
         } else {
-            websocket_intercept_editor(
+            let output = websocket_intercept_editor(
                 ui,
                 &mut self.edit,
                 ("ws-intercept", item.id, self.edit_hex),
                 self.edit_hex,
             );
+            editor_context::selection_menu(&output.inner);
         }
     }
 }

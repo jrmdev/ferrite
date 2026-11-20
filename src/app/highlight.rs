@@ -160,7 +160,18 @@ fn http_head(text: &str, offset: usize, p: &Palette, spans: &mut Spans, visuals:
         } else if let Some(colon) = content.find(':') {
             push(spans, start, start + colon, p.name);
             push(spans, start + colon, start + colon + 1, p.weak);
-            push(spans, start + colon + 1, position, p.text);
+            let name = content[..colon].trim_end_matches([' ', '\t']);
+            let value = &content[colon + 1..];
+            let cookies = if name.eq_ignore_ascii_case("cookie") {
+                value
+            } else if name.eq_ignore_ascii_case("set-cookie") {
+                value.split_inclusive(';').next().unwrap_or_default()
+            } else {
+                ""
+            };
+            let value_start = start + colon + 1;
+            cookie_pairs(cookies, value_start, p, spans);
+            push(spans, value_start + cookies.len(), position, p.text);
         } else {
             push(spans, start, position, p.text);
         }
@@ -281,40 +292,36 @@ fn markup(text: &str, offset: usize, p: &Palette, spans: &mut Spans) {
     }
 }
 
-fn form(text: &str, offset: usize, p: &Palette, spans: &mut Spans) {
-    let mut position = 0;
+fn parameter(text: &str, offset: usize, p: &Palette, spans: &mut Spans) {
+    let key_end = text.find('=').unwrap_or(text.len());
+    push(spans, offset, offset + key_end, p.key);
+    if key_end < text.len() {
+        push(spans, offset + key_end, offset + key_end + 1, p.weak);
+        push(spans, offset + key_end + 1, offset + text.len(), p.string);
+    }
+}
+
+fn form(text: &str, mut offset: usize, p: &Palette, spans: &mut Spans) {
     for pair in text.split_inclusive('&') {
         let content = pair.trim_end_matches('&');
-        match content.find('=') {
-            Some(eq) => {
-                push(spans, offset + position, offset + position + eq, p.key);
-                push(
-                    spans,
-                    offset + position + eq,
-                    offset + position + eq + 1,
-                    p.weak,
-                );
-                push(
-                    spans,
-                    offset + position + eq + 1,
-                    offset + position + content.len(),
-                    p.string,
-                );
-            }
-            None => push(
-                spans,
-                offset + position,
-                offset + position + content.len(),
-                p.key,
-            ),
-        }
-        push(
+        parameter(content, offset, p, spans);
+        push(spans, offset + content.len(), offset + pair.len(), p.weak);
+        offset += pair.len();
+    }
+}
+
+fn cookie_pairs(text: &str, mut offset: usize, p: &Palette, spans: &mut Spans) {
+    for pair in text.split_inclusive(';') {
+        let content = pair.trim_end_matches(';');
+        let trimmed = content.trim_start_matches([' ', '\t']);
+        parameter(
+            trimmed.trim_end_matches([' ', '\t']),
+            offset + content.len() - trimmed.len(),
+            p,
             spans,
-            offset + position + content.len(),
-            offset + position + pair.len(),
-            p.weak,
         );
-        position += pair.len();
+        push(spans, offset + content.len(), offset + pair.len(), p.weak);
+        offset += pair.len();
     }
 }
 
@@ -601,6 +608,42 @@ mod tests {
                 .iter()
                 .any(|(text, color, _)| text == "key" && *color == p.key)
         );
+    }
+
+    #[test]
+    fn cookie_pairs_use_parameter_colours_without_changing_header_text() {
+        let p = Palette::new(&egui::Visuals::dark());
+        let request = "GET / HTTP/2\r\ncOoKiE:\t theme=dark; empty=; token=\"a=b==\"; lang=café\r\nCookie: region=eu\r\nX-Other: key=value\r\n\r\n";
+        let sections = colours(request, Kind::Http, "");
+        for name in ["theme", "empty", "token", "lang", "region"] {
+            assert!(sections.contains(&(name.into(), p.key, false)), "{name}");
+        }
+        for value in ["dark", "\"a=b==\"", "café", "eu"] {
+            assert!(
+                sections.contains(&(value.into(), p.string, false)),
+                "{value}"
+            );
+        }
+        assert!(sections.contains(&(";".into(), p.weak, false)));
+        assert!(sections.contains(&(" key=value\r\n".into(), p.text, false)));
+
+        let response = "HTTP/1.1 200 OK\nSet-Cookie: sid=abc==; Expires=Wed, 09 Jun 2038 10:18:14 GMT; HttpOnly\nSET-COOKIE:\t locale=en-AU; Path=/\n\n";
+        let sections = colours(response, Kind::Http, "");
+        for name in ["sid", "locale"] {
+            assert!(sections.contains(&(name.into(), p.key, false)), "{name}");
+        }
+        for value in ["abc==", "en-AU"] {
+            assert!(
+                sections.contains(&(value.into(), p.string, false)),
+                "{value}"
+            );
+        }
+        assert!(sections.contains(&(
+            " Expires=Wed, 09 Jun 2038 10:18:14 GMT; HttpOnly\n".into(),
+            p.text,
+            false
+        )));
+        assert!(sections.contains(&(" Path=/\n".into(), p.text, false)));
     }
 
     #[test]

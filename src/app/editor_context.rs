@@ -4,7 +4,77 @@ use crate::{
     http::Message,
     model::{Destination, Exchange, RepeaterTab},
 };
+use eframe::egui::{self, PointerButton, text_edit::TextEditOutput};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(super) fn show(ui: &mut egui::Ui, id: egui::Id, edit: egui::TextEdit<'_>) -> TextEditOutput {
+    let (secondary, secondary_pressed) = ui.input(|input| {
+        let pointer = &input.pointer;
+        (
+            !pointer.primary_down()
+                && !pointer.primary_pressed()
+                && (pointer.secondary_down()
+                    || pointer.secondary_pressed()
+                    || pointer.secondary_released()),
+            pointer.secondary_pressed(),
+        )
+    });
+    let selection = if secondary && ui.memory(|memory| memory.has_focus(id)) {
+        egui::TextEdit::load_state(ui.ctx(), id)
+            .and_then(|state| state.cursor.char_range())
+            .filter(|range| !range.is_empty())
+    } else {
+        None
+    };
+    let mut output = edit.id(id).show(ui);
+    if let Some(range) = selection
+        && (output.response.is_pointer_button_down_on()
+            || output.response.secondary_clicked()
+            || output.response.drag_stopped_by(PointerButton::Secondary))
+        && output.state.cursor.char_range() != Some(range)
+    {
+        // egui treats a secondary press as the start of a text selection.
+        output.state.cursor.set_char_range(Some(range));
+        output.state.clone().store(ui.ctx(), id);
+        output.cursor_range = Some(range);
+        output.response.request_focus();
+        if secondary_pressed {
+            ui.ctx()
+                .request_discard("Redraw the selection after a right-click");
+        }
+        ui.ctx().request_repaint();
+    }
+    output
+}
+
+pub(super) fn show_with_copy_menu(ui: &mut egui::Ui, id: egui::Id, edit: egui::TextEdit<'_>) {
+    let output = show(ui, id, edit);
+    selection_menu(&output);
+}
+
+pub(super) fn selection_menu(editor: &TextEditOutput) {
+    editor.response.context_menu(|ui| {
+        ui.menu_button("Copy", |ui| copy_selection(ui, editor));
+    });
+}
+
+pub(super) fn copy_selection(ui: &mut egui::Ui, editor: &TextEditOutput) {
+    let range = editor
+        .state
+        .cursor
+        .range(&editor.galley)
+        .filter(|range| !range.is_empty());
+    if ui
+        .add_enabled(range.is_some(), egui::Button::new("Selection"))
+        .clicked()
+        && let Some(range) = range
+    {
+        ui.ctx()
+            .copy_text(range.slice_str(editor.galley.text()).to_owned());
+        editor.response.request_focus();
+        ui.close();
+    }
+}
 
 fn request_snapshot(
     request: Message,

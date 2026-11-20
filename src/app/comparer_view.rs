@@ -1,5 +1,5 @@
 //! Comparer: side-by-side differences between two requests or responses.
-use super::{Workbench, subsection_heading};
+use super::{Workbench, editor_context, subsection_heading};
 use crate::{
     comparer::{self, Comparison, Granularity, RowKind, Segment},
     http,
@@ -211,7 +211,9 @@ impl Workbench {
                             .id_salt(("comparer-input", index))
                             .max_height(140.0)
                             .show(column, |ui| {
-                                ui.add(
+                                editor_context::show_with_copy_menu(
+                                    ui,
+                                    ui.next_auto_id(),
                                     egui::TextEdit::multiline(&mut state.texts[index])
                                         .font(egui::TextStyle::Monospace)
                                         .desired_rows(5)

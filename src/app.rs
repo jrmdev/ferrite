@@ -61,6 +61,11 @@ enum Page {
     Alerts,
     Plugins,
 }
+enum ExchangeView {
+    History,
+    Intruder,
+    Target,
+}
 #[derive(Clone, Copy)]
 enum FileAction {
     OpenProject,
@@ -130,7 +135,9 @@ pub struct Workbench {
     case_sensitive: bool,
     scope_only: bool,
     history_request_hex: bool,
-    response_hex: bool,
+    history_response_hex: bool,
+    intruder_hex: bool,
+    target_hex: bool,
     response_cache: ResponseCache,
     message: String,
     intercept_id: Option<u64>,
@@ -142,7 +149,7 @@ pub struct Workbench {
     /// Tab IDs with a send in flight.
     repeater_busy: Vec<u64>,
     repeater_flow: Option<u64>,
-    repeater_cursor: usize,
+    repeater_response_hex: bool,
     attack_cancel: Option<tokio::sync::watch::Sender<bool>>,
     attack_running: bool,
     attack_payloads: Vec<String>,
@@ -181,7 +188,7 @@ fn hex_headers(
     text: &str,
     is_hex: bool,
     document: impl std::hash::Hash,
-) -> Option<egui::Response> {
+) -> Option<egui::text_edit::TextEditOutput> {
     if !is_hex {
         return None;
     }
@@ -194,14 +201,16 @@ fn hex_headers(
         http_editor(ui, &mut head.as_ref(), document, None)
     });
     ui.separator();
-    Some(output.inner.inner.response)
+    Some(output.inner.inner)
 }
 fn editor(ui: &mut egui::Ui, text: &mut String, rows: usize, id: impl std::hash::Hash) {
     egui::ScrollArea::both()
         .id_salt(id)
         .max_height((rows as f32) * 18.0)
         .show(ui, |ui| {
-            ui.add(
+            editor_context::show_with_copy_menu(
+                ui,
+                ui.next_auto_id(),
                 egui::TextEdit::multiline(text)
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY)
@@ -216,6 +225,33 @@ fn compact_rows(ui: &mut egui::Ui) {
     spacing.item_spacing.y = 2.0;
     spacing.button_padding.y = 1.0;
     spacing.interact_size.y = 20.0;
+}
+
+fn table_row_pressed(response: &egui::Response, focus: egui::Id) -> Option<egui::PointerButton> {
+    use egui::PointerButton::{Primary, Secondary};
+    let (primary, secondary) = response.ctx.input(|input| {
+        (
+            input.pointer.primary_pressed(),
+            input.pointer.secondary_pressed(),
+        )
+    });
+    let button = [(primary, Primary), (secondary, Secondary)]
+        .into_iter()
+        .find_map(|(pressed, button)| {
+            (pressed && (response.is_pointer_button_down_on() || response.clicked_by(button)))
+                .then_some(button)
+        })
+        .or_else(|| response.long_touched().then_some(Secondary))
+        .or_else(|| (response.clicked() && !response.clicked_by(Primary)).then_some(Primary));
+    if button.is_some() || response.clicked() || response.secondary_clicked() {
+        response
+            .ctx
+            .memory_mut(|memory| memory.request_focus(focus));
+    }
+    if button.is_some() {
+        response.ctx.request_repaint();
+    }
+    button
 }
 
 fn table_arrow_navigation(
@@ -370,12 +406,27 @@ enum EntryAction {
     Export,
 }
 fn entry_menu(response: &egui::Response, export: bool) -> Option<EntryAction> {
-    item_menu(response, export, Some("Delete"))
+    exchange_menu(response, export, Some("Delete"), None)
 }
-fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> Option<EntryAction> {
+fn editor_menu(
+    editor: &egui::text_edit::TextEditOutput,
+    export: bool,
+    delete: Option<&str>,
+) -> Option<EntryAction> {
+    exchange_menu(&editor.response, export, delete, Some(editor))
+}
+fn exchange_menu(
+    response: &egui::Response,
+    export: bool,
+    delete: Option<&str>,
+    editor: Option<&egui::text_edit::TextEditOutput>,
+) -> Option<EntryAction> {
     let mut action = None;
     response.context_menu(|ui| {
         ui.menu_button("Copy", |ui| {
+            if let Some(editor) = editor {
+                editor_context::copy_selection(ui, editor);
+            }
             for (label, value) in [
                 ("URL", EntryAction::CopyUrl),
                 ("Request", EntryAction::CopyMessage(false)),
@@ -545,20 +596,14 @@ impl Workbench {
             .iter()
             .map(|s| s.join("\n"))
             .collect();
-        let (initial_repeater_tab, initial_repeater_flow, initial_repeater_cursor) = engine
+        let (initial_repeater_tab, initial_repeater_flow) = engine
             .project
             .lock()
             .unwrap()
             .workspace
             .repeater
             .first()
-            .map(|tab| {
-                (
-                    tab.id,
-                    tab.history.last().copied(),
-                    tab.history.len().saturating_sub(1),
-                )
-            })
+            .map(|tab| (tab.id, tab.history.last().copied()))
             .unwrap_or_default();
         Self {
             engine,
@@ -592,7 +637,9 @@ impl Workbench {
             case_sensitive: false,
             scope_only: false,
             history_request_hex: false,
-            response_hex: false,
+            history_response_hex: false,
+            intruder_hex: false,
+            target_hex: false,
             response_cache: ResponseCache::default(),
             message: String::new(),
             intercept_id: None,
@@ -602,7 +649,7 @@ impl Workbench {
             repeater_tab: initial_repeater_tab,
             repeater_busy: vec![],
             repeater_flow: initial_repeater_flow,
-            repeater_cursor: initial_repeater_cursor,
+            repeater_response_hex: false,
             attack_cancel: None,
             attack_running: false,
             attack_payloads,
@@ -810,7 +857,7 @@ impl Workbench {
             match first {
                 Some(tab) => self.select_repeater_tab(&tab),
                 None => {
-                    (self.repeater_tab, self.repeater_flow, self.repeater_cursor) = (0, None, 0);
+                    (self.repeater_tab, self.repeater_flow) = (0, None);
                 }
             }
             self.intercept_id = None;
@@ -1403,7 +1450,12 @@ impl Workbench {
             .and_then(|id| self.history_exchange(id))
             .cloned()
         {
-            self.flow_view(&mut detail, &flow, !intruder_only);
+            let view = if intruder_only {
+                ExchangeView::Intruder
+            } else {
+                ExchangeView::History
+            };
+            self.flow_view(&mut detail, &flow, view);
         } else {
             detail.label("Select an exchange to inspect its request and response.");
         }
@@ -1598,7 +1650,9 @@ impl Workbench {
             } else {
                 format!("Comment on {} exchanges", ids.len())
             });
-            ui.add(
+            editor_context::show_with_copy_menu(
+                ui,
+                ui.next_auto_id(),
                 egui::TextEdit::multiline(draft)
                     .desired_rows(4)
                     .desired_width(420.0)
@@ -1650,23 +1704,30 @@ impl Workbench {
             self.exchange_action(ctx, vec![flow], action);
         }
     }
-    fn flow_view(&mut self, ui: &mut egui::Ui, flow: &Exchange, separate_hex: bool) {
+    fn flow_view(&mut self, ui: &mut egui::Ui, flow: &Exchange, view: ExchangeView) {
         if let Some(e) = &flow.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        let request_hex = if separate_hex {
-            self.history_request_hex
-        } else {
-            ui.checkbox(&mut self.response_hex, "Hex");
-            self.response_hex
+        let (request_hex, response_hex) = match view {
+            ExchangeView::History => (
+                Some(&mut self.history_request_hex),
+                &mut self.history_response_hex,
+            ),
+            ExchangeView::Intruder => (None, &mut self.intruder_hex),
+            ExchangeView::Target => (None, &mut self.target_hex),
         };
-        let request = message_view(&flow.request, request_hex);
+        let separate_hex = request_hex.is_some();
+        if !separate_hex {
+            ui.checkbox(response_hex, "Hex");
+        }
+        let show_request_hex = request_hex.as_deref().copied().unwrap_or(*response_hex);
+        let request = message_view(&flow.request, show_request_hex);
         let response = self.response_cache.get(
             flow.id,
             &flow.response,
             flow.omitted_response_body_bytes,
             flow.streamed_response,
-            self.response_hex,
+            *response_hex,
             self.engine.settings().max_message_bytes,
         );
         let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
@@ -1675,25 +1736,24 @@ impl Workbench {
         let request_output = http_editor(
             &mut request_ui,
             &mut request.as_ref(),
-            ("request-view", flow.id, request_hex),
-            Some(if separate_hex {
-                Find::WithHex(Stage::Request, &mut self.history_request_hex)
-            } else {
-                Find::Text(Stage::Request)
+            ("request-view", flow.id, show_request_hex),
+            Some(match request_hex {
+                Some(hex) => Find::WithHex(Stage::Request, hex),
+                None => Find::Text(Stage::Request),
             }),
         );
         let response_output = http_editor(
             &mut response_ui,
             &mut response.as_ref(),
-            ("response-view", flow.id, self.response_hex),
+            ("response-view", flow.id, *response_hex),
             Some(if separate_hex {
-                Find::WithHex(Stage::Response, &mut self.response_hex)
+                Find::WithHex(Stage::Response, response_hex)
             } else {
                 Find::Text(Stage::Response)
             }),
         );
-        let action = entry_menu(&request_output.inner.response, true)
-            .or_else(|| entry_menu(&response_output.inner.response, true));
+        let action = editor_menu(&request_output.inner, true, Some("Delete"))
+            .or_else(|| editor_menu(&response_output.inner, true, Some("Delete")));
         if let Some(action) = action {
             self.exchange_action(ui.ctx(), vec![flow.clone()], action);
         }
@@ -1929,10 +1989,10 @@ impl Workbench {
                     Some(Find::Text(item.stage)),
                 )
             };
-            let action = item_menu(&output.inner.response, false, Some("Drop")).or_else(|| {
+            let action = editor_menu(&output.inner, false, Some("Drop")).or_else(|| {
                 headers
                     .as_ref()
-                    .and_then(|response| item_menu(response, false, Some("Drop")))
+                    .and_then(|output| editor_menu(output, false, Some("Drop")))
             });
             if let Some(action) = action {
                 let snapshot = pending
@@ -2070,7 +2130,7 @@ impl Workbench {
             .and_then(|id| self.rows.iter().find(|r| r.id == id))
             .cloned()
         {
-            self.flow_view(&mut detail, &flow, false);
+            self.flow_view(&mut detail, &flow, ExchangeView::Target);
         } else {
             detail.label("Select an exchange to inspect its request and response.");
         }
@@ -2109,12 +2169,13 @@ impl Workbench {
             });
             ui.label("Place paired § markers around payload positions, for example ?q=§test§.");
             ui.allocate_ui(egui::vec2(ui.available_width(), 120.0), |ui| {
-                http_editor(
+                let output = http_editor(
                     ui,
                     &mut attack.template,
                     "attack-template",
                     Some(Find::Text(Stage::Request)),
                 );
+                editor_context::selection_menu(&output.inner);
             });
             ui.horizontal(|ui| {
                 subsection_heading(ui, "Payload sets");
@@ -2135,7 +2196,9 @@ impl Workbench {
                                 load_payload_set = Some(i);
                             }
                         });
-                        ui.add(
+                        editor_context::show_with_copy_menu(
+                            ui,
+                            ui.next_auto_id(),
                             egui::TextEdit::multiline(text)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_rows(4)
@@ -2772,6 +2835,186 @@ mod layout_tests {
             None,
             preferences,
         )
+    }
+
+    #[test]
+    fn history_and_repeater_remember_their_own_response_hex_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_workbench(dir.path());
+        let ctx = egui::Context::default();
+        let tab = {
+            let mut project = app.engine.project.lock().unwrap();
+            let tab = &mut project.workspace.repeater[0];
+            tab.history.push(1);
+            tab.clone()
+        };
+        let mut flow = editor_context::repeater(&tab).unwrap();
+        flow.id = 1;
+        flow.status = 200;
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nSample reply";
+        flow.response = response.as_bytes().to_vec();
+        let hex_response = hex(&flow.response);
+        app.rows = vec![Arc::new(flow)];
+        app.history_selection[0].focused = Some(1);
+        app.history_selection[0].ids.insert(1);
+        app.select_repeater_tab(&tab);
+
+        let frame = |app: &mut Workbench, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| match app.page {
+                        Page::History => app.history(ui, false),
+                        Page::Repeater => app.repeater(ui),
+                        _ => unreachable!(),
+                    });
+                },
+            )
+        };
+        let assert_response = |app: &mut Workbench, expected: &str| {
+            assert!(
+                frame(app, vec![]).shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == expected)
+                }),
+                "Expected the response in {} mode",
+                if expected == response { "text" } else { "hex" }
+            );
+        };
+        let toggle_response_hex = |app: &mut Workbench| {
+            frame(app, vec![]);
+            let pos = frame(app, vec![])
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text() == "Hex" && text.pos.x > 500.0 =>
+                    {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .expect("Response Hex checkbox");
+            frame(app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+        };
+
+        app.page = Page::Repeater;
+        assert_response(&mut app, response);
+        toggle_response_hex(&mut app);
+        assert_response(&mut app, &hex_response);
+        app.page = Page::History;
+        assert_response(&mut app, response);
+        toggle_response_hex(&mut app);
+        assert_response(&mut app, &hex_response);
+        app.page = Page::Repeater;
+        assert_response(&mut app, &hex_response);
+        toggle_response_hex(&mut app);
+        assert_response(&mut app, response);
+        app.page = Page::History;
+        assert_response(&mut app, &hex_response);
+    }
+
+    #[test]
+    fn repeater_navigation_loads_the_request_paired_with_the_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_workbench(dir.path());
+        let ctx = egui::Context::default();
+        let mut first = editor_context::repeater(&RepeaterTab {
+            destination: "https://example.test".into(),
+            request: "GET /first HTTP/1.1\r\nHost: example.test\r\n\r\n".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        first.id = 1;
+        first.response = b"HTTP/1.1 200 OK\r\n\r\nFirst reply".to_vec();
+        let mut second = first.clone();
+        second.id = 2;
+        second.destination =
+            crate::model::Destination::from_url("https://example.test:8443").unwrap();
+        second.request = b"POST /second HTTP/1.1\r\nHost: example.test\r\n\r\n\xff".to_vec();
+        second.response = b"HTTP/1.1 200 OK\r\n\r\nSecond reply".to_vec();
+        let (request, request_hex) = editable(&second.request);
+        let tab = RepeaterTab {
+            id: 1,
+            name: "Replay".into(),
+            destination: second.destination.origin(),
+            request,
+            request_hex,
+            history: vec![first.id, second.id],
+            ..Default::default()
+        };
+        let engine = app.engine.clone();
+        engine.project.lock().unwrap().workspace.repeater = vec![tab.clone()];
+        app.rows = vec![Arc::new(first.clone()), Arc::new(second.clone())];
+        app.select_repeater_tab(&tab);
+        let frame = |app: &mut Workbench, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.repeater(ui));
+                },
+            )
+        };
+
+        for (label, expected, reply) in [
+            ("Previous", first, "First reply"),
+            ("Next", second, "Second reply"),
+        ] {
+            let pos = frame(&mut app, vec![])
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let pointer_button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            frame(&mut app, vec![pointer_button(true)]);
+            let output = frame(&mut app, vec![pointer_button(false)]);
+            assert_eq!(app.repeater_flow, Some(expected.id));
+            assert!(output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains(reply))
+            }));
+            let project = engine.project.lock().unwrap();
+            let tab = &project.workspace.repeater[0];
+            assert_eq!(
+                (tab.request.clone(), tab.request_hex),
+                editable(&expected.request)
+            );
+            assert_eq!(tab.destination, expected.destination.origin());
+        }
     }
 
     #[test]

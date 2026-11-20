@@ -1,4 +1,11 @@
 /target/
 *.ferrite
 *.ferrite.*
-push.*
+/artifacts/
+
+# Supplied proprietary references and large local REA evidence
+/burpsuite.jar
+/BurpSuite.exe
+/evidence/burp-rea.json
+/github/*
+/graphify-out
