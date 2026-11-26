@@ -31,8 +31,8 @@ Ferrite records sent requests in History with the tool `MCP` and lists the calls
 
 ## Connect from another machine
 
-1. Under **Listen interface**, choose an address the agent can reach, such as the IP of a private VPN interface. **Port** defaults to `8765`. Select **Apply** to save the address and port. If MCP is already enabled, this restarts the network listener. Turn on **Enable MCP server** and keep Ferrite open. The status shows the Streamable HTTP URL ending in `/mcp`.
-2. Select **Connect an AI agent → Another machine**. Copy the URL and bearer token into a Streamable HTTP server entry in your MCP client. Adapt the configuration to your client and replace `YOUR_TOKEN` with the copied token. The example address and port below stand in for the values in Ferrite.
+1. Under **Listen interface**, choose an address the agent can reach, such as the IP of a private VPN interface. To listen on every IPv4 interface, choose **All IPv4 interfaces (0.0.0.0)**. **Port** defaults to `8765`. Select **Apply** to save the address and port. If MCP is already enabled, this restarts the network listener. Turn on **Enable MCP server** and keep Ferrite open.
+2. Select **Connect an AI agent → Another machine**. Copy the URL and bearer token into a Streamable HTTP server entry in your MCP client. Replace `YOUR_TOKEN` with the copied token. If the URL contains `FERRITE_IPV4`, replace it with a reachable IPv4 address of the Ferrite machine. The example address and port below stand in for the values in Ferrite.
 
    ```json
    {
@@ -48,7 +48,7 @@ Ferrite records sent requests in History with the tool `MCP` and lists the calls
 
 3. Start or reconnect the client. Network clients can inspect the live project, use Repeater, send in-scope requests and cancel active scans under the respective MCP permissions. Stdio also provides `start_active_scan`. Ferrite saves the port and issues a new bearer token each time the network listener starts. Copy the new token into your client after a restart.
 
-The built-in HTTP listener sends the token and project data in plaintext. Use an encrypted private network or terminate HTTPS at a reverse proxy. For a reverse proxy, use the HTTPS URL in the client and forward `/mcp` and the `Authorization` header to Ferrite. Set the upstream `Host` header to the IP and port shown in Ferrite and disable response buffering for event streams. If a host firewall blocks the connection, allow the displayed TCP port from the agent's address.
+The built-in HTTP listener sends the token and project data in plaintext. Use an encrypted private network or terminate HTTPS at a reverse proxy. For a reverse proxy, use the HTTPS URL in the client and forward `/mcp` and the `Authorization` header to Ferrite. Set the upstream `Host` header to the IP and port the reverse proxy connects to and disable response buffering for event streams. If a host firewall blocks the connection, allow the displayed TCP port from the agent's address.
 
 On Windows, allow Ferrite on your private network if Windows displays a firewall prompt. The active profile, notification settings and existing rules determine whether Windows shows the automatic prompt. [Windows Firewall rules](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/rules)
 
@@ -208,7 +208,7 @@ Set scope in the GUI before handing a project to a headless server: a new projec
 | "Another Ferrite instance is already serving MCP" | Disable MCP in the other window first |
 | "Could not bind MCP to …" | Check that the interface still has the selected address. If the port is in use, choose another port and select **Apply**. Select **Retry** after the address and port are available |
 | Network MCP returns HTTP 401 | Copy the current bearer token and set `Authorization: Bearer YOUR_TOKEN` in the client |
-| Network MCP returns HTTP 403 | Use the exact IP and port shown in Ferrite. With a reverse proxy, set the upstream `Host` header to that IP and port |
+| Network MCP returns HTTP 403 | Use the IP and port the client connects to. With a reverse proxy, set the upstream `Host` header to the IP and port the reverse proxy connects to |
 | "outside the target scope" | Add the target in **Target** |
 | "disabled for MCP clients" / "denied" | Change the permission on the MCP page, or approve the prompt |
 | Headless start fails to open the project | Close the project in the Ferrite window first |

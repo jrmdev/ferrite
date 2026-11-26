@@ -3,7 +3,7 @@
 use super::comparer_view::Slot;
 use super::{
     Event, Workbench, decode_editor, editable, editor_context, editor_menu, hex_headers,
-    http_editor::{Find, http_editor},
+    http_editor::{Find, editable_http_editor, http_editor},
     split_panes, subsection_heading,
 };
 use crate::engine::Stage;
@@ -392,7 +392,7 @@ impl Workbench {
                 tab.request_hex,
                 ("repeater-headers", tab.id, self.repeater_flow),
             );
-            let request_output = http_editor(
+            let request_output = editable_http_editor(
                 &mut request_ui,
                 &mut tab.request,
                 (
@@ -401,7 +401,7 @@ impl Workbench {
                     self.repeater_flow,
                     tab.request_hex,
                 ),
-                Some(Find::WithHex(Stage::Request, &mut tab.request_hex)),
+                Find::WithHex(Stage::Request, &mut tab.request_hex),
             );
             let action = editor_menu(&request_output.inner, false, None).or_else(|| {
                 headers

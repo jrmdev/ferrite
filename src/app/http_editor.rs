@@ -28,6 +28,17 @@ pub(super) fn http_editor(
     editor(ui, text, document, Content::Http, find)
 }
 
+/// Keep the request draft editable even when its body can be previewed as JSON.
+pub(super) fn editable_http_editor(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    document: impl std::hash::Hash,
+    find: Find<'_>,
+) -> egui::scroll_area::ScrollAreaOutput<egui::text_edit::TextEditOutput> {
+    let id = ui.make_persistent_id(("http-editor", document));
+    render(ui, text, id, highlight::Kind::Http, Some(find))
+}
+
 pub(super) fn websocket_editor(
     ui: &mut egui::Ui,
     text: &mut dyn egui::TextBuffer,

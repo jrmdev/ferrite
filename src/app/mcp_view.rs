@@ -231,7 +231,11 @@ impl Workbench {
             match (&self.mcp_view.server, self.mcp_view.starting) {
                 (Some(server), _) => {
                     if let Some(network) = &self.mcp_view.network_server {
-                        ui.label(format!("⏺ Listening at {}", network.url()));
+                        if network.address().ip().is_unspecified() {
+                            ui.label(format!("⏺ Listening on {}", network.address()));
+                        } else {
+                            ui.label(format!("⏺ Listening at {}", network.url()));
+                        }
                     } else if self.mcp_view.network_stopping && saved.network_ip.is_some() {
                         ui.label("Restarting network listener…");
                     } else {
@@ -505,21 +509,31 @@ impl Workbench {
             ui.label("Choose a network address under Listen interface, select Apply and enable the MCP server.");
             return;
         };
+        let address = server.address();
+        let wildcard = address.ip().is_unspecified();
+        let url = if wildcard {
+            format!("http://FERRITE_IPV4:{}/mcp", address.port())
+        } else {
+            server.url()
+        };
         let config = serde_json::json!({
             "mcpServers": {"ferrite": {
                 "type": "http",
-                "url": server.url(),
+                "url": url,
                 "headers": {"Authorization": "Bearer YOUR_TOKEN"}
             }}
         });
         let json = serde_json::to_string_pretty(&config).unwrap_or_default();
         ui.label("1. Keep Ferrite open. Use an encrypted private network or an HTTPS reverse proxy to protect the token and project data.");
         ui.label("2. Add a Streamable HTTP server in your MCP client using this URL and Authorization header. Replace YOUR_TOKEN with the copied token.");
+        if wildcard {
+            ui.label("Replace FERRITE_IPV4 with an IPv4 address of this machine that the agent can reach.");
+        }
         ui.add(egui::Label::new(RichText::new(&json).monospace()));
         ui.horizontal(|ui| {
             for (label, value) in [
                 ("Copy configuration", json),
-                ("Copy URL", server.url()),
+                ("Copy URL", url),
                 ("Copy bearer token", server.token().to_owned()),
             ] {
                 if ui.small_button(label).clicked() {

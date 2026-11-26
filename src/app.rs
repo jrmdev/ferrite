@@ -2465,10 +2465,17 @@ fn proxy_listener_fields(ui: &mut egui::Ui, listen: &mut String) {
 
 fn listen_interface_combo(ui: &mut egui::Ui, id: &str, ip: &mut Option<IpAddr>) {
     const LOOPBACK: &str = "Loopback only (127.0.0.1)";
+    const ALL_INTERFACES: &str = "All IPv4 interfaces (0.0.0.0)";
+    const WILDCARD: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     egui::ComboBox::from_id_salt(id)
-        .selected_text(ip.map_or_else(|| LOOPBACK.into(), |ip| ip.to_string()))
+        .selected_text(match *ip {
+            None => LOOPBACK.into(),
+            Some(WILDCARD) => ALL_INTERFACES.into(),
+            Some(address) => address.to_string(),
+        })
         .show_ui(ui, |ui| {
             ui.selectable_value(ip, None, LOOPBACK);
+            ui.selectable_value(ip, Some(WILDCARD), ALL_INTERFACES);
             match crate::mcp::network::interface_addresses() {
                 Ok(addresses) if addresses.is_empty() => {
                     ui.weak("No network addresses available");
@@ -2835,6 +2842,95 @@ mod layout_tests {
             None,
             preferences,
         )
+    }
+
+    #[test]
+    fn repeater_edits_json_requests_after_paste_or_send_to_repeater() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_workbench(dir.path());
+        let ctx = egui::Context::default();
+        let engine = app.engine.clone();
+        let request = "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Type: application/json\r\n\r\n{\"value\":1}";
+        let frame = |app: &mut Workbench, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.repeater(ui));
+                },
+            )
+        };
+        json_preview::configure(&ctx, true, 1);
+
+        let editable = [true, false].map(|paste| {
+            if !paste {
+                let mut flow = editor_context::repeater(&RepeaterTab {
+                    destination: "https://example.test".into(),
+                    request: request.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+                flow.tool = "Proxy".into();
+                app.send_to_repeater(&flow);
+            }
+            let output = frame(&mut app, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().contains("HTTP/1.1") => {
+                        Some(text.pos + egui::vec2(8.0, 6.0))
+                    }
+                    _ => None,
+                })
+                .expect("Request editor text");
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            if paste {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::Key {
+                            key: egui::Key::A,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::COMMAND,
+                        },
+                        egui::Event::Paste(request.into()),
+                    ],
+                );
+                assert_eq!(
+                    engine.project.lock().unwrap().workspace.repeater[0].request,
+                    request
+                );
+            }
+            frame(&mut app, vec![egui::Event::Text("edited".into())]);
+            let project = engine.project.lock().unwrap();
+            let tab = project.workspace.repeater_tab(app.repeater_tab).unwrap();
+            tab.request.contains("edited")
+        });
+        assert_eq!(
+            editable,
+            [true, true],
+            "Both pasted and imported requests should accept edits"
+        );
     }
 
     #[test]

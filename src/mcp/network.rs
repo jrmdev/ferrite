@@ -6,9 +6,11 @@ use super::{
 use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
-    extract::Request,
+    extract::{ConnectInfo, Request, connect_info::Connected},
     middleware::{self, Next},
     response::IntoResponse,
+    routing::any,
+    serve::IncomingStream,
 };
 use http::{StatusCode, header};
 use rand_core::RngCore;
@@ -16,7 +18,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 use subtle::ConstantTimeEq;
@@ -30,11 +32,20 @@ pub struct NetworkServer {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct LocalAddress(Option<SocketAddr>);
+
+impl Connected<IncomingStream<'_, TcpListener>> for LocalAddress {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        Self(stream.io().local_addr().ok())
+    }
+}
+
 impl NetworkServer {
     pub fn start(host: Arc<Host>, address: SocketAddr, runtime: &Handle) -> Result<Self> {
         ensure!(
-            is_network_address(address.ip()),
-            "Select a unicast network interface address"
+            address.ip() == Ipv4Addr::UNSPECIFIED || is_network_address(address.ip()),
+            "Select a unicast network interface address or all IPv4 interfaces"
         );
         Self::bind(host, address, runtime)
     }
@@ -56,7 +67,8 @@ impl NetworkServer {
         let router = router(host.clone(), address, &token, shutdown.clone());
         let stopped = shutdown.clone();
         let task = runtime.spawn(async move {
-            if let Err(error) = axum::serve(listener, router)
+            let service = router.into_make_service_with_connect_info::<LocalAddress>();
+            if let Err(error) = axum::serve(listener, service)
                 .with_graceful_shutdown(stopped.cancelled_owned())
                 .await
             {
@@ -70,6 +82,10 @@ impl NetworkServer {
             shutdown,
             task,
         })
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
     }
 
     pub fn url(&self) -> String {
@@ -129,6 +145,7 @@ fn router(
     token: &str,
     shutdown: CancellationToken,
 ) -> Router {
+    let wildcard = address.ip().is_unspecified();
     let config = StreamableHttpServerConfig::default()
         .with_allowed_hosts([address.to_string()])
         .enforce_origin_validation()
@@ -146,7 +163,24 @@ fn router(
     );
     let expected: Arc<str> = format!("Bearer {token}").into();
     Router::new()
-        .route_service("/mcp", service)
+        .route(
+            "/mcp",
+            any(move |request: Request| {
+                let mut service = service.clone();
+                async move {
+                    if wildcard {
+                        let Some(&ConnectInfo(LocalAddress(Some(local)))) =
+                            request.extensions().get::<ConnectInfo<LocalAddress>>()
+                        else {
+                            return StatusCode::FORBIDDEN.into_response();
+                        };
+                        // Keep rmcp's authority validation against the IPv4 destination of this connection.
+                        service.config.allowed_hosts = vec![local.to_string()];
+                    }
+                    service.handle(request).await.into_response()
+                }
+            }),
+        )
         .route_layer(middleware::from_fn(move |request: Request, next: Next| {
             let expected = expected.clone();
             let shutdown = shutdown.clone();
@@ -228,6 +262,61 @@ mod tests {
 
         let server = NetworkServer::bind(host, address, &runtime).unwrap();
         assert_eq!(server.url(), url);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn wildcard_listener_accepts_its_local_ipv4_authority() {
+        let reservation = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, address.port()));
+        let settings = McpSettings {
+            network_ip: Some(address.ip()),
+            network_port: address.port(),
+            ..McpSettings::default()
+        };
+        let host = Host::new(
+            Engine::new(Project::temporary()).unwrap(),
+            settings.clone(),
+            HostMode::Gui,
+        );
+        drop(reservation);
+        let server = NetworkServer::start(
+            host,
+            settings.network_address().unwrap(),
+            &Handle::current(),
+        )
+        .unwrap();
+        assert_eq!(server.address(), address);
+
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "network-test", "version": "1"}
+            }
+        })
+        .to_string();
+        for (authority, expected) in [
+            (local.to_string(), b"HTTP/1.1 200"),
+            (address.to_string(), b"HTTP/1.1 403"),
+            (format!("example.test:{}", local.port()), b"HTTP/1.1 403"),
+        ] {
+            let mut connection = tokio::net::TcpStream::connect(local).await.unwrap();
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                server.token(),
+                body.len(),
+            );
+            connection.write_all(request.as_bytes()).await.unwrap();
+            let mut status = [0; 12];
+            tokio::time::timeout(Duration::from_secs(5), connection.read_exact(&mut status))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&status, expected, "Host: {authority}");
+        }
         server.stop().await;
     }
 
